@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { wsUrl } from '../lib/api'
 
 export default function LogStream({ threadId, onEvent }) {
   const [logs, setLogs] = useState([])
@@ -13,8 +14,7 @@ export default function LogStream({ threadId, onEvent }) {
     if (!threadId || doneRef.current) return
     if (wsRef.current && wsRef.current.readyState < 2) return // already open/connecting
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws/${threadId}`)
+    const ws = new WebSocket(wsUrl(`/ws/${threadId}`))
     wsRef.current = ws
 
     ws.onopen = () => {

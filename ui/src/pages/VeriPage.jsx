@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react'
+import { apiUrl } from '../lib/api'
 import LogStream from '../components/LogStream'
 
 export default function VeriPage() {
@@ -29,7 +30,7 @@ export default function VeriPage() {
     if (rowEnd) body.row_end = parseInt(rowEnd)
 
     try {
-      const resp = await fetch('/api/veri/run', {
+      const resp = await fetch(apiUrl('/api/veri/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

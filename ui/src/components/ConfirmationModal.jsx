@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { apiUrl } from '../lib/api'
 
 export default function ConfirmationModal({ data, threadId, onClose }) {
   const [fields, setFields] = useState({
@@ -14,7 +15,7 @@ export default function ConfirmationModal({ data, threadId, onClose }) {
   const post = async (confirmed) => {
     setSubmitting(true)
     try {
-      await fetch('/api/fini/confirm', {
+      await fetch(apiUrl('/api/fini/confirm'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ thread_id: threadId, confirmed, ...fields }),

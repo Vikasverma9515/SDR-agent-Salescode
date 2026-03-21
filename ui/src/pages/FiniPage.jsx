@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
+import { apiUrl } from '../lib/api'
 import LogStream from '../components/LogStream'
 import ConfirmationModal from '../components/ConfirmationModal'
 
@@ -162,7 +163,7 @@ export default function FiniPage() {
     if (!companies.trim()) return
     setRunning(true); setResult(null); setError(null); setPendingConfirmation(null)
     try {
-      const resp = await fetch('/api/fini/run', {
+      const resp = await fetch(apiUrl('/api/fini/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ companies: companies.trim(), sdr: sdr.trim(), region: region.trim(), submit_n8n: submitN8n }),

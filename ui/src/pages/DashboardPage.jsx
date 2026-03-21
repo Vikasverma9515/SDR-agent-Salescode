@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { apiUrl } from '../lib/api'
 
 const AGENTS = [
   {
@@ -32,7 +33,7 @@ export default function DashboardPage({ onNavigate }) {
   const [time, setTime] = useState(new Date())
 
   useEffect(() => {
-    fetch('/api/config/check').then(r => r.json()).then(setConfig).catch(() => {})
+    fetch(apiUrl('/api/config/check')).then(r => r.json()).then(setConfig).catch(() => {})
     const t = setInterval(() => setTime(new Date()), 1000)
     return () => clearInterval(t)
   }, [])

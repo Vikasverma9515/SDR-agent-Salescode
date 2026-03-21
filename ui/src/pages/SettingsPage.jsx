@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { apiUrl } from '../lib/api'
 
 const SETTINGS_FIELDS = [
   {
@@ -43,8 +44,8 @@ export default function SettingsPage() {
   const [credits, setCredits] = useState(null)
 
   useEffect(() => {
-    fetch('/api/config/check').then(r => r.json()).then(setConfig).catch(() => {})
-    fetch('/api/zerobounce/credits').then(r => r.json()).then(setCredits).catch(() => {})
+    fetch(apiUrl('/api/config/check')).then(r => r.json()).then(setConfig).catch(() => {})
+    fetch(apiUrl('/api/zerobounce/credits')).then(r => r.json()).then(setCredits).catch(() => {})
   }, [])
 
   return (

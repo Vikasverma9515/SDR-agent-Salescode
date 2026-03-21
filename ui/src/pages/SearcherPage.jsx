@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react'
+import { apiUrl } from '../lib/api'
 import LogStream from '../components/LogStream'
 
 const ROLE_COLORS = {
@@ -37,7 +38,7 @@ export default function SearcherPage() {
     setError(null)
 
     try {
-      const resp = await fetch('/api/searcher/run', {
+      const resp = await fetch(apiUrl('/api/searcher/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
