@@ -9,6 +9,8 @@ export default function ConfirmationModal({ data, threadId, onClose }) {
     sdr_assigned: data.sdr_assigned || '',
     account_type: data.account_type || '',
     account_size: data.account_size || '',
+    linkedin_org_id: data.linkedin_org_id || '',
+    sales_nav_url: data.sales_nav_url || '',
   })
   const [submitting, setSubmitting] = useState(false)
 
@@ -112,24 +114,27 @@ export default function ConfirmationModal({ data, threadId, onClose }) {
           </div>
 
           {/* LinkedIn data */}
-          {data.linkedin_org_id && (
-            <div className="mt-4 bg-blue-500/5 border border-blue-500/15 rounded px-3 py-2.5 space-y-1">
-              <div className="text-[10px] font-mono text-blue-500/60 uppercase tracking-wider mb-1.5">LinkedIn Enrichment</div>
-              <div className="flex items-center gap-2 text-xs font-mono">
-                <span className="text-gray-600">ORG_ID</span>
-                <span className="text-blue-300">{data.linkedin_org_id}</span>
-              </div>
-              {data.sales_nav_url && (
-                <div className="flex items-center gap-2 text-xs font-mono">
-                  <span className="text-gray-600">SALES_NAV</span>
-                  <a href={data.sales_nav_url} target="_blank" rel="noopener noreferrer"
-                     className="text-blue-400 hover:text-blue-300 underline underline-offset-2 truncate">
-                    {data.sales_nav_url}
-                  </a>
-                </div>
-              )}
+          <div className="mt-4 bg-blue-500/5 border border-blue-500/15 rounded px-3 py-2.5 space-y-3">
+            <div className="text-[10px] font-mono text-blue-500/60 uppercase tracking-wider">LinkedIn Enrichment</div>
+            <div>
+              <label className="block text-[10px] font-mono text-gray-600 uppercase tracking-wider mb-1.5">ORG ID</label>
+              <input
+                className="input-field"
+                value={fields.linkedin_org_id}
+                onChange={e => setFields(p => ({ ...p, linkedin_org_id: e.target.value }))}
+                placeholder="16271"
+              />
             </div>
-          )}
+            <div>
+              <label className="block text-[10px] font-mono text-gray-600 uppercase tracking-wider mb-1.5">SALES NAV URL</label>
+              <input
+                className="input-field"
+                value={fields.sales_nav_url}
+                onChange={e => setFields(p => ({ ...p, sales_nav_url: e.target.value }))}
+                placeholder="https://www.linkedin.com/sales/search/people/..."
+              />
+            </div>
+          </div>
         </div>
 
         {/* Actions */}

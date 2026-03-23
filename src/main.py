@@ -310,7 +310,7 @@ async def _run_veri(thread_id: str | None):
     app_graph = await build_veri_graph()
 
     with console.status("[magenta]Verifying contacts...[/magenta]", spinner="dots"):
-        result = await app_graph.ainvoke(state, config)
+        result = await app_graph.ainvoke(state, {**config, "recursion_limit": 150_000})
 
     if isinstance(result, dict):
         state = VeriState(**result)

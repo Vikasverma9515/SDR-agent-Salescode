@@ -51,6 +51,8 @@ class OperatorConfirmRequest(BaseModel):
     sdr_assigned: Optional[str] = None
     account_type: Optional[str] = None
     account_size: Optional[str] = None
+    linkedin_org_id: Optional[str] = None
+    sales_nav_url: Optional[str] = None
 
 class RunResponse(BaseModel):
     thread_id: str
@@ -170,6 +172,8 @@ def create_app() -> FastAPI:
             "sdr_assigned": req.sdr_assigned,
             "account_type": req.account_type,
             "account_size": req.account_size,
+            "linkedin_org_id": req.linkedin_org_id,
+            "sales_nav_url": req.sales_nav_url,
         }
         _pending_confirmations[req.thread_id].set()
         return {"status": "ok"}
@@ -383,6 +387,8 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
                         "sdr_assigned": conf_data.get("sdr_assigned") or c.sdr_assigned,
                         "account_type": conf_data.get("account_type") or c.account_type,
                         "account_size": conf_data.get("account_size") or c.account_size,
+                        "linkedin_org_id": conf_data.get("linkedin_org_id") or c.linkedin_org_id,
+                        "sales_nav_url": conf_data.get("sales_nav_url") or c.sales_nav_url,
                         "operator_confirmed": True,
                     })
                     companies[state.current_index] = updated
@@ -479,7 +485,10 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None)
         await _emit_log(thread_id, "info", f"Starting Veri agent —{range_msg}")
         app_graph = await build_veri_graph()
 
-        local_config = {**config, "recursion_limit": max(200, (row_end - row_start if row_start and row_end else 500), len(state.contacts) + 50)}
+        # 10 nodes per contact loop + buffer. Contacts are loaded inside the graph
+        # so we estimate from the row range; default to 10_000 for full runs.
+        estimated_contacts = (row_end - row_start + 1) if (row_start and row_end) else 10_000
+        local_config = {**config, "recursion_limit": estimated_contacts * 15}
         result = await app_graph.ainvoke(state, local_config)
         if isinstance(result, dict):
             state = VeriState(**result)
