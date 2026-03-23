@@ -795,7 +795,7 @@ async def search_filings(state: SearcherState) -> SearcherState:
             results = await search_with_fallback(query, max_results=8)
             for r in results:
                 raw_contacts.extend(
-                    _extract_names_from_snippet(r["snippet"], company_name, r["url"])
+                    _extract_names_from_snippet(r.snippet, company_name, r.url)
                 )
         except Exception as e:
             logger.warning("searcher_filings_query_error", query=query[:60], error=str(e))
@@ -830,7 +830,7 @@ async def search_web(state: SearcherState) -> SearcherState:
                 results = await search(query, provider=provider, max_results=6)
                 for r in results:
                     raw_contacts.extend(
-                        _extract_names_from_snippet(r["snippet"], company_name, r["url"])
+                        _extract_names_from_snippet(r.snippet, company_name, r.url)
                     )
             except Exception as e:
                 logger.warning("searcher_web_query_error", provider=provider, error=str(e))
@@ -884,7 +884,7 @@ async def search_pdfs(state: SearcherState) -> SearcherState:
             results = await search_with_fallback(query, max_results=5, providers=["tavily", "ddg"])
             for r in results:
                 raw_contacts.extend(
-                    _extract_names_from_snippet(r["snippet"], state.target_company, r["url"])
+                    _extract_names_from_snippet(r.snippet, state.target_company, r.url)
                 )
         except Exception as e:
             logger.warning("searcher_pdf_query_error", error=str(e))
@@ -1025,8 +1025,8 @@ async def validate_linkedin(state: SearcherState) -> SearcherState:
                         max_results=3,
                     )
                     for r in results:
-                        if "linkedin.com/in/" in r["url"]:
-                            contact = contact.model_copy(update={"linkedin_url": r["url"].split("?")[0]})
+                        if "linkedin.com/in/" in r.url:
+                            contact = contact.model_copy(update={"linkedin_url": r.url.split("?")[0]})
                             break
                     if contact.linkedin_url:
                         break

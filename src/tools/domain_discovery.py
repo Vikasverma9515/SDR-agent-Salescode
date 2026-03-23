@@ -156,9 +156,9 @@ async def discover_domain(company_name: str) -> DomainInfo:
                 continue
 
             for r in results:
-                all_snippets.append(r["snippet"])
-                if r["url"]:
-                    sources_used.append(r["url"])
+                all_snippets.append(r.snippet)
+                if r.url:
+                    sources_used.append(r.url)
 
             if all_snippets:
                 break
@@ -278,7 +278,7 @@ async def _probe_email_format(company_name: str, domain: str) -> str | None:
                 timeout=12,
             )
             for r in results:
-                matches = email_re.findall(r["snippet"])
+                matches = email_re.findall(r.snippet)
                 found_emails.extend(m.lower() for m in matches)
         except Exception:
             continue
@@ -301,7 +301,7 @@ async def _probe_email_format(company_name: str, domain: str) -> str | None:
             timeout=12,
         )
         for r in pdf_results:
-            matches = email_re.findall(r["snippet"])
+            matches = email_re.findall(r.snippet)
             found_emails.extend(m.lower() for m in matches)
     except Exception:
         pass

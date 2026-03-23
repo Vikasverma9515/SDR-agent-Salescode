@@ -140,7 +140,7 @@ async def ddg_sweep(state: VeriState) -> VeriState:
     snippets = []
     for query in queries:
         results = await search(query, provider="ddg", max_results=5)
-        snippets.extend([r["snippet"] for r in results])
+        snippets.extend([r.snippet for r in results])
 
     combined = "\n".join(snippets[:10])
     stale = _has_stale_signal(combined, contact.full_name, contact.company)
@@ -209,7 +209,7 @@ async def tavily_fallback(state: VeriState) -> VeriState:
         provider="tavily",
         max_results=5,
     )
-    combined = "\n".join(r["snippet"] for r in results[:5])
+    combined = "\n".join(r.snippet for r in results[:5])
     evidence["tavily"] = combined[:500]
     evidence["tavily_stale"] = _has_stale_signal(combined, contact.full_name, contact.company)
     evidence["tavily_positive"] = _has_positive_signal(combined, contact.full_name, contact.company)
@@ -233,7 +233,7 @@ async def perplexity_deep(state: VeriState) -> VeriState:
         provider="perplexity",
         max_results=5,
     )
-    combined = "\n".join(r["snippet"] for r in results[:5])
+    combined = "\n".join(r.snippet for r in results[:5])
     evidence = _evidence.setdefault(state.current_index, {})
     evidence["perplexity"] = combined[:500]
     evidence["perplexity_stale"] = _has_stale_signal(combined, contact.full_name, contact.company)

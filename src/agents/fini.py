@@ -188,7 +188,7 @@ async def normalize_company(state: FiniState) -> FiniState:
             max_results=5,
         )
 
-        all_text = " ".join(r["snippet"] for r in results)
+        all_text = " ".join(r.snippet for r in results)
 
         # Try to find the most commonly referenced clean name in snippets
         normalized = _extract_normalized_name(company.raw_name, all_text, results)
@@ -236,7 +236,7 @@ async def _fetch_account_size(company_name: str) -> str:
             ),
             timeout=12,
         )
-        text = " ".join(r["snippet"] for r in results).lower()
+        text = " ".join(r.snippet for r in results).lower()
 
         # Revenue signals (USD/INR billions → Large)
         if re.search(r'\$\s*\d+\s*b(?:illion)?|\b\d+[,\d]*\s*crore|\bfortune\s*\d+|\bfootball\b|\blisted\b', text):
@@ -287,7 +287,7 @@ def _extract_normalized_name(raw_name: str, all_text: str, results: list) -> str
     # Collect candidate names from page titles (more official than snippets)
     title_candidates = []
     for r in results:
-        title = r.get("title", "")
+        title = r.title or ""
         # Look for patterns like "CompanyName - About" or "CompanyName | Official"
         # Extract the part before " - ", " | ", " : "
         for sep in [" - ", " | ", " : ", " – "]:
