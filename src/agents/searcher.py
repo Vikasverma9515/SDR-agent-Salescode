@@ -1083,13 +1083,112 @@ async def validate_linkedin(state: SearcherState) -> SearcherState:
 
 
 # ---------------------------------------------------------------------------
+# Email format detection via LLM Structured Outputs
+# ---------------------------------------------------------------------------
+
+async def _detect_email_format_llm(domain: str, company: str) -> str | None:
+    """
+    Use GPT-5 with web_search + Structured Outputs (JSON schema) to detect
+    the email format for a domain. Returns a full format string like
+    '{first}.{last}@domain.com', or None if unknown.
+    """
+    import json
+    from openai import AsyncOpenAI
+    from src.tools.domain_discovery import _EMAIL_PATTERNS
+
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return None
+
+    _oai = AsyncOpenAI(api_key=settings.openai_api_key)
+    patterns_str = "\n".join(f"- {p}" for p in _EMAIL_PATTERNS)
+    prompt = (
+        f"Find the email format used by employees at {company} (domain: {domain}).\n"
+        f"Search for real employee emails — LinkedIn, email finders, press releases, PDFs.\n"
+        f"Pick EXACTLY ONE pattern from this list:\n{patterns_str}\n"
+        f"Or return 'unknown' if you cannot determine it with confidence."
+    )
+
+    try:
+        resp = await _oai.responses.create(
+            model="gpt-5",
+            tools=[{"type": "web_search"}],
+            input=prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "email_format_result",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "pattern": {
+                                    "type": "string",
+                                    "enum": list(_EMAIL_PATTERNS) + ["unknown"],
+                                }
+                            },
+                            "required": ["pattern"],
+                            "additionalProperties": False,
+                        },
+                    }
+                }
+            },
+        )
+        for item in resp.output:
+            if item.type == "message":
+                for part in item.content:
+                    if part.type == "output_text":
+                        data = json.loads(part.text)
+                        pattern = data.get("pattern", "unknown")
+                        if pattern != "unknown" and pattern in _EMAIL_PATTERNS:
+                            logger.info("searcher_enrich_format_llm", domain=domain, pattern=pattern)
+                            return f"{pattern}@{domain}"
+                        logger.warning("searcher_enrich_format_llm_unknown", domain=domain, pattern=pattern)
+                        return None
+    except Exception as e:
+        logger.warning("searcher_enrich_format_llm_error", domain=domain, error=str(e))
+
+    return None
+
+
+async def _try_patterns_zerobounce(full_name: str, domain: str) -> tuple[str | None, str | None, float | None]:
+    """
+    Try all 18 email patterns sequentially with ZeroBounce.
+    Stops at first valid or catch-all hit.
+    Returns (email, status, score) or (None, 'invalid', None).
+    """
+    from src.tools.domain_discovery import _EMAIL_PATTERNS
+
+    for pattern in _EMAIL_PATTERNS:
+        email = construct_email(full_name, f"{pattern}@{domain}", domain)
+        if not email:
+            continue
+        try:
+            result = await zb.validate_email(email)
+            status = result.get("status", "unknown")
+            if status in ("valid", "catch-all"):
+                logger.info("searcher_pattern_hit", email=email, status=status, pattern=pattern)
+                return email, status, result.get("score")
+        except Exception:
+            continue
+
+    return None, "invalid", None
+
+
+# ---------------------------------------------------------------------------
 # Node: enrich_contacts
 # ---------------------------------------------------------------------------
 
 async def enrich_contacts(state: SearcherState) -> SearcherState:
     """
     Role classification (keyword table), email construction, ZeroBounce.
-    Only process contacts that pass dedup and belong to missing DM roles.
+
+    Email priority:
+    1. Fini's email_format (from Target Accounts) → ZeroBounce
+    2. If no hit → try all 18 patterns → ZeroBounce
+    3. If no Fini format → GPT-5 Structured Output detection → ZeroBounce
+    4. If no hit → try all 18 patterns → ZeroBounce
     """
     logger.info("searcher_enrich",
                 company=state.target_company,
@@ -1098,66 +1197,28 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                 domain=state.target_domain or "(empty)")
 
     domain = state.target_domain
-    email_format = ""
-    # Always ask GPT-5 web search for the email format — more reliable than any cached value.
-    # Sheet value may be stale; GPT-5 finds real evidence (PDFs, event pages, etc.).
-    if domain:
-        try:
-            from openai import AsyncOpenAI
-            from src.tools.domain_discovery import _EMAIL_PATTERNS
-            _oai = AsyncOpenAI(api_key=get_settings().openai_api_key)
-            patterns_str = "\n".join(f"- {p}" for p in _EMAIL_PATTERNS)
-            _prompt = (
-                f"You are an email format detective. Given a company domain, find the email format they use for employees.\n\n"
-                f"Domain: {domain}\nCompany: {state.target_company}\n\n"
-                f"Search for real employee emails at this domain — look at LinkedIn, email finders, event pages, press releases, PDFs, anything public.\n\n"
-                f"Once you find evidence, pick EXACTLY ONE format from this list:\n{patterns_str}\n\n"
-                f"Where: first=firstname, last=lastname, first_initial=first letter of firstname, last_initial=first letter of lastname\n\n"
-                f"Reply with ONLY the format string from the list above, nothing else. Example reply: {{first}}.{{last}}\n"
-                f"If you truly cannot determine it, reply: unknown"
-            )
-            _resp = await _oai.responses.create(
-                model="gpt-5",
-                tools=[{"type": "web_search"}],
-                input=_prompt,
-            )
-            _gpt_fmt = ""
-            for _item in _resp.output:
-                if _item.type == "message":
-                    for _part in _item.content:
-                        if _part.type == "output_text":
-                            _gpt_fmt = _part.text.strip()
-                            break
-            if _gpt_fmt and _gpt_fmt != "unknown" and _gpt_fmt in _EMAIL_PATTERNS:
-                email_format = f"{_gpt_fmt}@{domain}"
-                logger.info("searcher_enrich_format_gpt5", domain=domain, pattern=_gpt_fmt)
-                # Save back to Target Accounts col F so Fini has it for future runs
-                try:
-                    from rapidfuzz import fuzz as _fuzz2
-                    ta_records = await sheets.read_all_records(sheets.TARGET_ACCOUNTS)
-                    match_name = (state.target_normalized_name or state.target_company).lower()
-                    for i, row in enumerate(ta_records):
-                        sn = str(row.get("Company Name", "") or "").lower()
-                        if _fuzz2.token_set_ratio(match_name, sn) >= 60:
-                            await sheets.update_row_cells(
-                                sheets.TARGET_ACCOUNTS, i + 2, 6, [email_format]
-                            )
-                            logger.info("searcher_enrich_format_saved", row=i + 2, fmt=email_format)
-                            break
-                except Exception as _se:
-                    logger.warning("searcher_enrich_format_save_error", error=str(_se))
-            else:
-                logger.warning("searcher_enrich_format_gpt5_miss", domain=domain, response=_gpt_fmt)
-        except Exception as e:
-            logger.warning("searcher_enrich_format_gpt5_error", domain=domain, error=str(e))
+    fini_format = state.target_email_format or ""  # e.g. "{first}.{last}@domain.com"
 
-    if not email_format and domain:
-        # Absolute fallback
-        email_format = f"{{first}}.{{last}}@{domain}"
-        logger.warning("searcher_enrich_fallback_format",
-                       company=state.target_company,
-                       domain=domain,
-                       msg="GPT-5 found no pattern — using {first}.{last} fallback")
+    # If Fini has no format, ask GPT-5 (Structured Output)
+    gpt_format: str | None = None
+    if domain and not fini_format:
+        gpt_format = await _detect_email_format_llm(domain, state.target_company)
+        if gpt_format:
+            # Save back to Target Accounts col F for future runs
+            try:
+                from rapidfuzz import fuzz as _fuzz2
+                ta_records = await sheets.read_all_records(sheets.TARGET_ACCOUNTS)
+                match_name = (state.target_normalized_name or state.target_company).lower()
+                for i, row in enumerate(ta_records):
+                    sn = str(row.get("Company Name", "") or "").lower()
+                    if _fuzz2.token_set_ratio(match_name, sn) >= 60:
+                        await sheets.update_row_cells(
+                            sheets.TARGET_ACCOUNTS, i + 2, 6, [gpt_format]
+                        )
+                        logger.info("searcher_enrich_format_saved", row=i + 2, fmt=gpt_format)
+                        break
+            except Exception as _se:
+                logger.warning("searcher_enrich_format_save_error", error=str(_se))
 
     enriched: list[Contact] = []
     for contact in state.discovered_contacts:
@@ -1165,7 +1226,7 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
         bucket = _classify_role(contact.role_title or "")
         contact = contact.model_copy(update={"role_bucket": bucket})
 
-        # Only keep DM and Influencer contacts — skip GateKeeper and Unknown
+        # Only keep DM and Influencer contacts
         if bucket not in ("DM", "Influencer"):
             logger.info(
                 "searcher_enrich_skip",
@@ -1175,19 +1236,71 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
             )
             continue
 
-        # Email construction
-        if not contact.email and email_format:
-            email = construct_email(contact.full_name, email_format, state.target_domain)
-            if email:
-                contact = contact.model_copy(update={"email": email})
+        # Email construction + ZeroBounce
+        if not contact.email and domain:
+            primary_format = fini_format or gpt_format
 
-        # ZeroBounce validation
-        if contact.email and contact.email_status == "pending":
+            if primary_format:
+                # Step 1: try the known format (Fini or GPT)
+                candidate = construct_email(contact.full_name, primary_format, domain)
+                hit_email, hit_status, hit_score = None, None, None
+
+                if candidate:
+                    try:
+                        result = await zb.validate_email(candidate)
+                        hit_status = result.get("status", "unknown")
+                        hit_score = result.get("score")
+                        if hit_status in ("valid", "catch-all"):
+                            hit_email = candidate
+                            logger.info("searcher_primary_format_hit",
+                                        email=candidate, status=hit_status,
+                                        source="fini" if fini_format else "llm")
+                    except Exception as e:
+                        logger.warning("searcher_zerobounce_error", email=candidate, error=str(e))
+
+                if hit_email:
+                    contact = contact.model_copy(update={
+                        "email": hit_email,
+                        "email_status": hit_status,
+                        "zerobounce_score": hit_score,
+                    })
+                else:
+                    # Step 2: primary format didn't hit — try all 18 patterns
+                    logger.info("searcher_primary_format_miss",
+                                email=candidate, status=hit_status,
+                                fallback="18_patterns")
+                    pat_email, pat_status, pat_score = await _try_patterns_zerobounce(
+                        contact.full_name, domain
+                    )
+                    if pat_email:
+                        contact = contact.model_copy(update={
+                            "email": pat_email,
+                            "email_status": pat_status,
+                            "zerobounce_score": pat_score,
+                        })
+                    else:
+                        # Keep candidate email, mark invalid
+                        contact = contact.model_copy(update={
+                            "email": candidate or "",
+                            "email_status": "invalid",
+                        })
+            else:
+                # No format at all — try 18 patterns directly
+                pat_email, pat_status, pat_score = await _try_patterns_zerobounce(
+                    contact.full_name, domain
+                )
+                if pat_email:
+                    contact = contact.model_copy(update={
+                        "email": pat_email,
+                        "email_status": pat_status,
+                        "zerobounce_score": pat_score,
+                    })
+
+        elif contact.email and contact.email_status == "pending":
+            # Contact already has an email (e.g. from Apollo) — just validate
             try:
                 result = await zb.validate_email(contact.email)
                 status = result.get("status", "unknown")
-                if status not in ("valid", "invalid", "catch-all", "unknown"):
-                    status = "unknown"
                 contact = contact.model_copy(update={
                     "email_status": status,
                     "zerobounce_score": result.get("score"),
@@ -1198,7 +1311,7 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
 
         # Set domain
         if not contact.domain:
-            contact = contact.model_copy(update={"domain": state.target_domain})
+            contact = contact.model_copy(update={"domain": domain})
 
         enriched.append(contact)
 
