@@ -97,9 +97,9 @@ export default function App() {
       {/* Main */}
       <main className="flex-1 overflow-y-auto bg-grid relative">
         {/* Build timestamp badge */}
-        <div className="absolute top-3 right-4 z-10 flex items-center gap-1.5 bg-white/[0.03] border border-white/[0.07] rounded px-2 py-1">
+        <div className="fixed bottom-4 right-4 z-50 flex items-center gap-1.5 bg-white/[0.04] border border-white/[0.08] rounded px-2.5 py-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
-          <span className="text-[9px] font-mono text-gray-600 uppercase tracking-wider">
+          <span className="text-[9px] font-mono text-gray-500 uppercase tracking-wider">
             deployed {new Date(__BUILD_TIME__).toLocaleString()}
           </span>
         </div>
