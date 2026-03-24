@@ -17,6 +17,12 @@ const NAV_ITEMS = [
 export default function App() {
   const [activePage, setActivePage] = useState('dashboard')
   const [configStatus, setConfigStatus] = useState(null)
+  const [veriThreadId, setVeriThreadId] = useState(null)
+
+  const navigateToVeri = (threadId) => {
+    setVeriThreadId(threadId || null)
+    setActivePage('veri')
+  }
 
   useEffect(() => {
     fetch(apiUrl('/api/config/check')).then(r => r.json()).then(setConfigStatus).catch(() => null)
@@ -106,8 +112,8 @@ export default function App() {
         <div className="page-transition min-h-full">
           {activePage === 'dashboard' && <DashboardPage onNavigate={setActivePage} />}
           {activePage === 'fini'      && <FiniPage />}
-          {activePage === 'searcher'  && <SearcherPage />}
-          {activePage === 'veri'      && <VeriPage />}
+          {activePage === 'searcher'  && <SearcherPage onNavigateVeri={navigateToVeri} />}
+          {activePage === 'veri'      && <VeriPage initialThreadId={veriThreadId} />}
           {activePage === 'settings'  && <SettingsPage />}
         </div>
       </main>

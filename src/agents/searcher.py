@@ -101,6 +101,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
     domain = state.target_domain or ""
     email_format = state.target_email_format or ""
     account_type = ""
+    account_size = ""
     normalized_company_name = state.target_company  # fallback to input if not in sheet
 
     try:
@@ -136,6 +137,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
             _ef_key = next((k for k in best_row if str(k).startswith("Email Format")), "Email Format")
             email_format = email_format or str(best_row.get(_ef_key, "") or "").strip()
             account_type = str(best_row.get("Account type", "") or "").strip()
+            account_size = str(best_row.get("Account Size", "") or "").strip()
             logger.info("searcher_target_accounts_match",
                         input=state.target_company,
                         matched=normalized_company_name,
@@ -201,6 +203,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
             "target_domain": domain,
             "target_email_format": email_format,
             "target_region": account_type,
+            "target_account_size": account_size,
             "target_normalized_name": normalized_company_name,
             "missing_dm_roles": [],
             "phase": "done",
@@ -228,6 +231,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
         "target_domain": domain,
         "target_email_format": email_format,
         "target_region": account_type,
+        "target_account_size": account_size,
         "target_normalized_name": normalized_company_name,
         "missing_dm_roles": missing_roles,
         "phase": "unipile_search",
@@ -1388,6 +1392,46 @@ async def write_contacts_to_sheet(state: SearcherState) -> SearcherState:
                 )
 
         logger.info("searcher_sheet_written", count=len(state.discovered_contacts), tab=sheets.SEARCHER_OUTPUT)
+
+        # --- Also write to First Clean List so Veri can auto-verify ---
+        try:
+            await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
+            for contact in state.discovered_contacts:
+                # Split full name into first/last
+                name_parts = contact.full_name.strip().split(None, 1)
+                first_name = name_parts[0] if name_parts else ""
+                last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+                # Map role_bucket back to buying role label
+                bucket_label_map = {
+                    "DM": "Decision Maker",
+                    "Champion": "Champion",
+                    "Influencer": "Influencer",
+                    "GateKeeper": "Gate Keeper",
+                    "Unknown": "",
+                }
+
+                fcl_row = [
+                    contact.company,                                        # A: Company Name
+                    state.target_normalized_name or contact.company,        # B: Normalized Company Name
+                    contact.domain or state.target_domain or "",            # C: Company Domain Name
+                    state.target_region or "",                              # D: Account type
+                    state.target_account_size or "",                        # E: Account Size
+                    state.target_region or "",                              # F: Country (use region as fallback)
+                    first_name,                                             # G: First Name
+                    last_name,                                              # H: Last Name
+                    contact.role_title or "",                               # I: Job titles (English)
+                    bucket_label_map.get(contact.role_bucket, ""),          # J: Buying Role
+                    contact.linkedin_url or "",                             # K: Linekdin Url
+                    contact.email or "",                                    # L: Email
+                    "",                                                     # M: Phone-1
+                    "",                                                     # N: Phone-2
+                ]
+                await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
+
+            logger.info("searcher_fcl_written", count=len(state.discovered_contacts), tab=sheets.FIRST_CLEAN_LIST)
+        except Exception as e:
+            logger.warning("searcher_fcl_write_error", error=str(e))
 
     except Exception as e:
         logger.error("searcher_sheet_write_error", error=str(e))

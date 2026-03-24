@@ -456,11 +456,27 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest):
         else:
             state = result
 
+        # --- Auto-trigger Veri on all pending contacts ---
+        veri_thread_id = None
+        if state.discovered_contacts:
+            veri_thread_id = str(uuid.uuid4())
+            _log_queues[veri_thread_id] = asyncio.Queue()
+            _active_runs[veri_thread_id] = {
+                "agent": "veri",
+                "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "auto_triggered_by": thread_id,
+            }
+            await _emit_log(thread_id, "info",
+                f"Auto-triggering Veri agent for all pending contacts")
+            asyncio.create_task(_veri_task(veri_thread_id, row_start=None, row_end=None))
+
         _active_runs[thread_id]["status"] = "completed"
         await _emit_event(thread_id, "completed", {
             "contacts_appended": len(state.discovered_contacts),
             "contacts": [c.model_dump() for c in state.discovered_contacts[:50]],
             "errors": state.errors,
+            "veri_thread_id": veri_thread_id,
         })
 
     except Exception as e:

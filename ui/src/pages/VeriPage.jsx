@@ -1,14 +1,26 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { apiUrl } from '../lib/api'
 import LogStream from '../components/LogStream'
 
-export default function VeriPage() {
+export default function VeriPage({ initialThreadId }) {
   const [running, setRunning] = useState(false)
   const [threadId, setThreadId] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [rowStart, setRowStart] = useState('')
   const [rowEnd, setRowEnd] = useState('')
+  const didAutoConnect = useRef(false)
+
+  // Auto-connect to an existing Veri run (triggered by Searcher)
+  useEffect(() => {
+    if (initialThreadId && !didAutoConnect.current) {
+      didAutoConnect.current = true
+      setThreadId(initialThreadId)
+      setRunning(true)
+      setResult(null)
+      setError(null)
+    }
+  }, [initialThreadId])
 
   const handleEvent = useCallback((msg) => {
     if (msg.type === 'completed') {

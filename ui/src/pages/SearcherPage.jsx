@@ -12,18 +12,22 @@ const ROLE_COLORS = {
 
 const DEFAULT_DM_ROLES = 'VP Ecommerce,CDO,Head of Digital,CTO,CMO,VP Marketing,VP Sales'
 
-export default function SearcherPage() {
+export default function SearcherPage({ onNavigateVeri }) {
   const [companies, setCompanies] = useState('')
   const [dmRoles, setDmRoles] = useState(DEFAULT_DM_ROLES)
   const [running, setRunning] = useState(false)
   const [threadId, setThreadId] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  const [veriThreadId, setVeriThreadId] = useState(null)
 
   const handleEvent = useCallback((msg) => {
     if (msg.type === 'completed') {
       setRunning(false)
       setResult(msg.data)
+      if (msg.data?.veri_thread_id) {
+        setVeriThreadId(msg.data.veri_thread_id)
+      }
     } else if (msg.type === 'error') {
       setRunning(false)
       setError(msg.data.error)
@@ -197,6 +201,29 @@ export default function SearcherPage() {
           {result.errors?.length > 0 && (
             <div className="text-xs font-mono text-red-400 mt-2">{result.errors.length} errors</div>
           )}
+        </div>
+      )}
+
+      {veriThreadId && (
+        <div className="mt-4 border border-emerald-500/20 bg-emerald-500/5 rounded p-4 flex items-center justify-between">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <div className="relative w-2 h-2">
+                <span className="absolute inset-0 rounded-full bg-emerald-400 ping-slow" />
+                <span className="relative block w-2 h-2 rounded-full bg-emerald-400" />
+              </div>
+              <span className="text-emerald-400 font-mono text-xs">VERI AUTO-TRIGGERED</span>
+            </div>
+            <div className="text-xs font-mono text-gray-400">
+              Verification agent started automatically for all pending contacts
+            </div>
+          </div>
+          <button
+            onClick={() => onNavigateVeri?.(veriThreadId)}
+            className="btn-primary text-xs shrink-0"
+          >
+            View Veri Progress →
+          </button>
         </div>
       )}
 

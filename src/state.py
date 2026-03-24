@@ -58,6 +58,7 @@ class FiniState(BaseModel):
     current_index: int = 0
     submit_to_n8n: bool = False
     region: str = ""  # operator-provided region, applied to all companies in this batch
+    enrichment_done: bool = False  # True after parallel_enrich_all completes
     errors: Annotated[list[str], operator.add] = Field(default_factory=list)
     status: Literal["running", "awaiting_confirmation", "completed", "failed"] = "running"
 
@@ -71,6 +72,7 @@ class SearcherState(BaseModel):
     target_org_id: str = ""             # LinkedIn org ID from Target Accounts (Fini's work)
     target_email_format: str = ""       # email format from Target Accounts
     target_region: str = ""             # Account type / region from Target Accounts (e.g. "India")
+    target_account_size: str = ""       # Account Size from Target Accounts (Small/Medium/Large)
     target_normalized_name: str = ""    # Normalized company name from Target Accounts (col A)
     # All companies to process (list of {"name": str})
     target_companies: list[dict] = Field(default_factory=list)

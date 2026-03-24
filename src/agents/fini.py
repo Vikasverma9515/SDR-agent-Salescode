@@ -2,9 +2,9 @@
 Fini - Target Builder Agent
 
 Graph:
-START -> scrape_linkedin_org -> normalize_company -> discover_domain
+START -> parallel_enrich_all (normalize + org-lookup + domain for ALL companies concurrently)
       -> confirm_with_operator [INTERRUPT] -> write_to_sheet
-      -> submit_n8n (conditional) -> advance_or_finish -> (loop or END)
+      -> submit_n8n (conditional) -> advance_or_finish -> (loop back to confirm or END)
 """
 from __future__ import annotations
 
@@ -334,7 +334,113 @@ def _name_overlap(a: str, b: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Node: discover_domain
+# Helper: enrich a single company (normalize + org lookup + domain)
+# ---------------------------------------------------------------------------
+
+async def _enrich_single_company(company: TargetCompany, region: str) -> TargetCompany:
+    """Run all enrichment steps for one company. Called concurrently for all companies."""
+
+    # --- Step 1: Normalize name ---
+    try:
+        results = await search_with_fallback(
+            f'"{company.raw_name}" company official name',
+            max_results=5,
+        )
+        all_text = " ".join(r.snippet for r in results)
+        normalized = _extract_normalized_name(company.raw_name, all_text, results)
+        account_size = await _fetch_account_size(company.raw_name)
+        company = company.model_copy(update={
+            "normalized_name": normalized,
+            "account_type": region or company.account_type or "",
+            "account_size": account_size,
+        })
+    except Exception as e:
+        logger.warning("enrich_normalize_error", company=company.raw_name, error=str(e))
+        company = company.model_copy(update={
+            "normalized_name": company.raw_name,
+            "account_type": region or company.account_type or "",
+        })
+
+    # --- Step 2: LinkedIn org lookup + Sales Nav URL ---
+    try:
+        lookup_name = company.normalized_name or company.raw_name
+        org_info = await unipile.get_company_org_id(lookup_name)
+        if org_info["org_id"]:
+            sales_nav_url = _build_sales_nav_url(
+                org_info["org_id"],
+                org_info["name"] or company.raw_name,
+                region,
+            )
+            company = company.model_copy(update={
+                "linkedin_org_id": org_info["org_id"],
+                "sales_nav_url": sales_nav_url,
+            })
+        elif org_info["error"]:
+            logger.warning("enrich_org_id_failed", company=company.raw_name, error=org_info["error"])
+    except Exception as e:
+        logger.warning("enrich_scrape_error", company=company.raw_name, error=str(e))
+
+    # --- Step 3: Domain + email format ---
+    try:
+        name = company.normalized_name or company.raw_name
+        domain_info = await discover_domain(name)
+        company = company.model_copy(update={
+            "domain": domain_info["domain"],
+            "email_format": domain_info["email_format"],
+        })
+    except Exception as e:
+        logger.warning("enrich_domain_error", company=company.raw_name, error=str(e))
+
+    logger.info(
+        "enrich_single_done",
+        company=company.raw_name,
+        normalized=company.normalized_name,
+        org_id=company.linkedin_org_id or "(none)",
+        domain=company.domain or "(none)",
+    )
+    return company
+
+
+# ---------------------------------------------------------------------------
+# Node: parallel_enrich_all
+# ---------------------------------------------------------------------------
+
+async def parallel_enrich_all(state: FiniState) -> FiniState:
+    """
+    Enrich ALL companies concurrently (normalize + org lookup + domain).
+    Skips on re-entry after confirmation (enrichment_done flag).
+    """
+    if state.enrichment_done:
+        return state  # already enriched on a previous invocation
+
+    logger.info("fini_parallel_enrich_start", count=len(state.companies))
+
+    tasks = [
+        _enrich_single_company(company, state.region)
+        for company in state.companies
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    companies = list(state.companies)
+    errors = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            errors.append(f"Enrichment failed for {companies[i].raw_name}: {result}")
+            logger.error("enrich_company_failed", company=companies[i].raw_name, error=str(result))
+        else:
+            companies[i] = result
+
+    logger.info("fini_parallel_enrich_done", count=len(companies), errors=len(errors))
+    return state.model_copy(update={
+        "companies": companies,
+        "enrichment_done": True,
+        "current_index": 0,
+        "errors": errors,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Node: discover_domain (kept for backwards compat, but unused in new graph)
 # ---------------------------------------------------------------------------
 
 async def fini_discover_domain(state: FiniState) -> FiniState:
@@ -515,7 +621,7 @@ def should_continue(state: FiniState) -> str:
         company = state.companies[state.current_index]
         if company.operator_confirmed and not company.sheet_row_written:
             return "write_to_sheet"
-    return "scrape_linkedin_org"
+    return "confirm_with_operator"
 
 
 # ---------------------------------------------------------------------------
@@ -543,19 +649,15 @@ async def build_fini_graph():
 
     graph = StateGraph(FiniState)
 
-    graph.add_node("scrape_linkedin_org", scrape_linkedin_org)
-    graph.add_node("normalize_company", normalize_company)
-    graph.add_node("discover_domain", fini_discover_domain)
+    graph.add_node("parallel_enrich_all", parallel_enrich_all)
     graph.add_node("confirm_with_operator", confirm_with_operator)
     graph.add_node("write_to_sheet", write_to_sheet)
     graph.add_node("submit_n8n", submit_n8n)
     graph.add_node("advance_or_finish", advance_or_finish)
 
-    graph.set_entry_point("normalize_company")
+    graph.set_entry_point("parallel_enrich_all")
 
-    graph.add_edge("normalize_company", "scrape_linkedin_org")
-    graph.add_edge("scrape_linkedin_org", "discover_domain")
-    graph.add_edge("discover_domain", "confirm_with_operator")
+    graph.add_edge("parallel_enrich_all", "confirm_with_operator")
     graph.add_conditional_edges("confirm_with_operator", after_confirm)
     graph.add_conditional_edges("write_to_sheet", should_submit_n8n)
     graph.add_edge("submit_n8n", "advance_or_finish")
