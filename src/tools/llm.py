@@ -24,6 +24,33 @@ from src.utils.logging import get_logger
 
 logger = get_logger("llm")
 
+# Global semaphore — limits concurrent OpenAI/Bedrock calls across all companies
+_LLM_CONCURRENCY = 2
+_llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
+
+# Circuit breaker — if OpenAI fails 2 times within 60s, switch to Bedrock permanently for this process
+_openai_failures: list[float] = []  # timestamps of recent failures
+_openai_dead = False  # once True, stays True for the entire process lifetime
+
+
+def _openai_is_broken() -> bool:
+    """Check if OpenAI has been permanently disabled."""
+    return _openai_dead
+
+
+def _record_openai_failure():
+    """Record an OpenAI failure. 2 failures within 60s = permanent switch to Bedrock."""
+    global _openai_dead
+    import time
+    now = time.time()
+    _openai_failures.append(now)
+    # Count failures in the last 60 seconds
+    recent = [t for t in _openai_failures if now - t <= 60]
+    if len(recent) >= 2:
+        _openai_dead = True
+        logger.warning("openai_circuit_breaker_permanent",
+                       msg="OpenAI failed 2x in 60s — switching to Bedrock for this session")
+
 
 # ---------------------------------------------------------------------------
 # OpenAI helpers
@@ -31,7 +58,7 @@ logger = get_logger("llm")
 
 async def _openai_responses(prompt: str, model: str = "gpt-5",
                             use_web_search: bool = False,
-                            max_retries: int = 2, wait_secs: int = 30) -> str:
+                            max_retries: int = 1, wait_secs: int = 10) -> str:
     """Call OpenAI Responses API. Retries on 429."""
     settings = get_settings()
     if not settings.openai_api_key:
@@ -67,7 +94,7 @@ async def _openai_responses(prompt: str, model: str = "gpt-5",
 
 
 async def _openai_chat(prompt: str, model: str = "gpt-4.1-mini",
-                       max_retries: int = 2, wait_secs: int = 30,
+                       max_retries: int = 1, wait_secs: int = 10,
                        max_tokens: int = 200, temperature: float = 0) -> str:
     """Call OpenAI Chat Completions API. Retries on 429."""
     settings = get_settings()
@@ -145,23 +172,30 @@ async def llm_web_search(prompt: str, model: str = "gpt-5") -> str:
     LLM call with web search capability.
     Tries OpenAI Responses API (has native web_search tool).
     Falls back to Claude Bedrock (no web search, but still answers from training data).
+    Max 2 concurrent LLM calls across all companies (semaphore).
     """
-    # Try OpenAI first
-    try:
-        result = await _openai_responses(prompt, model=model, use_web_search=True)
-        if result and result.strip():
-            return result
-    except Exception as e:
-        logger.warning("llm_web_search_openai_failed", error=str(e))
+    async with _llm_semaphore:
+        # Try OpenAI first (unless circuit breaker tripped)
+        if not _openai_is_broken():
+            try:
+                result = await _openai_responses(prompt, model=model, use_web_search=True)
+                if result and result.strip():
+                    return result
+            except Exception as e:
+                _record_openai_failure()
+                logger.warning("llm_web_search_openai_failed", error=str(e),
+                              failures=len(_openai_failures))
+        else:
+            logger.info("llm_web_search_openai_skipped", reason="circuit breaker open")
 
-    # Fallback to Claude Bedrock
-    try:
-        logger.info("llm_web_search_bedrock_fallback")
-        result = await _bedrock_claude(prompt)
-        if result and result.strip():
-            return result
-    except Exception as e:
-        logger.warning("llm_web_search_bedrock_failed", error=str(e))
+        # Fallback to Claude Bedrock
+        try:
+            logger.info("llm_web_search_bedrock_fallback")
+            result = await _bedrock_claude(prompt)
+            if result and result.strip():
+                return result
+        except Exception as e:
+            logger.warning("llm_web_search_bedrock_failed", error=str(e))
 
     return ""
 
@@ -171,24 +205,31 @@ async def llm_complete(prompt: str, model: str = "gpt-4.1-mini",
     """
     Simple LLM text completion (no web search).
     Tries OpenAI Chat Completions, falls back to Claude Bedrock.
+    Max 2 concurrent LLM calls across all companies (semaphore).
     """
-    # Try OpenAI first
-    try:
-        result = await _openai_chat(prompt, model=model,
-                                    max_tokens=max_tokens, temperature=temperature)
-        if result and result.strip():
-            return result
-    except Exception as e:
-        logger.warning("llm_complete_openai_failed", error=str(e))
+    async with _llm_semaphore:
+        # Try OpenAI first (unless circuit breaker tripped)
+        if not _openai_is_broken():
+            try:
+                result = await _openai_chat(prompt, model=model,
+                                            max_tokens=max_tokens, temperature=temperature)
+                if result and result.strip():
+                    return result
+            except Exception as e:
+                _record_openai_failure()
+                logger.warning("llm_complete_openai_failed", error=str(e),
+                              failures=len(_openai_failures))
+        else:
+            logger.info("llm_complete_openai_skipped", reason="circuit breaker open")
 
-    # Fallback to Claude Bedrock
-    try:
-        logger.info("llm_complete_bedrock_fallback")
-        result = await _bedrock_claude(prompt, max_tokens=max_tokens,
-                                       temperature=temperature)
-        if result and result.strip():
-            return result
-    except Exception as e:
-        logger.warning("llm_complete_bedrock_failed", error=str(e))
+        # Fallback to Claude Bedrock
+        try:
+            logger.info("llm_complete_bedrock_fallback")
+            result = await _bedrock_claude(prompt, max_tokens=max_tokens,
+                                           temperature=temperature)
+            if result and result.strip():
+                return result
+        except Exception as e:
+            logger.warning("llm_complete_bedrock_failed", error=str(e))
 
     return ""
