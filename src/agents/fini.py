@@ -464,6 +464,84 @@ async def _gpt_find_sales_nav(company_name: str, region: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Helper: extract parent company and clean name from raw input
+# ---------------------------------------------------------------------------
+
+# Regional suffixes to strip when looking for the global parent
+_REGIONAL_SUFFIXES = re.compile(
+    r'\s*[-/]\s*|\b(?:España|Espana|Iberia|Spain|France|Deutschland|Germany|Italy|Italia|'
+    r'UK|Brasil|Brazil|Mexico|México|India|China|Japan|APAC|EMEA|LATAM|'
+    r'Europe|Americas|Asia|Middle East|Africa|International|Global|'
+    r'Professional|Foodservice)\b',
+    re.IGNORECASE,
+)
+
+def _parse_company_variants(raw_name: str) -> dict:
+    """
+    Parse a company name to extract:
+    - parent_company: from parenthetical hints like "(Mahou owned)", "(Heineken distributor)"
+    - global_name: strip regional suffixes like "España", "Iberia"
+    - short_names: progressively shorter forms
+
+    Examples:
+        "Voldis (Mahou owned distribution)" → parent="Mahou", global="Voldis"
+        "Heineken España" → parent=None, global="Heineken"
+        "Antonio Sainero (Mahou distributor)" → parent="Mahou", global="Antonio Sainero"
+        "Nestlé España / Nestlé Professional" → parent=None, global="Nestlé"
+        "Coca-Cola Europacific Partners (CCEP) Iberia" → parent="Coca-Cola Europacific Partners", global="CCEP"
+    """
+    result = {"parent_company": None, "global_name": None, "short_names": []}
+
+    # --- Extract parent from parenthetical hints ---
+    # Patterns: "(Mahou owned)", "(Heineken distributor)", "(Damm owned)", "(Mahou)"
+    parent_patterns = [
+        r'\((\w[\w\s]*?)\s+(?:owned|distributor|distribution)\s+\w+\)',  # (Mahou owned distribution)
+        r'\((\w[\w\s]*?)\s+(?:owned|distributor|distribution|group)\)',  # (Mahou owned)
+    ]
+    for pat in parent_patterns:
+        m = re.search(pat, raw_name, re.IGNORECASE)
+        if m:
+            result["parent_company"] = m.group(1).strip()
+            break
+
+    # Also check for simple parenthetical that looks like a parent: "(Mahou)"
+    if not result["parent_company"]:
+        m = re.search(r'\(([A-Z][\w\s]{2,20})\)', raw_name)
+        if m:
+            candidate = m.group(1).strip()
+            # Only treat as parent if it's a known pattern (short, capitalized, no common words)
+            skip_words = {"JV", "formerly", "now", "aka", "including", "and", "or"}
+            if not any(w in candidate for w in skip_words) and len(candidate.split()) <= 3:
+                result["parent_company"] = candidate
+
+    # --- Strip parenthetical text for clean name ---
+    clean = re.sub(r'\s*\([^)]*\)', '', raw_name).strip()
+
+    # --- Handle "X / Y" format (take both parts) ---
+    slash_parts = [p.strip() for p in clean.split('/') if p.strip()]
+
+    # --- Strip regional suffixes to get global name ---
+    for part in slash_parts:
+        global_candidate = _REGIONAL_SUFFIXES.sub(' ', part).strip()
+        global_candidate = re.sub(r'\s+', ' ', global_candidate).strip()
+        # Strip trailing legal suffixes
+        global_candidate = _strip_legal_suffix(global_candidate)
+        if global_candidate and len(global_candidate) >= 3:
+            result["global_name"] = global_candidate
+            break
+
+    # --- Build short name variants ---
+    base = result["global_name"] or clean
+    words = base.split()
+    for length in range(len(words) - 1, 0, -1):
+        variant = " ".join(words[:length])
+        if len(variant) >= 3:
+            result["short_names"].append(variant)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Helper: enrich a single company (normalize + org lookup + domain)
 # ---------------------------------------------------------------------------
 
@@ -586,16 +664,73 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
             region,
         )
 
-    # Strategy 5: Try parent company name if different from normalized name
+    # Strategy 5: Ask LLM for parent company / LinkedIn name, then try variants
     if not org_id and not sales_nav_url:
-        parent_name = company.raw_name.strip()
-        if parent_name.lower() != lookup_name.lower():
-            logger.info("enrich_trying_parent_company", company=company.raw_name, parent=parent_name)
+        # Step A: Ask the LLM what the parent company is and what name LinkedIn would use
+        name_variants = []
+        try:
+            from src.tools.llm import llm_complete
+            llm_answer = await llm_complete(
+                f"The company is: \"{company.raw_name}\"\n"
+                f"1. Is this a subsidiary, local branch, or distributor of a larger company? "
+                f"If yes, what is the parent/global company name?\n"
+                f"2. What name would this company be listed under on LinkedIn?\n"
+                f"3. If this company is too small for LinkedIn, which parent company's "
+                f"LinkedIn page should we use instead?\n\n"
+                f"Reply in this exact format (one per line):\n"
+                f"PARENT: <parent company name or NONE>\n"
+                f"LINKEDIN_NAME: <name on LinkedIn>\n"
+                f"No explanation.",
+                max_tokens=100,
+            )
+            logger.info("enrich_llm_parent_lookup", company=company.raw_name, answer=llm_answer[:200])
 
-            # 5a: Search engines for parent
+            # Parse LLM response
+            for line in llm_answer.splitlines():
+                line = line.strip()
+                if line.upper().startswith("PARENT:"):
+                    val = line.split(":", 1)[1].strip()
+                    if val and val.upper() != "NONE":
+                        name_variants.append(val)
+                elif line.upper().startswith("LINKEDIN_NAME:"):
+                    val = line.split(":", 1)[1].strip()
+                    if val and val.upper() != "NONE":
+                        name_variants.append(val)
+        except Exception as e:
+            logger.warning("enrich_llm_parent_error", company=company.raw_name, error=str(e))
+
+        # Step B: Also add regex-parsed variants as backup
+        parsed = _parse_company_variants(company.raw_name)
+        if parsed["parent_company"]:
+            name_variants.append(parsed["parent_company"])
+        if parsed["global_name"] and parsed["global_name"].lower() != lookup_name.lower():
+            name_variants.append(parsed["global_name"])
+        if company.raw_name.strip().lower() != lookup_name.lower():
+            name_variants.append(company.raw_name.strip())
+        for short in parsed["short_names"]:
+            if short.lower() != lookup_name.lower():
+                name_variants.append(short)
+
+        # Deduplicate while preserving order
+        seen_variants = {lookup_name.lower()}
+        unique_variants = []
+        for v in name_variants:
+            vl = v.lower().strip()
+            if vl not in seen_variants and len(v.strip()) >= 3:
+                seen_variants.add(vl)
+                unique_variants.append(v.strip())
+
+        logger.info("enrich_variants_to_try", company=company.raw_name, variants=unique_variants[:5])
+
+        for variant in unique_variants:
+            if org_id:
+                break
+            logger.info("enrich_trying_name_variant", company=company.raw_name, variant=variant)
+
+            # 5a: Search engines for this variant
             try:
                 search_results = await search_with_fallback(
-                    f'"{parent_name}" site:linkedin.com/company',
+                    f'"{variant}" site:linkedin.com/company',
                     max_results=5,
                 )
                 for r in search_results:
@@ -607,19 +742,31 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
                                 org_info = await unipile.get_company_org_id(slug)
                                 if org_info["org_id"]:
                                     org_id = org_info["org_id"]
-                                    logger.info("enrich_org_found_parent_search", company=company.raw_name, org_id=org_id)
+                                    logger.info("enrich_org_found_variant_search",
+                                                company=company.raw_name, variant=variant, org_id=org_id)
                                     break
                             except Exception:
                                 pass
             except Exception as e:
-                logger.warning("enrich_parent_search_error", company=company.raw_name, error=str(e))
+                logger.warning("enrich_variant_search_error", company=company.raw_name, variant=variant, error=str(e))
 
-            # 5b: LLM for parent
+            # 5b: Unipile direct with this variant
+            if not org_id:
+                try:
+                    org_info = await unipile.get_company_org_id(variant)
+                    if org_info["org_id"]:
+                        org_id = org_info["org_id"]
+                        logger.info("enrich_org_found_variant_unipile",
+                                    company=company.raw_name, variant=variant, org_id=org_id)
+                except Exception:
+                    pass
+
+            # 5c: LLM for this variant
             if not org_id:
                 try:
                     from src.tools.llm import llm_web_search
                     content = await llm_web_search(
-                        f"What is the LinkedIn company page URL for {parent_name}? "
+                        f"What is the LinkedIn company page URL for {variant}? "
                         f"Return ONLY the URL like https://www.linkedin.com/company/SLUG"
                     )
                     if content:
@@ -633,19 +780,20 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
                                     org_info = await unipile.get_company_org_id(slug)
                                     if org_info["org_id"]:
                                         org_id = org_info["org_id"]
-                                        logger.info("enrich_org_found_parent_llm", company=company.raw_name, org_id=org_id)
+                                        logger.info("enrich_org_found_variant_llm",
+                                                    company=company.raw_name, variant=variant, org_id=org_id)
                                 except Exception:
                                     pass
                 except Exception as e:
-                    logger.warning("enrich_parent_llm_error", company=company.raw_name, error=str(e))
+                    logger.warning("enrich_variant_llm_error", company=company.raw_name, variant=variant, error=str(e))
 
-            # Build URL from parent org_id
-            if org_id and not sales_nav_url:
-                sales_nav_url = _build_sales_nav_url(
-                    org_id,
-                    parent_name,
-                    region,
-                )
+        # Build URL from variant org_id
+        if org_id and not sales_nav_url:
+            sales_nav_url = _build_sales_nav_url(
+                org_id,
+                company.normalized_name or company.raw_name,
+                region,
+            )
 
     # Strategy 6 (last resort): keyword-based Sales Nav URL — always works
     link_not_found = False
