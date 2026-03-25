@@ -20,6 +20,7 @@ export default function SearcherPage({ onNavigateVeri }) {
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [veriThreadId, setVeriThreadId] = useState(null)
+  const [veriResult, setVeriResult] = useState(null)
 
   const handleEvent = useCallback((msg) => {
     if (msg.type === 'completed') {
@@ -126,7 +127,7 @@ export default function SearcherPage({ onNavigateVeri }) {
               {[
                 ['01', 'Gap analysis', 'reads Target Accounts for org_id, domain, email_format · deduplicates against existing lists'],
                 ['02', 'Unipile search', 'LinkedIn people search via org_id + region filter'],
-                ['03', 'Company website', 'httpx scrape of leadership pages · GPT-5 fallback for 403/JS sites'],
+                ['03', 'Company website', 'httpx scrape of leadership pages · LLM fallback for 403/JS sites'],
                 ['04', 'Filings search', 'DDG + Perplexity — annual reports, board filings'],
                 ['05', 'Web + TheOrg', 'multi-source web search + org chart'],
                 ['06', 'PDF sweep', 'press releases, org charts — Tavily + DDG'],
@@ -205,25 +206,54 @@ export default function SearcherPage({ onNavigateVeri }) {
       )}
 
       {veriThreadId && (
-        <div className="mt-4 border border-emerald-500/20 bg-emerald-500/5 rounded p-4 flex items-center justify-between">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <div className="relative w-2 h-2">
-                <span className="absolute inset-0 rounded-full bg-emerald-400 ping-slow" />
-                <span className="relative block w-2 h-2 rounded-full bg-emerald-400" />
+        <div className="mt-4">
+          <div className="border border-emerald-500/20 bg-emerald-500/5 rounded p-4 flex items-center justify-between mb-3">
+            <div>
+              <div className="flex items-center gap-2 mb-1">
+                <div className="relative w-2 h-2">
+                  <span className="absolute inset-0 rounded-full bg-emerald-400 ping-slow" />
+                  <span className="relative block w-2 h-2 rounded-full bg-emerald-400" />
+                </div>
+                <span className="text-emerald-400 font-mono text-xs">VERI AUTO-TRIGGERED</span>
               </div>
-              <span className="text-emerald-400 font-mono text-xs">VERI AUTO-TRIGGERED</span>
+              <div className="text-xs font-mono text-gray-400">
+                Verification agent started automatically for all pending contacts
+              </div>
             </div>
-            <div className="text-xs font-mono text-gray-400">
-              Verification agent started automatically for all pending contacts
-            </div>
+            <button
+              onClick={() => onNavigateVeri?.(veriThreadId)}
+              className="btn-primary text-xs shrink-0"
+            >
+              Open Veri Page →
+            </button>
           </div>
-          <button
-            onClick={() => onNavigateVeri?.(veriThreadId)}
-            className="btn-primary text-xs shrink-0"
-          >
-            View Veri Progress →
-          </button>
+          {/* Show Veri progress inline */}
+          <div className="border border-emerald-500/10 rounded">
+            <div className="px-3 py-2 border-b border-emerald-500/10">
+              <span className="text-[10px] font-mono text-emerald-500/60 uppercase tracking-wider">Verifier Progress</span>
+            </div>
+            <LogStream threadId={veriThreadId} onEvent={(msg) => {
+              if (msg.type === 'completed') {
+                setVeriResult(msg.data)
+              }
+            }} />
+          </div>
+          {veriResult && (
+            <div className="mt-3 grid grid-cols-3 gap-3">
+              <div className="bg-emerald-500/10 rounded p-3 text-center">
+                <div className="text-2xl font-bold text-emerald-300 font-mono">{veriResult.verified ?? 0}</div>
+                <div className="text-[10px] font-mono text-emerald-600 mt-1 uppercase tracking-wider">Verified</div>
+              </div>
+              <div className="bg-amber-500/10 rounded p-3 text-center">
+                <div className="text-2xl font-bold text-amber-300 font-mono">{veriResult.review ?? 0}</div>
+                <div className="text-[10px] font-mono text-amber-600 mt-1 uppercase tracking-wider">Review</div>
+              </div>
+              <div className="bg-red-500/10 rounded p-3 text-center">
+                <div className="text-2xl font-bold text-red-300 font-mono">{veriResult.rejected ?? 0}</div>
+                <div className="text-[10px] font-mono text-red-600 mt-1 uppercase tracking-wider">Rejected</div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

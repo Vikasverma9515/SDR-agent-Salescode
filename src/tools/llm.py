@@ -56,7 +56,7 @@ def _record_openai_failure():
 # OpenAI helpers
 # ---------------------------------------------------------------------------
 
-async def _openai_responses(prompt: str, model: str = "gpt-5",
+async def _openai_responses(prompt: str, model: str = "gpt-4o-search-preview",
                             use_web_search: bool = False,
                             max_retries: int = 1, wait_secs: int = 10) -> str:
     """Call OpenAI Responses API. Retries on 429."""
@@ -207,7 +207,7 @@ async def _bedrock_claude_with_search(prompt: str, max_tokens: int = 1024,
 # Public API — try OpenAI, fallback to Claude Bedrock
 # ---------------------------------------------------------------------------
 
-async def llm_web_search(prompt: str, model: str = "gpt-5") -> str:
+async def llm_web_search(prompt: str, model: str = "gpt-4o-search-preview") -> str:
     """
     LLM call with web search capability.
     Tries OpenAI Responses API (has native web_search tool).

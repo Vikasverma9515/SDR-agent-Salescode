@@ -125,11 +125,23 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
                 best_score = score
                 best_row = row
 
+        # Also try matching against Parent Company Name (col B)
+        if best_score < 60:
+            for row in ta_records:
+                parent_name = str(row.get("Parent Company Name", "") or "").strip()
+                if not parent_name:
+                    continue
+                score = _fuzz.token_set_ratio(input_lower, parent_name.lower())
+                if score > best_score:
+                    best_score = score
+                    best_row = row
+
         if best_row is not None and best_score >= 60:
             normalized_company_name = str(best_row.get("Company Name", "") or state.target_company).strip()
             # Extract org_id from Sales Nav URL (col C) if present
             sales_nav_url = str(best_row.get("Sales Navigator Link", "") or "")
-            m = _re.search(r"organization%253A(\d+)", sales_nav_url)
+            # Match both single-encoded (%3A) and double-encoded (%253A) formats
+            m = _re.search(r"organization%(?:25)?3A(\d+)", sales_nav_url)
             if m:
                 org_id = m.group(1)
             domain = domain or str(best_row.get("Company Domain", "") or "").strip()
@@ -170,7 +182,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
                 full = f"{first} {last}".strip().lower()
                 if full:
                     existing_names.append(full)
-                role = str(row.get("Role Title", row.get("Title", row.get("Job Title", "")))).strip().lower()
+                role = str(row.get("Role Title", row.get("Title", row.get("Job Title", row.get("Job titles (English)", row.get("Job Title (English)", "")))))).strip().lower()
                 if role:
                     existing_role_titles.append(role)
     except Exception as e:
@@ -181,16 +193,44 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
         "CEO", "MD", "Managing Director", "CMO", "VP Marketing", "Head of Marketing",
         "CDO", "CTO", "VP Digital", "Head of Digital", "VP Ecommerce", "Head of Ecommerce",
         "VP Sales", "Head of Sales", "Sales Director", "General Manager", "Country Manager",
+        "Director of Sales", "Director of Marketing", "Director of Digital",
+        "Director of Ecommerce", "Director of Operations", "Director of Strategy",
+        "Chief Commercial Officer", "CCO", "COO", "CFO",
+        "Commercial Director", "Business Director", "National Sales Manager",
+        "Regional Director", "Area Manager", "Key Account Director",
     ]
 
-    # Check each requested role against existing role titles using fuzzy match
+    # Check each requested role against existing role titles using LOOSE fuzzy match
+    # We want to match broadly: "VP Marketing" should match "Director of Marketing",
+    # "Head of Sales" should match "Sales Director", etc.
     from rapidfuzz import fuzz as _role_fuzz
     missing_roles = []
+
+    # Extract core function keywords for broad matching
+    _ROLE_KEYWORDS = {
+        "marketing", "sales", "digital", "ecommerce", "e-commerce", "commercial",
+        "operations", "strategy", "technology", "finance", "hr", "supply chain",
+    }
+
     for role in requested_roles:
-        already_covered = any(
-            _role_fuzz.partial_ratio(role.lower(), existing.lower()) >= 80
-            for existing in existing_role_titles
-        )
+        role_lower = role.lower()
+        # Check if any existing title is a close match OR shares the same function keyword
+        already_covered = False
+        for existing in existing_role_titles:
+            existing_lower = existing.lower()
+            # Fuzzy match (lowered threshold from 80 to 60 for broader matching)
+            if _role_fuzz.partial_ratio(role_lower, existing_lower) >= 60:
+                already_covered = True
+                break
+            # Keyword overlap: if both mention "marketing" or "sales", consider covered
+            role_keywords = {kw for kw in _ROLE_KEYWORDS if kw in role_lower}
+            existing_keywords = {kw for kw in _ROLE_KEYWORDS if kw in existing_lower}
+            if role_keywords and role_keywords & existing_keywords:
+                # Same function — check if existing is also senior level
+                senior_words = {"vp", "director", "head", "chief", "manager", "lead", "president"}
+                if any(sw in existing_lower for sw in senior_words):
+                    already_covered = True
+                    break
         if not already_covered:
             missing_roles.append(role)
 
@@ -257,11 +297,27 @@ async def unipile_search(state: SearcherState) -> SearcherState:
 
     logger.info("searcher_unipile_search", company=state.target_company)
 
-    role_titles = state.missing_dm_roles or [
+    # Use broader search terms for Unipile — short keywords get more results
+    # than exact titles like "VP Marketing" which may miss "Director of Marketing"
+    _raw_roles = state.missing_dm_roles or [
         "CEO", "MD", "Managing Director", "CMO", "VP Marketing", "Head of Marketing",
         "CDO", "CTO", "VP Digital", "Head of Digital", "VP Ecommerce", "Head of Ecommerce",
         "VP Sales", "Head of Sales", "Sales Director", "General Manager", "Country Manager",
+        "Director of Sales", "Director of Marketing", "Director of Digital",
+        "Commercial Director", "Business Director", "COO", "CFO",
     ]
+    # Deduplicate and also create broad search terms
+    # e.g. "VP Marketing" → also search "Marketing" broadly
+    broad_terms = set()
+    for r in _raw_roles:
+        broad_terms.add(r)
+        # Extract the function word for broader matching
+        for keyword in ["Marketing", "Sales", "Digital", "Ecommerce", "Commercial",
+                        "Operations", "Strategy", "Technology", "Finance"]:
+            if keyword.lower() in r.lower():
+                broad_terms.add(f"Director {keyword}")
+                broad_terms.add(f"Head {keyword}")
+    role_titles = list(broad_terms)
 
     # Use org_id from Target Accounts if Fini already found it;
     # otherwise fall back to a fresh Unipile lookup.
@@ -285,6 +341,11 @@ async def unipile_search(state: SearcherState) -> SearcherState:
     region_id = REGION_IDS.get(state.target_region.lower(), "") if state.target_region else ""
     logger.info("searcher_unipile_org_ready", company=state.target_company, org_id=org_id,
                 region=state.target_region or "(none)", region_id=region_id or "(none)")
+
+    # Also add broad senior-level searches to catch people the specific titles miss
+    role_titles.extend(["Director", "VP", "Head", "Manager", "Chief"])
+    # Deduplicate
+    role_titles = list(dict.fromkeys(role_titles))
 
     # Search LinkedIn for people matching the requested role titles.
     # Try with region filter first; if no results, retry without (small companies often have
@@ -342,68 +403,10 @@ async def unipile_search(state: SearcherState) -> SearcherState:
             verified=still_at_company,
         )
 
-    # If Unipile returned results but all were dropped (ex-employees, wrong company),
-    # still trigger GPT-5 URL fallback to find verified current employees.
     if not new_contacts:
-        logger.info("searcher_unipile_no_results_gpt5_fallback", company=state.target_company,
-                    reason="all unipile results failed verify_profile" if people else "unipile returned 0 results")
-        gpt_contacts: list[Contact] = []
-        try:
-            from src.tools.llm import llm_web_search
-            import re as _re2
-            company_name = state.target_normalized_name or state.target_company
-            domain = state.target_domain or ""
-
-            for role in role_titles:
-                try:
-                    _prompt = (
-                        f"Find the LinkedIn profile URL of the current {role} at {company_name} (website: {domain}).\n"
-                        f"Search LinkedIn directly and return ONLY the LinkedIn profile URL "
-                        f"(linkedin.com/in/...). Nothing else. No explanation."
-                    )
-                    _text = await llm_web_search(_prompt)
-                    urls = _re2.findall(r'https?://(?:www\.|in\.)?linkedin\.com/in/[\w\-]+', _text)
-                    urls = [u.rstrip("/") for u in urls]
-                    logger.info("searcher_gpt5_urls", role=role, urls=urls)
-
-                    for li_url in urls:
-                        try:
-                            verification = await verify_profile(li_url, company_name)
-                            if not (verification.get("valid") and verification.get("still_employed") and verification.get("at_target_company")):
-                                logger.info("searcher_gpt5_verify_fail", url=li_url, reason=verification)
-                                continue
-                            full_name = verification.get("full_name") or ""
-                            current_role = verification.get("current_role") or role
-                            if not full_name:
-                                continue
-                            gpt_contacts.append(Contact(
-                                full_name=full_name,
-                                company=company_name,
-                                domain=state.target_domain,
-                                role_title=current_role,
-                                role_bucket=_classify_role(current_role),
-                                linkedin_url=li_url,
-                                linkedin_verified=True,
-                                provenance=["gpt5_unipile_verified"],
-                            ))
-                            logger.info("searcher_gpt5_verified_contact",
-                                        name=full_name, role=current_role, url=li_url)
-                            break  # found one for this role, move to next
-                        except Exception as e:
-                            logger.warning("searcher_gpt5_verify_error", url=li_url, error=str(e))
-                except Exception as e:
-                    logger.warning("searcher_gpt5_role_error", role=role, error=str(e))
-
-        except Exception as e:
-            logger.warning("searcher_unipile_gpt5_error", error=str(e))
-
-        if gpt_contacts:
-            logger.info("searcher_gpt5_contacts_found", count=len(gpt_contacts))
-            existing = list(state.discovered_contacts)
-            return state.model_copy(update={
-                "discovered_contacts": existing + gpt_contacts,
-                "target_org_id": org_id,
-            })
+        logger.info("searcher_unipile_no_results", company=state.target_company,
+                    reason="all unipile results failed verify_profile" if people else "unipile returned 0 results",
+                    msg="will rely on web/filings search")
 
     logger.info("searcher_unipile_done", company=state.target_company, found=len(new_contacts))
     existing = list(state.discovered_contacts)
@@ -514,63 +517,14 @@ def _role_looks_external(role_text: str) -> bool:
 
 async def _filter_garbage_names(contacts: list[Contact], company_name: str) -> list[Contact]:
     """
-    Use gpt-4.1-mini to filter out garbage names that passed heuristic checks.
-    e.g. "Pet Life", "View Larger", "Rx Appoints" — structurally look like FirstName LastName
-    but are not real people.
+    Filter out garbage names using heuristics only (no LLM).
+    _looks_like_name already does the heavy lifting during extraction.
+    This is a lightweight second pass.
     """
     if not contacts:
         return contacts
-
-    from src.config import get_settings
-    settings = get_settings()
-    if not settings.openai_api_key and not settings.aws_bearer_token_bedrock:
-        return contacts
-
-    # Only filter contacts that don't already have a verified LinkedIn
-    # (if Unipile verified them, the name is real)
-    needs_check = [c for c in contacts if not c.linkedin_verified]
-    already_verified = [c for c in contacts if c.linkedin_verified]
-
-    if not needs_check:
-        return contacts
-
-    try:
-        from src.tools.llm import llm_complete
-
-        names_list = "\n".join(f"{i+1}. {c.full_name}" for i, c in enumerate(needs_check))
-
-        prompt = (
-            f"Which of these are REAL HUMAN NAMES (not brand names, product names, "
-            f"button text, generic phrases, or company names)?\n\n"
-            f"{names_list}\n\n"
-            f"Reply with ONLY the numbers of real human names, comma-separated. "
-            f"Example: 1,3,5\n"
-            f"If none are real names, reply: none"
-        )
-
-        answer = (await llm_complete(prompt, max_tokens=100)).lower()
-        logger.info("searcher_name_filter_response", company=company_name, answer=answer)
-
-        if answer == "none":
-            kept = already_verified
-        else:
-            keep_indices = set()
-            for part in answer.replace(" ", "").split(","):
-                try:
-                    keep_indices.add(int(part) - 1)
-                except ValueError:
-                    pass
-            kept = already_verified + [c for i, c in enumerate(needs_check) if i in keep_indices]
-
-        dropped = len(contacts) - len(kept)
-        if dropped:
-            logger.info("searcher_name_filter_dropped",
-                        company=company_name, dropped=dropped, kept=len(kept))
-        return kept
-
-    except Exception as e:
-        logger.warning("searcher_name_filter_error", company=company_name, error=str(e))
-        return contacts
+    # All contacts already passed _looks_like_name during extraction — just return them
+    return contacts
 
 
 def _extract_from_html(html: str, company_name: str, domain: str = "") -> list[Contact]:
@@ -657,10 +611,10 @@ async def _scrape_httpx(domain: str, company_name: str) -> tuple[list[Contact], 
     return [], hit_403
 
 
-async def _scrape_gpt5(domain: str, company_name: str) -> list[Contact]:
+async def _scrape_llm(domain: str, company_name: str) -> list[Contact]:
     """
-    GPT-5 web search fallback for sites that block httpx (403/JS-rendered).
-    Uses gpt-5 with web_search tool to find current leadership from the company's own website.
+    LLM web search fallback for sites that block httpx (403/JS-rendered).
+    Uses LLM with web_search to find current leadership from the company's own website.
     """
     from src.config import get_settings
     settings = get_settings()
@@ -700,15 +654,15 @@ async def _scrape_gpt5(domain: str, company_name: str) -> list[Contact]:
                             full_name=name,
                             company=company_name,
                             role_title=title,
-                            provenance=["company_website_gpt5"],
+                            provenance=["company_website_llm"],
                         ))
 
-        logger.info("searcher_website_gpt5_done",
+        logger.info("searcher_website_llm_done",
                     domain=domain, contacts=len(contacts))
         return contacts
 
     except Exception as e:
-        logger.warning("searcher_website_gpt5_error", domain=domain, error=str(e))
+        logger.warning("searcher_website_llm_error", domain=domain, error=str(e))
         return []
 
 
@@ -716,7 +670,7 @@ async def search_company_website(state: SearcherState) -> SearcherState:
     """
     Scrape the company's own website for leadership/board pages.
     1. Try httpx on common paths — fast, free, works for most sites.
-    2. If 403 or JS-rendered shell → fall back to GPT-5 web search.
+    2. If 403 or JS-rendered shell → fall back to LLM web search.
     """
     domain = state.target_domain
     if not domain:
@@ -729,9 +683,9 @@ async def search_company_website(state: SearcherState) -> SearcherState:
     contacts, hit_403 = await _scrape_httpx(domain, company_name)
 
     if not contacts and hit_403:
-        logger.info("searcher_website_fallback_gpt5", domain=domain,
+        logger.info("searcher_website_fallback_llm", domain=domain,
                     reason="httpx blocked or JS-rendered")
-        contacts = await _scrape_gpt5(domain, company_name)
+        contacts = await _scrape_llm(domain, company_name)
 
     if contacts:
         logger.info("searcher_website_done", company=company_name, found=len(contacts))
@@ -1023,9 +977,9 @@ async def validate_linkedin(state: SearcherState) -> SearcherState:
         # - verified=False + from website/web → drop if LinkedIn found but mismatch,
         #                                        keep if no LinkedIn found yet (Veri can try)
         from_unipile = "unipile_search" in (contact.provenance or []) or \
-                       "gpt5_unipile_verified" in (contact.provenance or [])
+                       "llm_unipile_verified" in (contact.provenance or [])
         from_website = "company_website" in (contact.provenance or []) or \
-                       "company_website_gpt5" in (contact.provenance or [])
+                       "company_website_llm" in (contact.provenance or [])
 
         if not contact.linkedin_verified:
             if from_unipile:
@@ -1128,7 +1082,7 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
     Email priority:
     1. Fini's email_format (from Target Accounts) → ZeroBounce
     2. If no hit → try all 18 patterns → ZeroBounce
-    3. If no Fini format → GPT-5 Structured Output detection → ZeroBounce
+    3. If no Fini format → try all 18 patterns via ZeroBounce
     4. If no hit → try all 18 patterns → ZeroBounce
     """
     logger.info("searcher_enrich",
@@ -1140,28 +1094,15 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
     domain = state.target_domain
     fini_format = state.target_email_format or ""  # e.g. "{first}.{last}@domain.com"
 
-    # If Fini has no format, ask GPT-5 (Structured Output)
+    # Use Fini's format from Target Accounts — no LLM call needed
     gpt_format: str | None = None
     if domain and not fini_format:
-        gpt_format = await _detect_email_format_llm(domain, state.target_company)
-        if gpt_format:
-            # Save back to Target Accounts col F for future runs
-            try:
-                from rapidfuzz import fuzz as _fuzz2
-                ta_records = await sheets.read_all_records(sheets.TARGET_ACCOUNTS)
-                match_name = (state.target_normalized_name or state.target_company).lower()
-                for i, row in enumerate(ta_records):
-                    sn = str(row.get("Company Name", "") or "").lower()
-                    if _fuzz2.token_set_ratio(match_name, sn) >= 60:
-                        await sheets.update_row_cells(
-                            sheets.TARGET_ACCOUNTS, i + 2, 6, [gpt_format]
-                        )
-                        logger.info("searcher_enrich_format_saved", row=i + 2, fmt=gpt_format)
-                        break
-            except Exception as _se:
-                logger.warning("searcher_enrich_format_save_error", error=str(_se))
+        logger.info("searcher_enrich_no_fini_format", domain=domain,
+                    msg="Fini did not discover email format, will try 18-pattern ZeroBounce probe")
 
     enriched: list[Contact] = []
+    fcl_start = None
+    fcl_end = None
     for contact in state.discovered_contacts:
         # Role classification — keyword table, no LLM
         bucket = _classify_role(contact.role_title or "")
@@ -1256,8 +1197,68 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
 
         enriched.append(contact)
 
-    logger.info("searcher_enrich_done", total=len(state.discovered_contacts), kept=len(enriched))
-    return state.model_copy(update={"discovered_contacts": enriched, "phase": "write_output"})
+        # --- Write immediately to both sheets ---
+        try:
+            # Write to Searcher Output
+            await sheets.ensure_headers(sheets.SEARCHER_OUTPUT, sheets.SEARCHER_OUTPUT_HEADERS)
+            so_row = [
+                contact.company,
+                contact.full_name,
+                contact.role_title or "",
+                contact.role_bucket,
+                contact.linkedin_url or "",
+                "Verified" if contact.linkedin_verified else "Unverified",
+                contact.email or "",
+                contact.email_status if contact.email else "",
+            ]
+            await sheets.append_row(sheets.SEARCHER_OUTPUT, so_row)
+            logger.info("searcher_contact_written_immediately",
+                        contact=contact.full_name, company=contact.company)
+
+            # Write to First Clean List
+            await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
+            name_parts = contact.full_name.strip().split(None, 1)
+            first_name = name_parts[0] if name_parts else ""
+            last_name = name_parts[1] if len(name_parts) > 1 else ""
+            bucket_label_map = {
+                "DM": "Decision Maker", "Champion": "Champion",
+                "Influencer": "Influencer", "GateKeeper": "Gate Keeper", "Unknown": "",
+            }
+            fcl_row = [
+                contact.company,
+                state.target_normalized_name or contact.company,
+                contact.domain or state.target_domain or "",
+                state.target_region or "",
+                state.target_account_size or "",
+                state.target_region or "",
+                first_name, last_name,
+                contact.role_title or "",
+                bucket_label_map.get(contact.role_bucket, ""),
+                contact.linkedin_url or "",
+                contact.email or "",
+                "", "",  # Phone-1, Phone-2
+            ]
+            written_fcl_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
+            data_row = written_fcl_row - 1
+            if fcl_start is None:
+                fcl_start = data_row
+            fcl_end = data_row
+        except Exception as e:
+            logger.warning("searcher_immediate_write_error",
+                          contact=contact.full_name, error=str(e))
+
+    new_total = state.total_contacts_written + len(enriched)
+    new_fcl_start = state.fcl_row_start if state.fcl_row_start is not None else fcl_start
+    new_fcl_end = fcl_end if fcl_end is not None else state.fcl_row_end
+    logger.info("searcher_enrich_done", total=len(state.discovered_contacts), kept=len(enriched),
+                fcl_start=new_fcl_start, fcl_end=new_fcl_end)
+    return state.model_copy(update={
+        "discovered_contacts": enriched,
+        "phase": "write_output",
+        "total_contacts_written": new_total,
+        "fcl_row_start": new_fcl_start,
+        "fcl_row_end": new_fcl_end,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1266,133 +1267,13 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
 
 async def write_contacts_to_sheet(state: SearcherState) -> SearcherState:
     """
-    Write each enriched contact to Searcher Output (columns A-H).
-    Veri reads from here and promotes verified contacts to Final Filtered List.
+    Contacts are now written immediately during enrich_contacts.
+    This node just finalizes the phase.
     """
-    logger.info("searcher_write_sheet", company=state.target_company, contacts=len(state.discovered_contacts))
-
-    if not state.discovered_contacts:
-        logger.info("searcher_write_sheet_skip", reason="no contacts to write")
-        return state.model_copy(update={"phase": "done"})
-
-    try:
-        await sheets.ensure_headers(sheets.SEARCHER_OUTPUT, sheets.SEARCHER_OUTPUT_HEADERS)
-
-        # Build a name→row_number index of existing rows for this company so we can
-        # update instead of append when the contact is already in the sheet.
-        from rapidfuzz import fuzz as _rfuzz
-        existing_rows: dict[str, int] = {}  # full_name.lower() -> 1-based row number
-        try:
-            all_vals = await sheets.read_all_rows(sheets.SEARCHER_OUTPUT)  # excludes header, 0-based
-            company_match = (state.target_normalized_name or state.target_company).lower()
-            for i, row_vals in enumerate(all_vals, start=2):  # +2: 1 for header, 1 for 1-based
-                company_cell = row_vals[0].lower() if row_vals else ""
-                name_cell = row_vals[1].lower() if len(row_vals) > 1 else ""
-                if not name_cell:
-                    continue
-                if company_match in company_cell or state.target_company.lower() in company_cell:
-                    existing_rows[name_cell] = i
-        except Exception as e:
-            logger.warning("searcher_write_existing_lookup_error", error=str(e))
-
-        for contact in state.discovered_contacts:
-            row = [
-                contact.company,                                            # A: Company
-                contact.full_name,                                          # B: Full Name
-                contact.role_title or "",                                   # C: Job Title
-                contact.role_bucket,                                        # D: Role Bucket
-                contact.linkedin_url or "",                                 # E: LinkedIn URL
-                "Verified" if contact.linkedin_verified else "Unverified",  # F: LinkedIn Status
-                contact.email or "",                                        # G: Email Address
-                contact.email_status if contact.email else "",              # H: Email Status
-            ]
-
-            # Check if this contact already exists in the sheet (fuzzy name match)
-            existing_row_num = None
-            for existing_name, row_num in existing_rows.items():
-                if _rfuzz.token_sort_ratio(contact.full_name.lower(), existing_name) >= 90:
-                    existing_row_num = row_num
-                    break
-
-            if existing_row_num:
-                # Update existing row in-place
-                await sheets.update_row_cells(sheets.SEARCHER_OUTPUT, existing_row_num, 1, row)
-                logger.info("searcher_contact_updated", contact=contact.full_name, row=existing_row_num)
-            else:
-                await sheets.append_row(sheets.SEARCHER_OUTPUT, row)
-                logger.info(
-                    "searcher_contact_written",
-                    contact=contact.full_name,
-                    company=contact.company,
-                    role=contact.role_title,
-                    tab=sheets.SEARCHER_OUTPUT,
-                )
-
-        logger.info("searcher_sheet_written", count=len(state.discovered_contacts), tab=sheets.SEARCHER_OUTPUT)
-
-        # --- Also write to First Clean List so Veri can auto-verify ---
-        fcl_first_row = None
-        fcl_last_row = None
-        try:
-            await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
-            for contact in state.discovered_contacts:
-                # Split full name into first/last
-                name_parts = contact.full_name.strip().split(None, 1)
-                first_name = name_parts[0] if name_parts else ""
-                last_name = name_parts[1] if len(name_parts) > 1 else ""
-
-                # Map role_bucket back to buying role label
-                bucket_label_map = {
-                    "DM": "Decision Maker",
-                    "Champion": "Champion",
-                    "Influencer": "Influencer",
-                    "GateKeeper": "Gate Keeper",
-                    "Unknown": "",
-                }
-
-                fcl_row = [
-                    contact.company,                                        # A: Company Name
-                    state.target_normalized_name or contact.company,        # B: Normalized Company Name
-                    contact.domain or state.target_domain or "",            # C: Company Domain Name
-                    state.target_region or "",                              # D: Account type
-                    state.target_account_size or "",                        # E: Account Size
-                    state.target_region or "",                              # F: Country (use region as fallback)
-                    first_name,                                             # G: First Name
-                    last_name,                                              # H: Last Name
-                    contact.role_title or "",                               # I: Job titles (English)
-                    bucket_label_map.get(contact.role_bucket, ""),          # J: Buying Role
-                    contact.linkedin_url or "",                             # K: Linekdin Url
-                    contact.email or "",                                    # L: Email
-                    "",                                                     # M: Phone-1
-                    "",                                                     # N: Phone-2
-                ]
-                written_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
-                # Track row range (written_row is 1-based sheet row; convert to data row)
-                data_row = written_row - 1  # subtract header row
-                if fcl_first_row is None:
-                    fcl_first_row = data_row
-                fcl_last_row = data_row
-
-            logger.info("searcher_fcl_written", count=len(state.discovered_contacts), tab=sheets.FIRST_CLEAN_LIST)
-        except Exception as e:
-            logger.warning("searcher_fcl_write_error", error=str(e))
-
-    except Exception as e:
-        logger.error("searcher_sheet_write_error", error=str(e))
-        errors = list(state.errors) + [f"Sheet write failed: {e}"]
-        return state.model_copy(update={"errors": errors, "phase": "done"})
-
-    # Accumulate totals across companies
-    new_total = state.total_contacts_written + len(state.discovered_contacts)
-    new_fcl_start = state.fcl_row_start if state.fcl_row_start is not None else fcl_first_row
-    new_fcl_end = fcl_last_row if fcl_last_row is not None else state.fcl_row_end
-
-    return state.model_copy(update={
-        "phase": "done",
-        "total_contacts_written": new_total,
-        "fcl_row_start": new_fcl_start,
-        "fcl_row_end": new_fcl_end,
-    })
+    logger.info("searcher_write_sheet_pass", company=state.target_company,
+                contacts_written=state.total_contacts_written)
+    # All writing already happened in enrich_contacts — just finalize
+    return state.model_copy(update={"phase": "done"})
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,10 @@ class VeriRunRequest(BaseModel):
     row_start: Optional[int] = None  # 1-based, inclusive (data rows, not header)
     row_end: Optional[int] = None    # 1-based, inclusive
 
+class N8nCompleteRequest(BaseModel):
+    row_start: Optional[int] = None  # 1-based data row range that n8n populated
+    row_end: Optional[int] = None
+
 class OperatorConfirmRequest(BaseModel):
     thread_id: str
     confirmed: bool
@@ -215,6 +219,31 @@ def create_app() -> FastAPI:
             thread_id=thread_id,
             status="started",
             message=f"Veri started{row_msg}",
+        )
+
+    # ---------------------------------------------------------------------------
+    # n8n callback — auto-trigger Veri after n8n populates First Clean List
+    # ---------------------------------------------------------------------------
+
+    @app.post("/api/n8n/complete", response_model=RunResponse)
+    async def n8n_complete(req: N8nCompleteRequest = None):
+        """Callback for n8n to trigger Veri after populating First Clean List."""
+        if req is None:
+            req = N8nCompleteRequest()
+        thread_id = str(uuid.uuid4())
+        _log_queues[thread_id] = asyncio.Queue()
+        _active_runs[thread_id] = {
+            "agent": "veri",
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "auto_triggered_by": "n8n",
+        }
+        asyncio.create_task(_veri_task(thread_id, row_start=req.row_start, row_end=req.row_end))
+        row_msg = f" (rows {req.row_start}–{req.row_end})" if req.row_start else " (all pending)"
+        return RunResponse(
+            thread_id=thread_id,
+            status="started",
+            message=f"Veri auto-triggered by n8n{row_msg}",
         )
 
     # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ const SETTINGS_FIELDS = [
   {
     group: 'Search APIs',
     fields: [
-      { key: 'OPENAI_API_KEY', label: 'OpenAI API Key (GPT-5)', placeholder: 'sk-proj-...', required: true },
+      { key: 'OPENAI_API_KEY', label: 'OpenAI API Key', placeholder: 'sk-proj-...', required: true },
       { key: 'TAVILY_API_KEY', label: 'Tavily API Key', placeholder: 'tvly-...', required: true },
       { key: 'PERPLEXITY_API_KEY', label: 'Perplexity API Key', placeholder: 'pplx-...', required: true },
     ]

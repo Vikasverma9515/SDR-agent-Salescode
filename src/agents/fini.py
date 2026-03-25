@@ -1013,7 +1013,7 @@ async def _enrich_and_write_if_ready(
             written_row = await sheets.append_row(sheets.TARGET_ACCOUNTS, row)
             logger.info("fini_auto_written", company=company.raw_name, row=written_row)
 
-            if submit_to_n8n and all(v != "" for v in row):
+            if submit_to_n8n:
                 try:
                     from src.tools.n8n import submit_to_n8n as _submit, build_payload
                     payload = build_payload(
@@ -1027,13 +1027,19 @@ async def _enrich_and_write_if_ready(
                         account_size=company.account_size or "",
                         row=written_row,
                     )
-                    await _submit(payload)
+                    success = await _submit(payload)
+                    if success:
+                        try:
+                            await sheets.update_row_cells(sheets.TARGET_ACCOUNTS, written_row, 10, ["✓"])
+                        except Exception:
+                            pass
                 except Exception as e:
                     logger.warning("fini_auto_n8n_error", company=company.raw_name, error=str(e))
 
             company = company.model_copy(update={
                 "operator_confirmed": True,
                 "sheet_row_written": True,
+                "n8n_submitted": submit_to_n8n,
             })
         except Exception as e:
             logger.warning("fini_auto_write_error", company=company.raw_name, error=str(e))
@@ -1176,7 +1182,7 @@ async def write_to_sheet(state: FiniState) -> FiniState:
         written_row = await sheets.append_row(sheets.TARGET_ACCOUNTS, row)
 
         # Submit directly to n8n webhook — App Script onEdit doesn't fire on API writes.
-        if state.submit_to_n8n and all(v != "" for v in row):
+        if state.submit_to_n8n:
             from src.tools.n8n import submit_to_n8n, build_payload
             payload = build_payload(
                 company_name=company.normalized_name or company.raw_name,
@@ -1191,6 +1197,12 @@ async def write_to_sheet(state: FiniState) -> FiniState:
             )
             success = await submit_to_n8n(payload)
             logger.info("fini_n8n_submitted", company=name, success=success, row=written_row)
+            if success:
+                # Write ✓ in column J (col 10) to mark n8n submission
+                try:
+                    await sheets.update_row_cells(sheets.TARGET_ACCOUNTS, written_row, 10, ["✓"])
+                except Exception:
+                    pass
 
         updated = company.model_copy(update={"sheet_row_written": True})
         companies = list(state.companies)
@@ -1213,6 +1225,9 @@ async def submit_n8n(state: FiniState) -> FiniState:
         return state
 
     company = state.companies[state.current_index]
+    if company.n8n_submitted:
+        return state  # already submitted (by auto-write or write_to_sheet)
+
     name = company.normalized_name or company.raw_name
     logger.info("fini_submit_n8n", step="submit_n8n", company=name)
 

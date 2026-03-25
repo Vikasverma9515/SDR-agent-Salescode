@@ -103,8 +103,7 @@ async def discover_domain(company_name: str) -> DomainInfo:
     Discover the official domain and email format for a company.
 
     Domain lookup strategy (stops at first success):
-    1. Ask GPT-4o-mini directly — knows HQ domains for major companies instantly,
-       no search result pollution from subsidiary/product domains.
+    1. LLM web search (OpenAI gpt-4o-search-preview → Claude Bedrock fallback).
     2. Fallback: search snippets + URLs via Perplexity/Tavily/DDG.
     """
     # --- Step 1: GPT domain lookup (primary) ---
