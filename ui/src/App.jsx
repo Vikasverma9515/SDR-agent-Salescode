@@ -106,7 +106,7 @@ export default function App() {
         <div className="fixed bottom-4 right-4 z-50 flex items-center gap-1.5 bg-white/[0.04] border border-white/[0.08] rounded px-2.5 py-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
           <span className="text-[9px] font-mono text-gray-500 uppercase tracking-wider">
-            deployed {new Date(__BUILD_TIME__).toLocaleString()}
+            deployed {new Date(typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : Date.now()).toLocaleString()}
           </span>
         </div>
         <div className="page-transition min-h-full">

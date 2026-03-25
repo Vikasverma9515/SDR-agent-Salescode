@@ -85,6 +85,10 @@ class SearcherState(BaseModel):
     phase: Literal[
         "unipile_search", "filing_search", "web_search", "linkedin_validation", "enrichment", "write_output", "done"
     ] = "unipile_search"
+    # Track rows written to FIRST_CLEAN_LIST for Veri auto-trigger
+    total_contacts_written: int = 0       # accumulates across all companies
+    fcl_row_start: int | None = None      # first row written to FIRST_CLEAN_LIST (1-based data row)
+    fcl_row_end: int | None = None        # last row written
     errors: Annotated[list[str], operator.add] = Field(default_factory=list)
 
 

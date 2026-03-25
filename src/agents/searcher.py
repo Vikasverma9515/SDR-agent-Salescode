@@ -1394,6 +1394,8 @@ async def write_contacts_to_sheet(state: SearcherState) -> SearcherState:
         logger.info("searcher_sheet_written", count=len(state.discovered_contacts), tab=sheets.SEARCHER_OUTPUT)
 
         # --- Also write to First Clean List so Veri can auto-verify ---
+        fcl_first_row = None
+        fcl_last_row = None
         try:
             await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
             for contact in state.discovered_contacts:
@@ -1427,7 +1429,12 @@ async def write_contacts_to_sheet(state: SearcherState) -> SearcherState:
                     "",                                                     # M: Phone-1
                     "",                                                     # N: Phone-2
                 ]
-                await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
+                written_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
+                # Track row range (written_row is 1-based sheet row; convert to data row)
+                data_row = written_row - 1  # subtract header row
+                if fcl_first_row is None:
+                    fcl_first_row = data_row
+                fcl_last_row = data_row
 
             logger.info("searcher_fcl_written", count=len(state.discovered_contacts), tab=sheets.FIRST_CLEAN_LIST)
         except Exception as e:
@@ -1438,7 +1445,17 @@ async def write_contacts_to_sheet(state: SearcherState) -> SearcherState:
         errors = list(state.errors) + [f"Sheet write failed: {e}"]
         return state.model_copy(update={"errors": errors, "phase": "done"})
 
-    return state.model_copy(update={"phase": "done"})
+    # Accumulate totals across companies
+    new_total = state.total_contacts_written + len(state.discovered_contacts)
+    new_fcl_start = state.fcl_row_start if state.fcl_row_start is not None else fcl_first_row
+    new_fcl_end = fcl_last_row if fcl_last_row is not None else state.fcl_row_end
+
+    return state.model_copy(update={
+        "phase": "done",
+        "total_contacts_written": new_total,
+        "fcl_row_start": new_fcl_start,
+        "fcl_row_end": new_fcl_end,
+    })
 
 
 # ---------------------------------------------------------------------------
