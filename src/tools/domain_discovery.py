@@ -243,17 +243,22 @@ async def _probe_email_format(company_name: str, domain: str) -> str | None:
             for url in pages_to_try:
                 try:
                     resp = await client.get(url)
-                    if resp.status_code == 200:
-                        text = resp.text
-                        # mailto: links first — most reliable
-                        mailto_emails = re.findall(r'mailto:([a-z0-9._%+\-]+@' + re.escape(domain) + r')', text, re.IGNORECASE)
-                        plain_emails = email_re.findall(text)
-                        batch = [e.lower() for e in (mailto_emails + plain_emails)]
-                        found_emails.extend(batch)
-                        if batch:
-                            logger.info("email_from_website", url=url, found=batch[:3])
-                        if len(found_emails) >= 3:
-                            break
+                    if resp.status_code in (403, 401):
+                        # Site is blocking us — skip remaining URLs for this domain
+                        logger.info("domain_website_blocked", url=url, status=resp.status_code)
+                        break
+                    if resp.status_code != 200:
+                        continue
+                    text = resp.text
+                    # mailto: links first — most reliable
+                    mailto_emails = re.findall(r'mailto:([a-z0-9._%+\-]+@' + re.escape(domain) + r')', text, re.IGNORECASE)
+                    plain_emails = email_re.findall(text)
+                    batch = [e.lower() for e in (mailto_emails + plain_emails)]
+                    found_emails.extend(batch)
+                    if batch:
+                        logger.info("email_from_website", url=url, found=batch[:3])
+                    if len(found_emails) >= 3:
+                        break
                 except Exception:
                     continue
     except Exception as e:

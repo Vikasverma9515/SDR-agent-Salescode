@@ -646,6 +646,8 @@ async def _scrape_httpx(domain: str, company_name: str) -> tuple[list[Contact], 
     base = f"https://{_d.rstrip('/')}"
     hit_403 = False
 
+    failed_urls: set[str] = set()  # track URLs that returned non-200
+
     try:
         async with _httpx.AsyncClient(headers=_HEADERS, follow_redirects=True, timeout=10) as client:
             for path in _LEADERSHIP_PATHS:
@@ -654,8 +656,10 @@ async def _scrape_httpx(domain: str, company_name: str) -> tuple[list[Contact], 
                     resp = await client.get(url)
                     if resp.status_code == 403:
                         hit_403 = True
+                        failed_urls.add(url)
                         continue
                     if resp.status_code != 200:
+                        failed_urls.add(url)
                         continue
                     contacts = _extract_from_html(resp.text, company_name, domain)
                     if contacts:
@@ -665,6 +669,7 @@ async def _scrape_httpx(domain: str, company_name: str) -> tuple[list[Contact], 
                     # Page loaded but empty — might be JS-rendered, flag as 403-like
                     hit_403 = True
                 except Exception:
+                    failed_urls.add(url)
                     continue
     except Exception as e:
         logger.warning("searcher_website_httpx_error", domain=domain, error=str(e))
@@ -1038,7 +1043,6 @@ async def validate_linkedin(state: SearcherState) -> SearcherState:
                     pass
 
         if contact.linkedin_url and not contact.linkedin_verified:
-            # Skip re-verification for contacts already verified by unipile_search
             try:
                 from src.tools.unipile import verify_profile
                 verification = await verify_profile(contact.linkedin_url, state.target_company)

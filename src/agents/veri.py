@@ -106,9 +106,10 @@ async def read_final_list(state: VeriState) -> VeriState:
             contact_idx = len(contacts)
             contacts.append(contact)
             # Ensure exactly 14 scalar string values for cols A-N
+            # (cols O-P are Searcher metadata, not copied to Final Filtered List)
             flat_row = [str(v) if v is not None else "" for v in raw_row]
             flat_row += [""] * max(0, 14 - len(flat_row))
-            raw_rows[contact_idx] = flat_row[:14]
+            raw_rows[contact_idx] = flat_row[:14]  # only A-N go to Final Filtered List
 
         logger.info("veri_contacts_loaded", count=len(contacts))
         await sheets.ensure_headers(sheets.FINAL_FILTERED_LIST, sheets.FINAL_FILTERED_LIST_HEADERS)
