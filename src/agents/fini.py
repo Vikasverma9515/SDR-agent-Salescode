@@ -81,9 +81,208 @@ REGION_IDS: dict[str, str] = {
     "turkey": "102105699",
     "latvia": "104341318",
     "estonia": "102974008",
-    "mena": "103537801",  # fallback to Africa region for MENA — add proper MENA if available
-    "latam": "104514572",  # South America
-    "southeast asia": "102393603",  # Asia
+    "mena": "103537801",
+    "latam": "104514572",
+    "southeast asia": "102393603",
+    # Europe
+    "portugal": "100364860",
+    "poland": "105072130",
+    "austria": "103883259",
+    "denmark": "104514075",
+    "norway": "103819153",
+    "finland": "100456013",
+    "ireland": "104738515",
+    "czech republic": "104508036",
+    "czechia": "104508036",
+    "romania": "106670623",
+    "hungary": "100288700",
+    "uk": "101165590",
+    "united kingdom": "101165590",
+    "scotland": "101165590",
+    "wales": "101165590",
+    "croatia": "104688944",
+    "serbia": "101855366",
+    "bulgaria": "105333783",
+    "slovakia": "103061721",
+    "slovenia": "106137034",
+    "lithuania": "101464403",
+    "iceland": "105238872",
+    "luxembourg": "104042105",
+    "malta": "100994331",
+    "cyprus": "104084526",
+    "bosnia": "100501484",
+    "north macedonia": "106442863",
+    "albania": "102845717",
+    "montenegro": "100733275",
+    "moldova": "106178099",
+    "ukraine": "102264497",
+    "belarus": "101705918",
+    "georgia": "100490383",
+    "armenia": "100355325",
+    "azerbaijan": "100188092",
+    # Americas
+    "peru": "102927786",
+    "venezuela": "101490751",
+    "ecuador": "106373484",
+    "uruguay": "100867946",
+    "paraguay": "104065273",
+    "bolivia": "104379274",
+    "costa rica": "100422673",
+    "panama": "100808673",
+    "dominican republic": "105765876",
+    "guatemala": "100877388",
+    "honduras": "101937718",
+    "el salvador": "103117009",
+    "nicaragua": "100947750",
+    "cuba": "106482999",
+    "puerto rico": "105245958",
+    "jamaica": "100655965",
+    "trinidad": "104766925",
+    # Asia Pacific
+    "pakistan": "101022442",
+    "bangladesh": "106471528",
+    "sri lanka": "100446943",
+    "new zealand": "105490917",
+    "taiwan": "104187078",
+    "hong kong": "103291313",
+    "mongolia": "105723438",
+    "laos": "104498776",
+    "brunei": "100606914",
+    "maldives": "100336308",
+    "fiji": "102924498",
+    "papua new guinea": "105571498",
+    "uzbekistan": "106366767",
+    "kazakhstan": "101735227",
+    "afghanistan": "101620260",
+    # Africa
+    "south africa": "104035573",
+    "kenya": "100505942",
+    "ghana": "105765362",
+    "tanzania": "103571671",
+    "ethiopia": "100267870",
+    "uganda": "106436890",
+    "rwanda": "106906318",
+    "senegal": "106057037",
+    "ivory coast": "100648897",
+    "cameroon": "103481974",
+    "algeria": "104024592",
+    "tunisia": "102134353",
+    "morocco": "102787409",
+    "libya": "104221888",
+    "angola": "105266956",
+    "mozambique": "106022431",
+    "zambia": "107563082",
+    "zimbabwe": "101543816",
+    "botswana": "106883637",
+    "namibia": "105765365",
+    "mauritius": "103617495",
+    # Middle East
+    "bahrain": "101883610",
+    "iraq": "103883898",
+    "iran": "103356411",
+    "lebanon": "101834488",
+    "yemen": "103540826",
+    "palestine": "106512065",
+    "syria": "103759581",
+}
+
+# Maps regional hints found in company names → region key for REGION_IDS
+_REGION_HINTS: dict[str, str] = {
+    # Spanish / Iberian
+    "españa": "spain", "espana": "spain", "iberia": "spain", "ibérica": "spain",
+    "iberica": "spain", "peninsular": "spain",
+    # Portuguese
+    "portugal": "portugal", "brasil": "brazil", "brazil": "brazil",
+    "brasileira": "brazil",
+    # French
+    "france": "france", "française": "france", "francaise": "france",
+    "francophone": "france",
+    # German / DACH
+    "deutschland": "germany", "dach": "germany", "österreich": "austria",
+    "osterreich": "austria", "austria": "austria", "schweiz": "switzerland",
+    "suisse": "switzerland", "switzerland": "switzerland",
+    # Italian
+    "italia": "italy", "italy": "italy", "italiana": "italy",
+    # UK / Ireland
+    "uk": "united kingdom", "britain": "united kingdom",
+    "england": "united kingdom", "scotland": "united kingdom",
+    "ireland": "ireland", "éire": "ireland",
+    # Benelux / Nordics
+    "benelux": "netherlands", "nederland": "netherlands", "netherlands": "netherlands",
+    "holland": "netherlands", "belgique": "belgium", "belgium": "belgium",
+    "belgien": "belgium", "luxembourg": "luxembourg",
+    "nordics": "europe", "scandinavia": "europe", "nordic": "europe",
+    "denmark": "denmark", "danmark": "denmark",
+    "norway": "norway", "norge": "norway",
+    "sweden": "sweden", "sverige": "sweden",
+    "finland": "finland", "suomi": "finland",
+    "iceland": "iceland",
+    # Eastern Europe
+    "poland": "poland", "polska": "poland",
+    "czech": "czech republic", "czechia": "czech republic",
+    "romania": "romania", "hungary": "hungary", "magyarország": "hungary",
+    "croatia": "croatia", "hrvatska": "croatia",
+    "serbia": "serbia", "srbija": "serbia",
+    "bulgaria": "bulgaria", "slovakia": "slovakia",
+    "slovenia": "slovenia", "ukraine": "ukraine",
+    "baltic": "europe", "baltics": "europe",
+    "latvia": "latvia", "lithuania": "lithuania", "estonia": "estonia",
+    "greece": "greece", "hellas": "greece",
+    "turkey": "turkey", "türkiye": "turkey", "turkiye": "turkey",
+    "cyprus": "cyprus",
+    # Americas
+    "usa": "usa", "united states": "usa", "americas": "north america",
+    "latam": "latam", "latin america": "latam",
+    "méxico": "mexico", "mexico": "mexico",
+    "canada": "canada", "canadá": "canada",
+    "argentina": "argentina", "chile": "chile", "colombia": "colombia",
+    "peru": "peru", "perú": "peru",
+    "venezuela": "venezuela", "ecuador": "ecuador",
+    "uruguay": "uruguay", "paraguay": "paraguay", "bolivia": "bolivia",
+    "costa rica": "costa rica", "panama": "panama", "panamá": "panama",
+    "dominicana": "dominican republic", "guatemala": "guatemala",
+    "caribbean": "north america", "caribe": "north america",
+    "centroamérica": "north america", "centroamerica": "north america",
+    "andina": "south america", "andean": "south america",
+    "mesoamerica": "north america", "cono sur": "south america",
+    # Asia Pacific
+    "india": "india", "bharat": "india",
+    "china": "china", "中国": "china", "zhongguo": "china",
+    "japan": "japan", "nippon": "japan", "日本": "japan",
+    "apac": "asia", "asia": "asia", "asia pacific": "asia",
+    "asia-pacific": "asia",
+    "singapore": "singapore", "malaysia": "malaysia",
+    "indonesia": "indonesia", "thailand": "thailand",
+    "philippines": "philippines", "pilipinas": "philippines",
+    "vietnam": "vietnam", "viet nam": "vietnam",
+    "korea": "south korea", "한국": "south korea",
+    "taiwan": "taiwan", "hong kong": "hong kong",
+    "pakistan": "pakistan", "bangladesh": "bangladesh",
+    "sri lanka": "sri lanka", "nepal": "nepal",
+    "myanmar": "myanmar", "cambodia": "cambodia",
+    "australia": "australia", "new zealand": "new zealand",
+    "oceania": "australia", "australasia": "australia",
+    "asean": "asia",
+    # Middle East
+    "uae": "uae", "emirates": "uae", "dubai": "uae", "abu dhabi": "uae",
+    "saudi": "saudi arabia", "saudi arabia": "saudi arabia",
+    "qatar": "qatar", "kuwait": "kuwait", "bahrain": "bahrain",
+    "oman": "oman", "jordan": "jordan", "lebanon": "lebanon",
+    "iraq": "iraq", "iran": "iran",
+    "middle east": "mena", "mea": "mena", "gcc": "uae",
+    "gulf": "uae", "levant": "mena", "mashreq": "mena",
+    "maghreb": "mena",
+    # Africa
+    "africa": "africa", "emea": "europe",
+    "south africa": "south africa", "nigeria": "nigeria",
+    "kenya": "kenya", "ghana": "ghana", "egypt": "egypt",
+    "morocco": "morocco", "maroc": "morocco",
+    "algeria": "algeria", "tunisia": "tunisia",
+    "east africa": "africa", "west africa": "africa",
+    "sub-saharan": "africa", "subsaharan": "africa",
+    "francophone africa": "africa", "anglophone africa": "africa",
+    # Generic (no filter)
+    "international": "", "global": "", "worldwide": "",
 }
 
 
@@ -464,6 +663,27 @@ async def _gpt_find_sales_nav(company_name: str, region: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Helper: detect region from company name
+# ---------------------------------------------------------------------------
+
+def _detect_region_from_name(raw_name: str) -> str:
+    """
+    Detect a geography/region from the company name.
+    E.g. "Red Bull España" → "spain", "Heineken Iberia" → "spain"
+    Returns the region key (for REGION_IDS) or "" if none detected.
+    """
+    # Check each word/phrase in the name against region hints
+    name_lower = raw_name.lower()
+    # Try multi-word hints first (e.g. "middle east", "south korea")
+    for hint, region_key in sorted(_REGION_HINTS.items(), key=lambda x: -len(x[0])):
+        if not region_key:
+            continue  # skip "international", "global"
+        if hint in name_lower:
+            return region_key
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Helper: extract parent company and clean name from raw input
 # ---------------------------------------------------------------------------
 
@@ -570,236 +790,159 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
         })
 
     # --- Step 2: LinkedIn org lookup + Sales Nav URL ---
-    # Aggressive multi-strategy approach — never gives up until we have a URL
+    # Phase 1: Build a list of ALL possible names this company could be under on LinkedIn
+    # Phase 2: Try each name with Unipile until one hits
     lookup_name = company.normalized_name or company.raw_name
     org_id = None
     sales_nav_url = None
 
-    # Strategy 1: Unipile direct lookup (fastest)
+    # Auto-detect region from company name if not explicitly set
+    effective_region = region
+    if not effective_region:
+        detected = _detect_region_from_name(company.raw_name)
+        if detected:
+            effective_region = detected
+            logger.info("enrich_auto_region", company=company.raw_name, detected_region=detected)
+
+    # ---- PHASE 1: Gather all candidate names ----
+    candidate_names = []
+    seen_lower = set()
+
+    def _add_candidate(name: str):
+        """Add a name to candidates if not already seen."""
+        n = name.strip()
+        if n and len(n) >= 2 and n.lower() not in seen_lower:
+            seen_lower.add(n.lower())
+            candidate_names.append(n)
+
+    # 1a: The normalized/lookup name itself
+    _add_candidate(lookup_name)
+
+    # 1b: Regex-parsed variants (fast, no API calls)
+    parsed = _parse_company_variants(company.raw_name)
+    if parsed["global_name"]:
+        _add_candidate(parsed["global_name"])       # "Heineken" from "Heineken España"
+    if parsed["parent_company"]:
+        _add_candidate(parsed["parent_company"])     # "Mahou" from "(Mahou distributor)"
+    for short in parsed["short_names"]:
+        _add_candidate(short)                        # "Heineken", "Coca-Cola" etc.
+    if company.raw_name.strip() != lookup_name:
+        _add_candidate(company.raw_name.strip())     # original raw input
+
+    # 1c: Ask LLM for the definitive list of names to try
     try:
-        org_info = await unipile.get_company_org_id(lookup_name)
-        if org_info["org_id"]:
-            org_id = org_info["org_id"]
-            logger.info("enrich_org_found_unipile", company=company.raw_name, org_id=org_id)
-    except Exception as e:
-        logger.warning("enrich_unipile_error", company=company.raw_name, error=str(e))
-
-    # Strategy 2: Search engines to find LinkedIn company name, then retry Unipile
-    if not org_id:
-        logger.info("enrich_trying_search_for_linkedin_name", company=company.raw_name)
-        try:
-            search_results = await search_with_fallback(
-                f'"{lookup_name}" site:linkedin.com/company',
-                max_results=5,
-            )
-            for r in search_results:
-                slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', r.url, re.IGNORECASE)
-                if slug_match:
-                    slug = slug_match.group(1).rstrip('/')
-                    if not slug.isdigit():
-                        logger.info("enrich_slug_from_search", company=company.raw_name, slug=slug)
-                        try:
-                            org_info = await unipile.get_company_org_id(slug)
-                            if org_info["org_id"]:
-                                org_id = org_info["org_id"]
-                                logger.info("enrich_org_found_search_unipile", company=company.raw_name, org_id=org_id)
-                                break
-                        except Exception:
-                            pass
-        except Exception as e:
-            logger.warning("enrich_search_linkedin_error", company=company.raw_name, error=str(e))
-
-    # Strategy 3: LLM (OpenAI/Claude) to find org ID or Sales Nav URL
-    if not org_id and not sales_nav_url:
-        logger.info("enrich_trying_llm_fallback", company=company.raw_name)
-        try:
-            gpt_result = await _gpt_find_sales_nav(lookup_name, region)
-            if gpt_result.get("org_id"):
-                org_id = gpt_result["org_id"]
-                logger.info("enrich_org_found_llm", company=company.raw_name, org_id=org_id)
-            elif gpt_result.get("sales_nav_url"):
-                sales_nav_url = gpt_result["sales_nav_url"]
-                logger.info("enrich_url_found_llm", company=company.raw_name)
-        except Exception as e:
-            logger.warning("enrich_llm_error", company=company.raw_name, error=str(e))
-
-    # Strategy 4: Direct LLM ask for the LinkedIn company page URL, extract org from page
-    if not org_id and not sales_nav_url:
-        logger.info("enrich_trying_direct_llm_search", company=company.raw_name)
-        try:
-            from src.tools.llm import llm_web_search
-            content = await llm_web_search(
-                f"What is the exact LinkedIn company page URL for {lookup_name}? "
-                f"Search linkedin.com and return ONLY the URL like https://www.linkedin.com/company/SLUG"
-            )
-            if content:
-                slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', content, re.IGNORECASE)
-                if slug_match:
-                    slug = slug_match.group(1).rstrip('/')
-                    # Try numeric org ID first
-                    if slug.isdigit():
-                        org_id = slug
-                    else:
-                        # Try Unipile with this slug
-                        try:
-                            org_info = await unipile.get_company_org_id(slug)
-                            if org_info["org_id"]:
-                                org_id = org_info["org_id"]
-                                logger.info("enrich_org_found_direct_llm", company=company.raw_name, org_id=org_id)
-                        except Exception:
-                            pass
-                # Also check for org ID in any URL pattern
-                if not org_id:
-                    org_match = re.search(r'organization%(?:25)?3A(\d+)', content)
-                    if org_match:
-                        org_id = org_match.group(1)
-        except Exception as e:
-            logger.warning("enrich_direct_llm_error", company=company.raw_name, error=str(e))
-
-    # Build the Sales Nav URL from org_id if we found one
-    if org_id and not sales_nav_url:
-        sales_nav_url = _build_sales_nav_url(
-            org_id,
-            company.normalized_name or company.raw_name,
-            region,
+        from src.tools.llm import llm_complete
+        llm_names = await llm_complete(
+            f"Company: \"{company.raw_name}\"\n\n"
+            f"I need to find this company on LinkedIn. List ALL possible names it could be "
+            f"registered under on LinkedIn, one per line. Consider:\n"
+            f"- The company's own name\n"
+            f"- The parent/holding company (if subsidiary or distributor)\n"
+            f"- The global brand name (if this is a regional branch like 'X España')\n"
+            f"- Common abbreviations or trading names\n"
+            f"- The LinkedIn slug (e.g. 'heineken' for Heineken)\n\n"
+            f"Reply with ONLY the names, one per line. Most likely LinkedIn name first. "
+            f"No numbering, no explanation.",
+            max_tokens=150,
         )
+        if llm_names:
+            for line in llm_names.strip().splitlines():
+                name = line.strip().lstrip('- •*0123456789.)')
+                if name:
+                    _add_candidate(name)
+        logger.info("enrich_candidate_names", company=company.raw_name,
+                    count=len(candidate_names), names=candidate_names[:8])
+    except Exception as e:
+        logger.warning("enrich_llm_names_error", company=company.raw_name, error=str(e))
 
-    # Strategy 5: Ask LLM for parent company / LinkedIn name, then try variants
-    if not org_id and not sales_nav_url:
-        # Step A: Ask the LLM what the parent company is and what name LinkedIn would use
-        name_variants = []
+    # 1d: Also ask LLM with web search to find the actual LinkedIn URL
+    llm_slugs = []
+    try:
+        from src.tools.llm import llm_web_search
+        llm_url_response = await llm_web_search(
+            f"Find the LinkedIn company page for \"{company.raw_name}\".\n"
+            f"If this is a subsidiary, regional branch, or distributor of a bigger company, "
+            f"find the parent company's LinkedIn page instead.\n"
+            f"Return ONLY the LinkedIn URL like: https://www.linkedin.com/company/SLUG\n"
+            f"Nothing else."
+        )
+        if llm_url_response:
+            for m in re.finditer(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', llm_url_response, re.IGNORECASE):
+                slug = m.group(1).rstrip('/')
+                if slug not in llm_slugs:
+                    llm_slugs.append(slug)
+            logger.info("enrich_llm_slugs", company=company.raw_name, slugs=llm_slugs)
+    except Exception as e:
+        logger.warning("enrich_llm_url_error", company=company.raw_name, error=str(e))
+
+    # ---- PHASE 2: Try each candidate with Unipile ----
+    # Try LLM-found slugs first (most likely to be correct)
+    for slug in llm_slugs:
+        if slug.isdigit():
+            org_id = slug
+            logger.info("enrich_org_from_slug_numeric", company=company.raw_name, org_id=org_id)
+            break
         try:
-            from src.tools.llm import llm_complete
-            llm_answer = await llm_complete(
-                f"The company is: \"{company.raw_name}\"\n"
-                f"1. Is this a subsidiary, local branch, or distributor of a larger company? "
-                f"If yes, what is the parent/global company name?\n"
-                f"2. What name would this company be listed under on LinkedIn?\n"
-                f"3. If this company is too small for LinkedIn, which parent company's "
-                f"LinkedIn page should we use instead?\n\n"
-                f"Reply in this exact format (one per line):\n"
-                f"PARENT: <parent company name or NONE>\n"
-                f"LINKEDIN_NAME: <name on LinkedIn>\n"
-                f"No explanation.",
-                max_tokens=100,
-            )
-            logger.info("enrich_llm_parent_lookup", company=company.raw_name, answer=llm_answer[:200])
-
-            # Parse LLM response
-            for line in llm_answer.splitlines():
-                line = line.strip()
-                if line.upper().startswith("PARENT:"):
-                    val = line.split(":", 1)[1].strip()
-                    if val and val.upper() != "NONE":
-                        name_variants.append(val)
-                elif line.upper().startswith("LINKEDIN_NAME:"):
-                    val = line.split(":", 1)[1].strip()
-                    if val and val.upper() != "NONE":
-                        name_variants.append(val)
-        except Exception as e:
-            logger.warning("enrich_llm_parent_error", company=company.raw_name, error=str(e))
-
-        # Step B: Also add regex-parsed variants as backup
-        parsed = _parse_company_variants(company.raw_name)
-        if parsed["parent_company"]:
-            name_variants.append(parsed["parent_company"])
-        if parsed["global_name"] and parsed["global_name"].lower() != lookup_name.lower():
-            name_variants.append(parsed["global_name"])
-        if company.raw_name.strip().lower() != lookup_name.lower():
-            name_variants.append(company.raw_name.strip())
-        for short in parsed["short_names"]:
-            if short.lower() != lookup_name.lower():
-                name_variants.append(short)
-
-        # Deduplicate while preserving order
-        seen_variants = {lookup_name.lower()}
-        unique_variants = []
-        for v in name_variants:
-            vl = v.lower().strip()
-            if vl not in seen_variants and len(v.strip()) >= 3:
-                seen_variants.add(vl)
-                unique_variants.append(v.strip())
-
-        logger.info("enrich_variants_to_try", company=company.raw_name, variants=unique_variants[:5])
-
-        for variant in unique_variants:
-            if org_id:
+            org_info = await unipile.get_company_org_id(slug)
+            if org_info["org_id"]:
+                org_id = org_info["org_id"]
+                logger.info("enrich_org_found", company=company.raw_name, slug=slug, org_id=org_id)
                 break
-            logger.info("enrich_trying_name_variant", company=company.raw_name, variant=variant)
+        except Exception:
+            pass
 
-            # 5a: Search engines for this variant
+    # Then try each candidate name
+    if not org_id:
+        for name in candidate_names:
+            try:
+                org_info = await unipile.get_company_org_id(name)
+                if org_info["org_id"]:
+                    org_id = org_info["org_id"]
+                    logger.info("enrich_org_found", company=company.raw_name, name=name, org_id=org_id)
+                    break
+            except Exception:
+                pass
+
+    # ---- PHASE 3: Search engines as last resort before keyword fallback ----
+    if not org_id:
+        for search_name in candidate_names[:3]:
             try:
                 search_results = await search_with_fallback(
-                    f'"{variant}" site:linkedin.com/company',
+                    f'{search_name} LinkedIn company page',
                     max_results=5,
                 )
                 for r in search_results:
                     slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', r.url, re.IGNORECASE)
                     if slug_match:
                         slug = slug_match.group(1).rstrip('/')
-                        if not slug.isdigit():
-                            try:
-                                org_info = await unipile.get_company_org_id(slug)
-                                if org_info["org_id"]:
-                                    org_id = org_info["org_id"]
-                                    logger.info("enrich_org_found_variant_search",
-                                                company=company.raw_name, variant=variant, org_id=org_id)
-                                    break
-                            except Exception:
-                                pass
-            except Exception as e:
-                logger.warning("enrich_variant_search_error", company=company.raw_name, variant=variant, error=str(e))
+                        try:
+                            org_info = await unipile.get_company_org_id(slug)
+                            if org_info["org_id"]:
+                                org_id = org_info["org_id"]
+                                logger.info("enrich_org_from_search", company=company.raw_name,
+                                            slug=slug, org_id=org_id)
+                                break
+                        except Exception:
+                            pass
+                if org_id:
+                    break
+            except Exception:
+                pass
 
-            # 5b: Unipile direct with this variant
-            if not org_id:
-                try:
-                    org_info = await unipile.get_company_org_id(variant)
-                    if org_info["org_id"]:
-                        org_id = org_info["org_id"]
-                        logger.info("enrich_org_found_variant_unipile",
-                                    company=company.raw_name, variant=variant, org_id=org_id)
-                except Exception:
-                    pass
+    # ---- Build Sales Nav URL ----
+    if org_id:
+        sales_nav_url = _build_sales_nav_url(
+            org_id,
+            company.normalized_name or company.raw_name,
+            effective_region,
+        )
 
-            # 5c: LLM for this variant
-            if not org_id:
-                try:
-                    from src.tools.llm import llm_web_search
-                    content = await llm_web_search(
-                        f"What is the LinkedIn company page URL for {variant}? "
-                        f"Return ONLY the URL like https://www.linkedin.com/company/SLUG"
-                    )
-                    if content:
-                        slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', content, re.IGNORECASE)
-                        if slug_match:
-                            slug = slug_match.group(1).rstrip('/')
-                            if slug.isdigit():
-                                org_id = slug
-                            else:
-                                try:
-                                    org_info = await unipile.get_company_org_id(slug)
-                                    if org_info["org_id"]:
-                                        org_id = org_info["org_id"]
-                                        logger.info("enrich_org_found_variant_llm",
-                                                    company=company.raw_name, variant=variant, org_id=org_id)
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.warning("enrich_variant_llm_error", company=company.raw_name, variant=variant, error=str(e))
-
-        # Build URL from variant org_id
-        if org_id and not sales_nav_url:
-            sales_nav_url = _build_sales_nav_url(
-                org_id,
-                company.normalized_name or company.raw_name,
-                region,
-            )
-
-    # Strategy 6 (last resort): keyword-based Sales Nav URL — always works
+    # ---- Fallback: keyword-based Sales Nav URL ----
     link_not_found = False
     if not sales_nav_url:
         link_not_found = True
-        logger.warning("enrich_all_strategies_failed_keyword_fallback", company=company.raw_name)
+        logger.warning("enrich_no_org_id_keyword_fallback", company=company.raw_name,
+                       candidates_tried=len(candidate_names))
         encoded_name = quote(lookup_name, safe="")
         sales_nav_url = (
             f"https://www.linkedin.com/sales/search/people?"
@@ -810,9 +953,12 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
     update = {"sales_nav_url": sales_nav_url}
     if org_id:
         update["linkedin_org_id"] = org_id
+    # Store detected region as account_type if not already set
+    if effective_region and not company.account_type:
+        update["account_type"] = effective_region.title()
     company = company.model_copy(update=update)
     logger.info("enrich_step2_done", company=company.raw_name,
-                org_id=org_id or "(none)", has_url=bool(sales_nav_url),
+                org_id=org_id or "(none)", region=effective_region or "(none)",
                 link_not_found=link_not_found)
 
     # --- Step 3: Domain + email format ---
@@ -840,9 +986,66 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
 # Node: parallel_enrich_all
 # ---------------------------------------------------------------------------
 
+async def _enrich_and_write_if_ready(
+    company: TargetCompany, region: str, submit_to_n8n: bool
+) -> TargetCompany:
+    """
+    Enrich a single company. If a real Sales Nav link is found (org_id),
+    write directly to the sheet — no waiting for other companies.
+    Returns the updated company with sheet_row_written=True if auto-written.
+    """
+    company = await _enrich_single_company(company, region)
+
+    # Auto-write to sheet if we found a real link
+    if company.linkedin_org_id:
+        try:
+            await sheets.ensure_headers(sheets.TARGET_ACCOUNTS, sheets.TARGET_ACCOUNTS_HEADERS)
+            row = [
+                company.normalized_name or company.raw_name,
+                company.raw_name,
+                company.sales_nav_url or "",
+                company.domain or "",
+                company.sdr_assigned or "",
+                company.email_format or "",
+                company.account_type or "",
+                company.account_size or "",
+            ]
+            written_row = await sheets.append_row(sheets.TARGET_ACCOUNTS, row)
+            logger.info("fini_auto_written", company=company.raw_name, row=written_row)
+
+            if submit_to_n8n and all(v != "" for v in row):
+                try:
+                    from src.tools.n8n import submit_to_n8n as _submit, build_payload
+                    payload = build_payload(
+                        company_name=company.normalized_name or company.raw_name,
+                        parent_company_name=company.raw_name,
+                        sales_nav_url=company.sales_nav_url or "",
+                        domain=company.domain or "",
+                        sdr_assigned=company.sdr_assigned or "",
+                        email_format=company.email_format or "",
+                        account_type=company.account_type or "",
+                        account_size=company.account_size or "",
+                        row=written_row,
+                    )
+                    await _submit(payload)
+                except Exception as e:
+                    logger.warning("fini_auto_n8n_error", company=company.raw_name, error=str(e))
+
+            company = company.model_copy(update={
+                "operator_confirmed": True,
+                "sheet_row_written": True,
+            })
+        except Exception as e:
+            logger.warning("fini_auto_write_error", company=company.raw_name, error=str(e))
+
+    return company
+
+
 async def parallel_enrich_all(state: FiniState) -> FiniState:
     """
-    Enrich ALL companies concurrently (normalize + org lookup + domain).
+    Enrich ALL companies concurrently. Companies with real links are written
+    to the sheet immediately as they finish. Companies without links are
+    queued for operator review.
     Skips on re-entry after confirmation (enrichment_done flag).
     """
     if state.enrichment_done:
@@ -851,21 +1054,28 @@ async def parallel_enrich_all(state: FiniState) -> FiniState:
     logger.info("fini_parallel_enrich_start", count=len(state.companies))
 
     tasks = [
-        _enrich_single_company(company, state.region)
+        _enrich_and_write_if_ready(company, state.region, state.submit_to_n8n)
         for company in state.companies
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     companies = list(state.companies)
     errors = []
+    auto_written = 0
+    needs_review = 0
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             errors.append(f"Enrichment failed for {companies[i].raw_name}: {result}")
             logger.error("enrich_company_failed", company=companies[i].raw_name, error=str(result))
         else:
             companies[i] = result
+            if result.sheet_row_written:
+                auto_written += 1
+            else:
+                needs_review += 1
 
-    logger.info("fini_parallel_enrich_done", count=len(companies), errors=len(errors))
+    logger.info("fini_parallel_enrich_done", count=len(companies),
+                auto_written=auto_written, needs_review=needs_review, errors=len(errors))
     return state.model_copy(update={
         "companies": companies,
         "enrichment_done": True,
@@ -908,17 +1118,30 @@ async def fini_discover_domain(state: FiniState) -> FiniState:
 
 async def confirm_with_operator(state: FiniState) -> FiniState:
     """
-    Pause point for operator review. Sets status to awaiting_confirmation
-    so the API layer can surface the confirmation UI and wait.
+    Pause point for operator review.
+    - If company has a real Sales Nav link (org_id found) → auto-confirm, write directly
+    - If company has a keyword fallback URL (no org_id) → pause for operator to paste link
     When operator_confirmed is already True (after resume), pass through.
     """
     company = state.companies[state.current_index]
     if company.operator_confirmed:
         return state.model_copy(update={"status": "running"})
+
+    # Auto-confirm if we have a real link (org_id was found)
+    has_real_link = bool(company.linkedin_org_id)
+    if has_real_link:
+        logger.info("fini_auto_confirmed", company=company.normalized_name,
+                    org_id=company.linkedin_org_id)
+        companies = list(state.companies)
+        companies[state.current_index] = company.model_copy(update={"operator_confirmed": True})
+        return state.model_copy(update={"companies": companies, "status": "running"})
+
+    # No real link — need operator to review / paste correct URL
     logger.info(
         "fini_awaiting_confirmation",
         company=company.normalized_name,
         domain=company.domain,
+        reason="no org_id found, needs manual Sales Nav URL",
     )
     return state.model_copy(update={"status": "awaiting_confirmation"})
 
@@ -930,6 +1153,9 @@ async def confirm_with_operator(state: FiniState) -> FiniState:
 async def write_to_sheet(state: FiniState) -> FiniState:
     """Write confirmed company to Target Accounts sheet."""
     company = state.companies[state.current_index]
+    if company.sheet_row_written:
+        logger.info("fini_write_sheet_skip", company=company.raw_name, reason="already written")
+        return state.model_copy(update={"status": "running"})
     name = company.normalized_name or company.raw_name
     logger.info("fini_write_sheet", step="write_to_sheet", company=name)
 
@@ -1025,13 +1251,23 @@ async def submit_n8n(state: FiniState) -> FiniState:
 # ---------------------------------------------------------------------------
 
 def advance_or_finish(state: FiniState) -> FiniState:
-    """Advance to next company or mark as completed."""
+    """Advance to next company that needs attention, or mark as completed."""
     next_index = state.current_index + 1
+
+    # Skip past companies that are already fully written
+    while next_index < len(state.companies):
+        c = state.companies[next_index]
+        if c.operator_confirmed and c.sheet_row_written:
+            next_index += 1  # already done, skip
+        else:
+            break
+
     if next_index >= len(state.companies):
         logger.info("fini_completed", total=len(state.companies), errors=len(state.errors))
         return state.model_copy(update={"status": "completed"})
     else:
-        logger.info("fini_advance", next_index=next_index)
+        logger.info("fini_advance", next_index=next_index,
+                    company=state.companies[next_index].raw_name)
         return state.model_copy(update={"current_index": next_index, "status": "running"})
 
 

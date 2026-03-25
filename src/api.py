@@ -255,7 +255,7 @@ def create_app() -> FastAPI:
             while True:
                 try:
                     # Wait for messages with timeout
-                    msg = await asyncio.wait_for(queue.get(), timeout=30)
+                    msg = await asyncio.wait_for(queue.get(), timeout=60)
                     await websocket.send_json(msg)
 
                     # If run completed or errored, send final status and close
@@ -334,7 +334,7 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
         await _emit_log(thread_id, "info", f"Starting Fini for {len(company_names)} companies")
         app_graph = await build_fini_graph()
 
-        local_config = {**config, "recursion_limit": max(100, len(companies) * 2, len(state.companies) + 5)}
+        local_config = {**config, "recursion_limit": 500}
         while True:
             result = await app_graph.ainvoke(state, local_config)
             if isinstance(result, dict):
@@ -371,7 +371,7 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
 
                 # Wait for operator response (up to 10 minutes)
                 try:
-                    await asyncio.wait_for(_pending_confirmations[thread_id].wait(), timeout=600)
+                    await asyncio.wait_for(_pending_confirmations[thread_id].wait(), timeout=3600)
                 except asyncio.TimeoutError:
                     await _emit_log(thread_id, "warning", "Confirmation timeout. Skipping company.")
                     break
