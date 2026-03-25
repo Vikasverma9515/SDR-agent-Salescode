@@ -334,6 +334,136 @@ def _name_overlap(a: str, b: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Helper: GPT fallback for Sales Nav URL / org ID
+# ---------------------------------------------------------------------------
+
+async def _gpt_find_sales_nav(company_name: str, region: str = "") -> dict:
+    """
+    Ask GPT with web_search to find the LinkedIn company page or Sales Nav URL.
+    Tries multiple strategies to ensure a URL is always returned.
+    Returns {"org_id": str, "sales_nav_url": str} — either or both may be set.
+    """
+    from src.tools.llm import llm_web_search
+
+    result = {}
+    region_hint = f" (based in {region})" if region else ""
+
+    def _extract_org_id(text: str) -> str | None:
+        """Try all patterns to extract a numeric org ID from text."""
+        m = re.search(r'ORG_ID:\s*(\d+)', text)
+        if m:
+            return m.group(1)
+        m = re.search(r'organization%(?:25)?3A(\d+)', text)
+        if m:
+            return m.group(1)
+        m = re.search(r'linkedin\.com/company/(\d+)', text)
+        if m:
+            return m.group(1)
+        return None
+
+    def _extract_slug(text: str) -> str | None:
+        """Extract LinkedIn company slug from text."""
+        m = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', text, re.IGNORECASE)
+        if m:
+            slug = m.group(1).rstrip('/')
+            if not slug.isdigit():
+                return slug
+        return None
+
+    try:
+        # --- Attempt 1: Ask for org ID directly ---
+        prompt1 = (
+            f"Find the LinkedIn company page for \"{company_name}\"{region_hint}. "
+            f"I need the numeric LinkedIn organization ID. "
+            f"Search LinkedIn and return ONLY in this format:\n"
+            f"ORG_ID: <number>\n"
+            f"URL: <linkedin company page url>\n"
+            f"The org ID is the number in URLs like linkedin.com/company/12345 or "
+            f"in Sales Navigator URLs after 'organization%3A'. "
+            f"If you can only find the company page URL, return that. No explanation."
+        )
+        content1 = await llm_web_search(prompt1)
+        logger.info("gpt_sales_nav_attempt1", company=company_name, content=content1[:300])
+
+        org_id = _extract_org_id(content1)
+        if org_id:
+            result["org_id"] = org_id
+            return result
+
+        slug = _extract_slug(content1)
+        if slug:
+            logger.info("gpt_sales_nav_slug_found", company=company_name, slug=slug)
+            try:
+                org_info = await unipile.get_company_org_id(slug)
+                if org_info["org_id"]:
+                    result["org_id"] = org_info["org_id"]
+                    return result
+            except Exception:
+                pass
+
+        nav_match = re.search(
+            r'(https://www\.linkedin\.com/sales/search/people\?[^\s"<>]+)', content1
+        )
+        if nav_match:
+            result["sales_nav_url"] = nav_match.group(1)
+            return result
+
+        # --- Attempt 2: Ask for Sales Nav URL directly ---
+        prompt2 = (
+            f"Go to LinkedIn Sales Navigator and search for people at \"{company_name}\"{region_hint}. "
+            f"Return the full Sales Navigator search URL. "
+            f"The URL should look like: https://www.linkedin.com/sales/search/people?query=... "
+            f"Return ONLY the URL. No explanation."
+        )
+        content2 = await llm_web_search(prompt2)
+        logger.info("gpt_sales_nav_attempt2", company=company_name, content=content2[:300])
+
+        org_id = _extract_org_id(content2)
+        if org_id:
+            result["org_id"] = org_id
+            return result
+
+        slug = _extract_slug(content2)
+        if slug:
+            try:
+                org_info = await unipile.get_company_org_id(slug)
+                if org_info["org_id"]:
+                    result["org_id"] = org_info["org_id"]
+                    return result
+            except Exception:
+                pass
+
+        nav_match = re.search(
+            r'(https://www\.linkedin\.com/sales/[^\s"<>]+)', content2
+        )
+        if nav_match:
+            result["sales_nav_url"] = nav_match.group(1)
+            return result
+
+        # --- Last resort: keyword-based Sales Nav URL ---
+        encoded_name = quote(company_name, safe="")
+        result["sales_nav_url"] = (
+            f"https://www.linkedin.com/sales/search/people?"
+            f"query=(keywords%3A{encoded_name})"
+        )
+        logger.info("gpt_sales_nav_keyword_fallback", company=company_name)
+        return result
+
+    except Exception as e:
+        logger.warning("gpt_sales_nav_error", company=company_name, error=str(e))
+
+    # Even on total failure, return a keyword search URL
+    try:
+        encoded_name = quote(company_name, safe="")
+        return {"sales_nav_url": (
+            f"https://www.linkedin.com/sales/search/people?"
+            f"query=(keywords%3A{encoded_name})"
+        )}
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Helper: enrich a single company (normalize + org lookup + domain)
 # ---------------------------------------------------------------------------
 
@@ -375,8 +505,30 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
                 "linkedin_org_id": org_info["org_id"],
                 "sales_nav_url": sales_nav_url,
             })
-        elif org_info["error"]:
-            logger.warning("enrich_org_id_failed", company=company.raw_name, error=org_info["error"])
+        else:
+            # Fallback: ask GPT to find Sales Nav URL or LinkedIn company page directly
+            logger.warning("enrich_org_id_failed_trying_gpt",
+                          company=company.raw_name, error=org_info.get("error"))
+            gpt_result = await _gpt_find_sales_nav(lookup_name, region)
+            if gpt_result.get("org_id"):
+                sales_nav_url = _build_sales_nav_url(
+                    gpt_result["org_id"],
+                    company.normalized_name or company.raw_name,
+                    region,
+                )
+                company = company.model_copy(update={
+                    "linkedin_org_id": gpt_result["org_id"],
+                    "sales_nav_url": sales_nav_url,
+                })
+                logger.info("enrich_org_id_from_gpt", company=company.raw_name,
+                           org_id=gpt_result["org_id"])
+            elif gpt_result.get("sales_nav_url"):
+                # GPT found a direct Sales Nav URL — use it as-is
+                company = company.model_copy(update={
+                    "sales_nav_url": gpt_result["sales_nav_url"],
+                })
+                logger.info("enrich_sales_nav_from_gpt", company=company.raw_name,
+                           url=gpt_result["sales_nav_url"])
     except Exception as e:
         logger.warning("enrich_scrape_error", company=company.raw_name, error=str(e))
 

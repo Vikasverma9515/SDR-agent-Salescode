@@ -16,10 +16,14 @@ class Settings(BaseSettings):
     unipile_dsn: str = "api21.unipile.com:15157"
     unipile_account_id: str = ""
 
-    # Search
+    # Search / LLM
     openai_api_key: str = ""
     tavily_api_key: str = ""
     perplexity_api_key: str = ""
+
+    # AWS Bedrock (Claude fallback)
+    aws_bearer_token_bedrock: str = ""
+    aws_bedrock_region: str = "us-east-1"
 
     # ZeroBounce
     zerobounce_api_key: str = ""

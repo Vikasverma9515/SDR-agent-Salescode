@@ -194,44 +194,20 @@ async def _ask_gpt_for_linkedin_slug(company_name: str) -> list[str]:
     Returns a list of candidate slugs extracted from the response.
     """
     settings = get_settings()
-    if not settings.openai_api_key:
+    if not settings.openai_api_key and not settings.aws_bearer_token_bedrock:
         return []
 
     try:
-        import httpx as _httpx
-        async with _httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-5",
-                    "tools": [{"type": "web_search"}],
-                    "input": (
-                        f"What is the LinkedIn company page URL for {company_name}? "
-                        f"Return ONLY the URL in format: https://www.linkedin.com/company/SLUG/ "
-                        f"No explanation, no markdown."
-                    ),
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        from src.tools.llm import llm_web_search
+        content = await llm_web_search(
+            f"What is the LinkedIn company page URL for {company_name}? "
+            f"Return ONLY the URL in format: https://www.linkedin.com/company/SLUG/ "
+            f"No explanation, no markdown."
+        )
 
-            content = ""
-            for item in data.get("output", []):
-                if item.get("type") == "message":
-                    for part in item.get("content", []):
-                        if part.get("type") == "output_text":
-                            content = part.get("text", "").strip()
-                            break
-                if content:
-                    break
-
-            slugs = [s.rstrip('/') for s in _slug_re.findall(content)]
-            logger.info("gpt_slug_response", company=company_name, content=content, slugs=slugs)
-            return slugs
+        slugs = [s.rstrip('/') for s in _slug_re.findall(content)]
+        logger.info("gpt_slug_response", company=company_name, content=content, slugs=slugs)
+        return slugs
     except Exception as e:
         logger.warning("gpt_slug_error", company=company_name, error=str(e))
         return []

@@ -349,9 +349,8 @@ async def unipile_search(state: SearcherState) -> SearcherState:
                     reason="all unipile results failed verify_profile" if people else "unipile returned 0 results")
         gpt_contacts: list[Contact] = []
         try:
-            from openai import AsyncOpenAI
+            from src.tools.llm import llm_web_search
             import re as _re2
-            _oai = AsyncOpenAI(api_key=get_settings().openai_api_key)
             company_name = state.target_normalized_name or state.target_company
             domain = state.target_domain or ""
 
@@ -362,19 +361,7 @@ async def unipile_search(state: SearcherState) -> SearcherState:
                         f"Search LinkedIn directly and return ONLY the LinkedIn profile URL "
                         f"(linkedin.com/in/...). Nothing else. No explanation."
                     )
-                    _resp = await _oai.responses.create(
-                        model="gpt-5",
-                        tools=[{"type": "web_search"}],
-                        input=_prompt,
-                    )
-                    _text = ""
-                    for _item in (_resp.output or []):
-                        content = getattr(_item, "content", None) or []
-                        for _part in content:
-                            t = getattr(_part, "text", None)
-                            if t:
-                                _text += t
-                    # Extract all linkedin.com/in/ URLs from the response
+                    _text = await llm_web_search(_prompt)
                     urls = _re2.findall(r'https?://(?:www\.|in\.)?linkedin\.com/in/[\w\-]+', _text)
                     urls = [u.rstrip("/") for u in urls]
                     logger.info("searcher_gpt5_urls", role=role, urls=urls)
@@ -536,7 +523,7 @@ async def _filter_garbage_names(contacts: list[Contact], company_name: str) -> l
 
     from src.config import get_settings
     settings = get_settings()
-    if not settings.openai_api_key:
+    if not settings.openai_api_key and not settings.aws_bearer_token_bedrock:
         return contacts
 
     # Only filter contacts that don't already have a verified LinkedIn
@@ -548,8 +535,7 @@ async def _filter_garbage_names(contacts: list[Contact], company_name: str) -> l
         return contacts
 
     try:
-        from openai import AsyncOpenAI
-        _oai = AsyncOpenAI(api_key=settings.openai_api_key)
+        from src.tools.llm import llm_complete
 
         names_list = "\n".join(f"{i+1}. {c.full_name}" for i, c in enumerate(needs_check))
 
@@ -562,13 +548,7 @@ async def _filter_garbage_names(contacts: list[Contact], company_name: str) -> l
             f"If none are real names, reply: none"
         )
 
-        response = await _oai.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=100,
-        )
-        answer = response.choices[0].message.content.strip().lower()
+        answer = (await llm_complete(prompt, max_tokens=100)).lower()
         logger.info("searcher_name_filter_response", company=company_name, answer=answer)
 
         if answer == "none":
@@ -684,10 +664,9 @@ async def _scrape_gpt5(domain: str, company_name: str) -> list[Contact]:
     """
     from src.config import get_settings
     settings = get_settings()
-    if not settings.openai_api_key:
+    if not settings.openai_api_key and not settings.aws_bearer_token_bedrock:
         return []
 
-    import httpx as _httpx
     prompt = (
         f"Find the CURRENT board of directors and leadership team for {company_name} "
         f"from their official website {domain}. "
@@ -697,27 +676,9 @@ async def _scrape_gpt5(domain: str, company_name: str) -> list[Contact]:
     )
 
     try:
-        async with _httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-5",
-                    "tools": [{"type": "web_search"}],
-                    "input": prompt,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = ""
-            for item in data.get("output", []):
-                if item.get("type") == "message":
-                    for part in item.get("content", []):
-                        if part.get("type") == "output_text":
-                            content = part.get("text", "").strip()
+        from src.tools.llm import llm_web_search
+        content = await llm_web_search(prompt)
+        content = content.strip() if content else ""
 
         if not content:
             return []
@@ -1096,64 +1057,36 @@ async def validate_linkedin(state: SearcherState) -> SearcherState:
 
 async def _detect_email_format_llm(domain: str, company: str) -> str | None:
     """
-    Use GPT-5 with web_search + Structured Outputs (JSON schema) to detect
-    the email format for a domain. Returns a full format string like
-    '{first}.{last}@domain.com', or None if unknown.
+    Use LLM with web_search to detect the email format for a domain.
+    Tries OpenAI first, falls back to Claude Bedrock.
+    Returns a full format string like '{first}.{last}@domain.com', or None if unknown.
     """
-    import json
-    from openai import AsyncOpenAI
     from src.tools.domain_discovery import _EMAIL_PATTERNS
+    from src.tools.llm import llm_web_search
 
     settings = get_settings()
-    if not settings.openai_api_key:
+    if not settings.openai_api_key and not settings.aws_bearer_token_bedrock:
         return None
 
-    _oai = AsyncOpenAI(api_key=settings.openai_api_key)
     patterns_str = "\n".join(f"- {p}" for p in _EMAIL_PATTERNS)
     prompt = (
         f"Find the email format used by employees at {company} (domain: {domain}).\n"
         f"Search for real employee emails — LinkedIn, email finders, press releases, PDFs.\n"
         f"Pick EXACTLY ONE pattern from this list:\n{patterns_str}\n"
-        f"Or return 'unknown' if you cannot determine it with confidence."
+        f"Or return 'unknown' if you cannot determine it with confidence.\n"
+        f"Reply with ONLY the pattern, nothing else."
     )
 
     try:
-        resp = await _oai.responses.create(
-            model="gpt-5",
-            tools=[{"type": "web_search"}],
-            input=prompt,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "email_format_result",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "pattern": {
-                                    "type": "string",
-                                    "enum": list(_EMAIL_PATTERNS) + ["unknown"],
-                                }
-                            },
-                            "required": ["pattern"],
-                            "additionalProperties": False,
-                        },
-                    }
-                }
-            },
-        )
-        for item in resp.output:
-            if item.type == "message":
-                for part in item.content:
-                    if part.type == "output_text":
-                        data = json.loads(part.text)
-                        pattern = data.get("pattern", "unknown")
-                        if pattern != "unknown" and pattern in _EMAIL_PATTERNS:
-                            logger.info("searcher_enrich_format_llm", domain=domain, pattern=pattern)
-                            return f"{pattern}@{domain}"
-                        logger.warning("searcher_enrich_format_llm_unknown", domain=domain, pattern=pattern)
-                        return None
+        answer = await llm_web_search(prompt)
+        answer = answer.strip()
+        # Try to extract a pattern from the response
+        for pattern in _EMAIL_PATTERNS:
+            if pattern in answer:
+                logger.info("searcher_enrich_format_llm", domain=domain, pattern=pattern)
+                return f"{pattern}@{domain}"
+        if answer and answer != "unknown":
+            logger.warning("searcher_enrich_format_llm_unknown", domain=domain, answer=answer)
     except Exception as e:
         logger.warning("searcher_enrich_format_llm_error", domain=domain, error=str(e))
 

@@ -68,54 +68,29 @@ async def _ask_gpt_for_domain(company_name: str) -> str | None:
     """
     from src.config import get_settings
     settings = get_settings()
-    if not settings.openai_api_key:
+    if not settings.openai_api_key and not settings.aws_bearer_token_bedrock:
         return None
 
     try:
-        import httpx as _httpx
-        async with _httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-5",
-                    "tools": [{"type": "web_search"}],
-                    "input": (
-                        f"What is the official corporate website domain for {company_name}? "
-                        f"Return ONLY the bare domain (e.g. dabur.com) — the primary HQ domain, "
-                        f"not a subsidiary, product, shop, or regional domain. No explanation."
-                    ),
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        from src.tools.llm import llm_web_search
+        raw = await llm_web_search(
+            f"What is the official corporate website domain for {company_name}? "
+            f"Return ONLY the bare domain (e.g. dabur.com) — the primary HQ domain, "
+            f"not a subsidiary, product, shop, or regional domain. No explanation."
+        )
+        content = raw.strip().lower() if raw else ""
+        logger.info("gpt_domain_response", company=company_name, content=content)
 
-            # Extract text from output items
-            content = ""
-            for item in data.get("output", []):
-                if item.get("type") == "message":
-                    for part in item.get("content", []):
-                        if part.get("type") == "output_text":
-                            content = part.get("text", "").strip().lower()
-                            break
-                if content:
-                    break
+        if not content or content == "unknown":
+            return None
 
-            logger.info("gpt_domain_response", company=company_name, content=content)
+        # Strip URL prefix / www if GPT returned a full URL
+        content = re.sub(r'^https?://(?:www\.)?', '', content)
+        content = re.sub(r'^www\.', '', content)
+        content = content.split('/')[0].strip()
 
-            if not content or content == "unknown":
-                return None
-
-            # Strip URL prefix / www if GPT returned a full URL
-            content = re.sub(r'^https?://(?:www\.)?', '', content)
-            content = re.sub(r'^www\.', '', content)
-            content = content.split('/')[0].strip()
-
-            if re.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}', content):
-                return content
+        if re.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}', content):
+            return content
 
     except Exception as e:
         logger.warning("gpt_domain_error", company=company_name, error=str(e))
@@ -434,16 +409,14 @@ async def _infer_pattern_from_emails(
 
         return None
 
-    # --- gpt-4.1-mini: pick the best pattern from the 18 supported ones ---
-    import asyncio as _asyncio
+    # --- LLM: pick the best pattern from the 18 supported ones ---
     from src.config import get_settings as _get_settings
     _settings = _get_settings()
-    if not _settings.openai_api_key:
+    if not _settings.openai_api_key and not _settings.aws_bearer_token_bedrock:
         return None
 
     try:
-        from openai import AsyncOpenAI
-        _oai = AsyncOpenAI(api_key=_settings.openai_api_key)
+        from src.tools.llm import llm_complete
 
         _patterns = [
             "{first}.{last}", "{first_initial}.{last}", "{first}.{last_initial}",
@@ -454,7 +427,7 @@ async def _infer_pattern_from_emails(
             "{last_initial}-{first_initial}",
         ]
         _patterns_str = "\n".join(f"- {p}" for p in _patterns)
-        _emails_str = ", ".join(name_emails[:20])  # cap at 20
+        _emails_str = ", ".join(name_emails[:20])
 
         _prompt = (
             f"These are email local parts (before @) scraped from the domain {domain}:\n"
@@ -467,13 +440,8 @@ async def _infer_pattern_from_emails(
             f"If you cannot determine, reply: unknown"
         )
 
-        _resp = await _oai.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": _prompt}],
-            temperature=0,
-            max_tokens=30,
-        )
-        _answer = _resp.choices[0].message.content.strip()
+        _answer = await llm_complete(_prompt, max_tokens=30)
+        _answer = _answer.strip()
         if _answer in _patterns:
             return f"{_answer}@{domain}"
     except Exception:
