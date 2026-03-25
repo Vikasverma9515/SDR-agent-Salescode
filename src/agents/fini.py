@@ -492,45 +492,180 @@ async def _enrich_single_company(company: TargetCompany, region: str) -> TargetC
         })
 
     # --- Step 2: LinkedIn org lookup + Sales Nav URL ---
+    # Aggressive multi-strategy approach — never gives up until we have a URL
+    lookup_name = company.normalized_name or company.raw_name
+    org_id = None
+    sales_nav_url = None
+
+    # Strategy 1: Unipile direct lookup (fastest)
     try:
-        lookup_name = company.normalized_name or company.raw_name
         org_info = await unipile.get_company_org_id(lookup_name)
         if org_info["org_id"]:
-            sales_nav_url = _build_sales_nav_url(
-                org_info["org_id"],
-                org_info["name"] or company.raw_name,
-                region,
+            org_id = org_info["org_id"]
+            logger.info("enrich_org_found_unipile", company=company.raw_name, org_id=org_id)
+    except Exception as e:
+        logger.warning("enrich_unipile_error", company=company.raw_name, error=str(e))
+
+    # Strategy 2: Search engines to find LinkedIn company name, then retry Unipile
+    if not org_id:
+        logger.info("enrich_trying_search_for_linkedin_name", company=company.raw_name)
+        try:
+            search_results = await search_with_fallback(
+                f'"{lookup_name}" site:linkedin.com/company',
+                max_results=5,
             )
-            company = company.model_copy(update={
-                "linkedin_org_id": org_info["org_id"],
-                "sales_nav_url": sales_nav_url,
-            })
-        else:
-            # Fallback: ask GPT to find Sales Nav URL or LinkedIn company page directly
-            logger.warning("enrich_org_id_failed_trying_gpt",
-                          company=company.raw_name, error=org_info.get("error"))
+            for r in search_results:
+                slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', r.url, re.IGNORECASE)
+                if slug_match:
+                    slug = slug_match.group(1).rstrip('/')
+                    if not slug.isdigit():
+                        logger.info("enrich_slug_from_search", company=company.raw_name, slug=slug)
+                        try:
+                            org_info = await unipile.get_company_org_id(slug)
+                            if org_info["org_id"]:
+                                org_id = org_info["org_id"]
+                                logger.info("enrich_org_found_search_unipile", company=company.raw_name, org_id=org_id)
+                                break
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning("enrich_search_linkedin_error", company=company.raw_name, error=str(e))
+
+    # Strategy 3: LLM (OpenAI/Claude) to find org ID or Sales Nav URL
+    if not org_id and not sales_nav_url:
+        logger.info("enrich_trying_llm_fallback", company=company.raw_name)
+        try:
             gpt_result = await _gpt_find_sales_nav(lookup_name, region)
             if gpt_result.get("org_id"):
+                org_id = gpt_result["org_id"]
+                logger.info("enrich_org_found_llm", company=company.raw_name, org_id=org_id)
+            elif gpt_result.get("sales_nav_url"):
+                sales_nav_url = gpt_result["sales_nav_url"]
+                logger.info("enrich_url_found_llm", company=company.raw_name)
+        except Exception as e:
+            logger.warning("enrich_llm_error", company=company.raw_name, error=str(e))
+
+    # Strategy 4: Direct LLM ask for the LinkedIn company page URL, extract org from page
+    if not org_id and not sales_nav_url:
+        logger.info("enrich_trying_direct_llm_search", company=company.raw_name)
+        try:
+            from src.tools.llm import llm_web_search
+            content = await llm_web_search(
+                f"What is the exact LinkedIn company page URL for {lookup_name}? "
+                f"Search linkedin.com and return ONLY the URL like https://www.linkedin.com/company/SLUG"
+            )
+            if content:
+                slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', content, re.IGNORECASE)
+                if slug_match:
+                    slug = slug_match.group(1).rstrip('/')
+                    # Try numeric org ID first
+                    if slug.isdigit():
+                        org_id = slug
+                    else:
+                        # Try Unipile with this slug
+                        try:
+                            org_info = await unipile.get_company_org_id(slug)
+                            if org_info["org_id"]:
+                                org_id = org_info["org_id"]
+                                logger.info("enrich_org_found_direct_llm", company=company.raw_name, org_id=org_id)
+                        except Exception:
+                            pass
+                # Also check for org ID in any URL pattern
+                if not org_id:
+                    org_match = re.search(r'organization%(?:25)?3A(\d+)', content)
+                    if org_match:
+                        org_id = org_match.group(1)
+        except Exception as e:
+            logger.warning("enrich_direct_llm_error", company=company.raw_name, error=str(e))
+
+    # Build the Sales Nav URL from org_id if we found one
+    if org_id and not sales_nav_url:
+        sales_nav_url = _build_sales_nav_url(
+            org_id,
+            company.normalized_name or company.raw_name,
+            region,
+        )
+
+    # Strategy 5: Try parent company name if different from normalized name
+    if not org_id and not sales_nav_url:
+        parent_name = company.raw_name.strip()
+        if parent_name.lower() != lookup_name.lower():
+            logger.info("enrich_trying_parent_company", company=company.raw_name, parent=parent_name)
+
+            # 5a: Search engines for parent
+            try:
+                search_results = await search_with_fallback(
+                    f'"{parent_name}" site:linkedin.com/company',
+                    max_results=5,
+                )
+                for r in search_results:
+                    slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', r.url, re.IGNORECASE)
+                    if slug_match:
+                        slug = slug_match.group(1).rstrip('/')
+                        if not slug.isdigit():
+                            try:
+                                org_info = await unipile.get_company_org_id(slug)
+                                if org_info["org_id"]:
+                                    org_id = org_info["org_id"]
+                                    logger.info("enrich_org_found_parent_search", company=company.raw_name, org_id=org_id)
+                                    break
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning("enrich_parent_search_error", company=company.raw_name, error=str(e))
+
+            # 5b: LLM for parent
+            if not org_id:
+                try:
+                    from src.tools.llm import llm_web_search
+                    content = await llm_web_search(
+                        f"What is the LinkedIn company page URL for {parent_name}? "
+                        f"Return ONLY the URL like https://www.linkedin.com/company/SLUG"
+                    )
+                    if content:
+                        slug_match = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]+)', content, re.IGNORECASE)
+                        if slug_match:
+                            slug = slug_match.group(1).rstrip('/')
+                            if slug.isdigit():
+                                org_id = slug
+                            else:
+                                try:
+                                    org_info = await unipile.get_company_org_id(slug)
+                                    if org_info["org_id"]:
+                                        org_id = org_info["org_id"]
+                                        logger.info("enrich_org_found_parent_llm", company=company.raw_name, org_id=org_id)
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    logger.warning("enrich_parent_llm_error", company=company.raw_name, error=str(e))
+
+            # Build URL from parent org_id
+            if org_id and not sales_nav_url:
                 sales_nav_url = _build_sales_nav_url(
-                    gpt_result["org_id"],
-                    company.normalized_name or company.raw_name,
+                    org_id,
+                    parent_name,
                     region,
                 )
-                company = company.model_copy(update={
-                    "linkedin_org_id": gpt_result["org_id"],
-                    "sales_nav_url": sales_nav_url,
-                })
-                logger.info("enrich_org_id_from_gpt", company=company.raw_name,
-                           org_id=gpt_result["org_id"])
-            elif gpt_result.get("sales_nav_url"):
-                # GPT found a direct Sales Nav URL — use it as-is
-                company = company.model_copy(update={
-                    "sales_nav_url": gpt_result["sales_nav_url"],
-                })
-                logger.info("enrich_sales_nav_from_gpt", company=company.raw_name,
-                           url=gpt_result["sales_nav_url"])
-    except Exception as e:
-        logger.warning("enrich_scrape_error", company=company.raw_name, error=str(e))
+
+    # Strategy 6 (last resort): keyword-based Sales Nav URL — always works
+    link_not_found = False
+    if not sales_nav_url:
+        link_not_found = True
+        logger.warning("enrich_all_strategies_failed_keyword_fallback", company=company.raw_name)
+        encoded_name = quote(lookup_name, safe="")
+        sales_nav_url = (
+            f"https://www.linkedin.com/sales/search/people?"
+            f"query=(keywords%3A{encoded_name})"
+        )
+
+    # Apply results
+    update = {"sales_nav_url": sales_nav_url}
+    if org_id:
+        update["linkedin_org_id"] = org_id
+    company = company.model_copy(update=update)
+    logger.info("enrich_step2_done", company=company.raw_name,
+                org_id=org_id or "(none)", has_url=bool(sales_nav_url),
+                link_not_found=link_not_found)
 
     # --- Step 3: Domain + email format ---
     try:

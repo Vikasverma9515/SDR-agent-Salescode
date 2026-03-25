@@ -133,6 +133,18 @@ export default function ConfirmationModal({ data, threadId, onClose }) {
                 onChange={e => setFields(p => ({ ...p, sales_nav_url: e.target.value }))}
                 placeholder="https://www.linkedin.com/sales/search/people/..."
               />
+              {(!fields.sales_nav_url || fields.sales_nav_url.includes('keywords%3A') || !fields.linkedin_org_id) && (
+                <div className="mt-1.5 flex items-center gap-1.5 text-amber-400">
+                  <svg className="w-3 h-3 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                    <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.168 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+                  </svg>
+                  <span className="text-[10px] font-mono">
+                    {!fields.sales_nav_url ? 'No link found — please paste manually' :
+                     fields.sales_nav_url.includes('keywords%3A') ? 'Auto-generated keyword link — paste exact link if available' :
+                     !fields.linkedin_org_id ? 'No org ID — link may be imprecise' : ''}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         </div>

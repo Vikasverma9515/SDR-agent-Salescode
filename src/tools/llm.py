@@ -163,6 +163,46 @@ async def _bedrock_claude(prompt: str, max_tokens: int = 1024,
     return text
 
 
+async def _bedrock_claude_with_search(prompt: str, max_tokens: int = 1024,
+                                       temperature: float = 0) -> str:
+    """
+    Claude Bedrock with web search context.
+    Runs Perplexity/Tavily/DDG search first, feeds results into Claude's prompt.
+    """
+    from src.tools.search import search_with_fallback
+    from src.state import SearchResult
+
+    # Extract a good search query from the prompt (first 150 chars, clean up)
+    search_query = prompt[:150].replace('"', '').replace('\n', ' ').strip()
+
+    # Run search
+    search_results = []
+    try:
+        search_results = await search_with_fallback(search_query, max_results=5)
+    except Exception as e:
+        logger.warning("bedrock_search_prefetch_error", error=str(e))
+
+    # Build context from search results
+    if search_results:
+        context_parts = []
+        for i, r in enumerate(search_results, 1):
+            context_parts.append(f"[{i}] {r.title}\nURL: {r.url}\n{r.snippet}")
+        search_context = "\n\n".join(context_parts)
+
+        augmented_prompt = (
+            f"I searched the web for relevant information. Here are the results:\n\n"
+            f"{search_context}\n\n"
+            f"---\n\n"
+            f"Based on the search results above and your knowledge, please answer:\n\n"
+            f"{prompt}"
+        )
+    else:
+        augmented_prompt = prompt
+
+    return await _bedrock_claude(augmented_prompt, max_tokens=max_tokens,
+                                 temperature=temperature)
+
+
 # ---------------------------------------------------------------------------
 # Public API — try OpenAI, fallback to Claude Bedrock
 # ---------------------------------------------------------------------------
@@ -188,10 +228,10 @@ async def llm_web_search(prompt: str, model: str = "gpt-5") -> str:
         else:
             logger.info("llm_web_search_openai_skipped", reason="circuit breaker open")
 
-        # Fallback to Claude Bedrock
+        # Fallback to Claude Bedrock with search context
         try:
             logger.info("llm_web_search_bedrock_fallback")
-            result = await _bedrock_claude(prompt)
+            result = await _bedrock_claude_with_search(prompt)
             if result and result.strip():
                 return result
         except Exception as e:
