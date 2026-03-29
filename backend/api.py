@@ -33,6 +33,8 @@ class SearcherRunRequest(BaseModel):
     companies: str
     dm_roles: str = "VP Ecommerce,CDO,Head of Digital,CTO,CMO,VP Marketing,VP Sales"
     target_contact_count: int = 10  # max contacts to find per company (0 = unlimited)
+    auto_approve: bool = False  # if True, skip SDR pause steps and auto-write all matched contacts
+    auto_trigger_veri: bool = True  # if True, automatically start Veri after contacts are written
 
 class VeriRunRequest(BaseModel):
     row_start: Optional[int] = None  # 1-based, inclusive (data rows, not header)
@@ -91,14 +93,26 @@ class ScoutCommitRequest(BaseModel):
     company: str = ""
     linkedin_url: str = ""
     linkedin_verified: bool = False
+    linkedin_status: str = ""
+    employment_verified: str = ""
+    title_match: str = ""
+    actual_title: str = ""
+    email: str = ""
+    email_status: str = ""
+    buying_role: str = ""
     source: str = "scout"
     confidence: str = "medium"
+    # Company context (passed from frontend store)
+    company_domain: str = ""
+    company_account_type: str = ""
+    company_account_size: str = ""
 
 # ---------------------------------------------------------------------------
 # Active runs tracker
 # ---------------------------------------------------------------------------
 
 _active_runs: dict[str, dict] = {}
+_active_tasks: dict[str, asyncio.Task] = {}  # task handles for cancellation
 _pending_confirmations: dict[str, asyncio.Event] = {}
 _confirmation_data: dict[str, dict] = {}
 _log_queues: dict[str, asyncio.Queue] = {}
@@ -202,9 +216,9 @@ def create_app() -> FastAPI:
     async def run_fini(req: FiniRunRequest):
         thread_id = str(uuid.uuid4())
         _log_queues[thread_id] = _PipelineQueue(thread_id)
-        _active_runs[thread_id] = {"agent": "fini", "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+        _active_runs[thread_id] = {"agent": "fini", "status": "running", "thread_id": thread_id, "started_at": datetime.now(timezone.utc).isoformat()}
 
-        asyncio.create_task(_fini_task(thread_id, req))
+        _active_tasks[thread_id] = asyncio.create_task(_fini_task(thread_id, req))
 
         return RunResponse(
             thread_id=thread_id,
@@ -287,9 +301,9 @@ def create_app() -> FastAPI:
     async def run_searcher(req: SearcherRunRequest):
         thread_id = str(uuid.uuid4())
         _log_queues[thread_id] = _PipelineQueue(thread_id)
-        _active_runs[thread_id] = {"agent": "searcher", "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+        _active_runs[thread_id] = {"agent": "searcher", "status": "running", "thread_id": thread_id, "started_at": datetime.now(timezone.utc).isoformat()}
 
-        asyncio.create_task(_searcher_task(thread_id, req))
+        _active_tasks[thread_id] = asyncio.create_task(_searcher_task(thread_id, req, auto_trigger_veri=req.auto_trigger_veri))
 
         return RunResponse(
             thread_id=thread_id,
@@ -310,10 +324,10 @@ def create_app() -> FastAPI:
 
     @app.post("/api/searcher/scout-commit")
     async def scout_commit(req: ScoutCommitRequest) -> dict[str, Any]:
-        """Write a scout-found candidate directly to the First Clean List."""
+        """Write enriched scout candidate to Final Filtered List (cols A–U)."""
         try:
-            row = await _scout_commit(req.model_dump())
-            return {"ok": True, "row": row}
+            result = await _scout_commit(req.model_dump())
+            return result
         except Exception as e:
             logger.error("scout_commit_error", error=str(e))
             raise HTTPException(status_code=500, detail=str(e))
@@ -366,9 +380,9 @@ def create_app() -> FastAPI:
             req = VeriRunRequest()
         thread_id = str(uuid.uuid4())
         _log_queues[thread_id] = _PipelineQueue(thread_id)
-        _active_runs[thread_id] = {"agent": "veri", "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+        _active_runs[thread_id] = {"agent": "veri", "status": "running", "thread_id": thread_id, "started_at": datetime.now(timezone.utc).isoformat()}
 
-        asyncio.create_task(_veri_task(thread_id, req.row_start, req.row_end))
+        _active_tasks[thread_id] = asyncio.create_task(_veri_task(thread_id, req.row_start, req.row_end))
 
         row_msg = f" (rows {req.row_start}–{req.row_end})" if req.row_start else " (all pending)"
         return RunResponse(
@@ -391,6 +405,7 @@ def create_app() -> FastAPI:
         _active_runs[thread_id] = {
             "agent": "veri",
             "status": "running",
+            "thread_id": thread_id,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "auto_triggered_by": "n8n",
         }
@@ -415,6 +430,36 @@ def create_app() -> FastAPI:
         if thread_id not in _active_runs:
             raise HTTPException(status_code=404, detail="Run not found")
         return _active_runs[thread_id]
+
+    @app.post("/api/runs/{thread_id}/cancel")
+    async def cancel_run(thread_id: str) -> dict[str, str]:
+        """Cancel a running pipeline task."""
+        task = _active_tasks.get(thread_id)
+        if not task or task.done():
+            raise HTTPException(status_code=404, detail="No active task for this thread")
+        task.cancel()
+        _active_runs.get(thread_id, {})["status"] = "cancelling"
+        return {"status": "cancelling", "thread_id": thread_id}
+
+    @app.post("/api/runs/{thread_id}/pause")
+    async def pause_run(thread_id: str) -> dict[str, str]:
+        """Pause a running pipeline at the next checkpoint."""
+        from backend.utils import pause as _pause
+        if not _pause.pause(thread_id):
+            raise HTTPException(status_code=404, detail="No active run for this thread")
+        _active_runs.get(thread_id, {})["status"] = "paused"
+        await _emit_event(thread_id, "paused", {"message": "Paused — will stop at next checkpoint"})
+        return {"status": "paused", "thread_id": thread_id}
+
+    @app.post("/api/runs/{thread_id}/resume")
+    async def resume_run(thread_id: str) -> dict[str, str]:
+        """Resume a paused pipeline run."""
+        from backend.utils import pause as _pause
+        if not _pause.resume(thread_id):
+            raise HTTPException(status_code=404, detail="No active run for this thread")
+        _active_runs.get(thread_id, {})["status"] = "running"
+        await _emit_event(thread_id, "resumed", {"message": "Resumed"})
+        return {"status": "running", "thread_id": thread_id}
 
     # ---------------------------------------------------------------------------
     # WebSocket for real-time logs
@@ -576,6 +621,9 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
     if thread_id in _log_queues:
         _reg_progress(thread_id, _log_queues[thread_id])
 
+    from backend.utils import pause as _pause_util
+    _pause_util.register(thread_id)
+
     try:
         # Small delay so the UI WebSocket can connect before first events are emitted
         await asyncio.sleep(0.5)
@@ -584,6 +632,8 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
 
         local_config = {**config, "recursion_limit": 500}
         while True:
+            # Check pause gate between company iterations
+            await _pause_util.await_if_paused(thread_id)
             result = await app_graph.ainvoke(state, local_config)
             if isinstance(result, dict):
                 state = FiniState(**result)
@@ -686,13 +736,19 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
             else:
                 break
 
+    except asyncio.CancelledError:
+        logger.info("fini_task_cancelled", thread_id=thread_id)
+        _active_runs[thread_id]["status"] = "cancelled"
+        await _emit_event(thread_id, "cancelled", {"message": "Run stopped by user"})
     except Exception as e:
         logger.error("fini_task_error", error=str(e), thread_id=thread_id)
         _active_runs[thread_id]["status"] = "failed"
         await _emit_event(thread_id, "error", {"error": str(e)})
+    finally:
+        _pause_util.unregister(thread_id)
 
 
-async def _searcher_task(thread_id: str, req: SearcherRunRequest):
+async def _searcher_task(thread_id: str, req: SearcherRunRequest, auto_trigger_veri: bool = True):
     """Background task running the Searcher gap-fill agent."""
     from backend.agents.searcher import build_searcher_graph
     from backend.state import SearcherState
@@ -700,6 +756,9 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest):
 
     # Register queue for per-company progress events
     _reg_progress(thread_id, _log_queues[thread_id])
+
+    from backend.utils import pause as _pause_util
+    _pause_util.register(thread_id)
 
     # Parse "Company:domain,..." format
     target_companies = []
@@ -726,6 +785,7 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest):
         dm_roles=dm_roles,
         target_contact_count=req.target_contact_count,
         thread_id=thread_id,
+        auto_approve=req.auto_approve,
     )
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -742,12 +802,13 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest):
 
         # --- Auto-trigger Veri on newly written rows ---
         veri_thread_id = None
-        if state.total_contacts_written > 0 and state.fcl_row_start is not None:
+        if auto_trigger_veri and state.total_contacts_written > 0 and state.fcl_row_start is not None:
             veri_thread_id = str(uuid.uuid4())
             _log_queues[veri_thread_id] = _PipelineQueue(veri_thread_id)
             _active_runs[veri_thread_id] = {
                 "agent": "veri",
                 "status": "running",
+                "thread_id": veri_thread_id,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "auto_triggered_by": thread_id,
             }
@@ -768,20 +829,39 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest):
             "veri_thread_id": veri_thread_id,
         })
 
+    except asyncio.CancelledError:
+        logger.info("searcher_task_cancelled", thread_id=thread_id)
+        _active_runs[thread_id]["status"] = "cancelled"
+        # Unblock any waiting SDR selection queues so they don't leak
+        try:
+            from backend.utils import dm_selection as _dm_sel, role_selection as _rs
+            _dm_sel.unregister(thread_id)
+            _rs.unregister(thread_id)
+        except Exception:
+            pass
+        await _emit_event(thread_id, "cancelled", {"message": "Run stopped by user"})
     except Exception as e:
         import traceback
         logger.error("searcher_task_error", error=str(e), traceback=traceback.format_exc())
         print(f"[SEARCHER ERROR] {traceback.format_exc()}", flush=True)
         _active_runs[thread_id]["status"] = "failed"
         await _emit_event(thread_id, "error", {"error": str(e)})
+    finally:
+        _pause_util.unregister(thread_id)
 
 
 async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None):
     """Background task running the Veri agent."""
     from backend.agents.veri import build_veri_graph
     from backend.state import VeriState
+    from backend.utils import pause as _pause_util
+    from backend.utils.progress import register as _reg_progress
+    _pause_util.register(thread_id)
+    # Wire the WebSocket queue into the progress module so emit_veri_step / emit_veri_contact work
+    if thread_id in _log_queues:
+        _reg_progress(thread_id, _log_queues[thread_id])
 
-    state = VeriState(contacts=[], row_start=row_start, row_end=row_end)
+    state = VeriState(contacts=[], row_start=row_start, row_end=row_end, thread_id=thread_id)
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
@@ -808,252 +888,34 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None)
             "errors": state.errors,
         })
 
+    except asyncio.CancelledError:
+        logger.info("veri_task_cancelled", thread_id=thread_id)
+        _active_runs[thread_id]["status"] = "cancelled"
+        await _emit_event(thread_id, "cancelled", {"message": "Run stopped by user"})
     except Exception as e:
         logger.error("veri_task_error", error=str(e))
         _active_runs[thread_id]["status"] = "failed"
         await _emit_event(thread_id, "error", {"error": str(e)})
+    finally:
+        _pause_util.unregister(thread_id)
+        from backend.utils.progress import unregister as _unreg_progress
+        _unreg_progress(thread_id)
 
 async def _prospect_chat(query: str, company: str, history: list[dict]) -> dict:
-    """
-    Advanced SDR prospect finder — runs 3 agents in parallel:
-    1. Perplexity sonar-pro  → real-time web research with citations
-    2. Unipile LinkedIn      → org_id resolve → verified LinkedIn people search
-    3. Claude Bedrock        → synthesize + deduplicate + structure all results
-    """
-    import json as _json
-    import re as _re
-    import httpx as _httpx
-    from backend.tools.llm import _bedrock_claude
-    from backend.config import get_settings as _get_settings
-
-    target_company = company.strip() or "the company"
-
-    # conversation context for Claude synthesis
-    history_ctx = ""
-    for h in history[-4:]:
-        history_ctx += f"{h.get('role','user').upper()}: {h.get('content','')}\n"
-
-    # ── Agent 1: Perplexity sonar-pro — real-time web research ───────────
-    async def _perplexity_agent() -> str:
-        try:
-            settings = _get_settings()
-            if not settings.perplexity_api_key:
-                return ""
-            system_msg = (
-                "You are a B2B research expert specializing in finding senior executives. "
-                "Always provide real people's full names, job titles, and LinkedIn URLs when available. "
-                "Be factual and specific — only mention people you are confident about."
-            )
-            user_msg = (
-                f"Find specific people who work at {target_company}. Request: {query}\n\n"
-                "For each person you find, provide:\n"
-                "- Full name\n- Current job title\n- LinkedIn URL if available\n- Source\n\n"
-                "Focus on currently employed decision-makers. Be concise and factual."
-            )
-            async with _httpx.AsyncClient(timeout=35) as client:
-                resp = await client.post(
-                    "https://api.perplexity.ai/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.perplexity_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "sonar-pro",
-                        "messages": [
-                            {"role": "system", "content": system_msg},
-                            {"role": "user", "content": user_msg},
-                        ],
-                        "max_tokens": 2000,
-                        "search_recency_filter": "month",
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            citations = data.get("citations", [])
-            if citations:
-                content += "\n\nSources: " + ", ".join(citations[:5])
-            return content
-        except Exception as e:
-            logger.warning("scout_perplexity_error", error=str(e))
-            return ""
-
-    # ── Agent 2: Unipile LinkedIn — org resolve + people search ──────────
-    async def _linkedin_agent() -> list[dict]:
-        try:
-            from backend.tools.unipile import get_company_org_id, search_people
-
-            # Resolve org_id for the company
-            org_info = await get_company_org_id(target_company)
-            if not org_info or not org_info.get("org_id"):
-                return []
-            org_id: str = str(org_info["org_id"])
-
-            # Extract role titles with Claude (fast, small call)
-            titles_prompt = (
-                f"SDR needs to find: \"{query}\" at {target_company}.\n"
-                "Generate 6 specific LinkedIn job title search strings (in English + local language if relevant).\n"
-                "Return ONLY a JSON array, no explanation: [\"title1\", \"title2\", ...]"
-            )
-            titles_raw = await _bedrock_claude(titles_prompt, max_tokens=200, temperature=0)
-            titles: list[str] = []
-            m = _re.search(r'\[.*?\]', titles_raw, _re.DOTALL)
-            if m:
-                try:
-                    titles = _json.loads(m.group(0))
-                except Exception:
-                    pass
-            if not titles:
-                # fallback: split query
-                titles = [t.strip() for t in query.split(",") if t.strip()][:6] or [query[:60]]
-
-            people = await search_people(org_id, titles[:6], limit=25)
-            return [
-                {
-                    "full_name": p.get("full_name", ""),
-                    "role_title": p.get("headline", ""),
-                    "company": target_company,
-                    "linkedin_url": p.get("linkedin_url", ""),
-                    "linkedin_verified": True,
-                    "source": "linkedin",
-                    "confidence": "high",
-                }
-                for p in people
-                if p.get("full_name")
-            ]
-        except Exception as e:
-            logger.warning("scout_linkedin_error", error=str(e))
-            return []
-
-    # Run both agents in parallel
-    perp_content, li_candidates = await asyncio.gather(
-        _perplexity_agent(),
-        _linkedin_agent(),
-        return_exceptions=True,
-    )
-    if isinstance(perp_content, Exception):
-        perp_content = ""
-    if isinstance(li_candidates, Exception):
-        li_candidates = []
-
-    # ── Agent 3: Claude Bedrock — synthesize + structure ─────────────────
-    li_section = ""
-    if li_candidates:
-        li_section = "\n\n## LinkedIn verified contacts:\n" + "\n".join(
-            f"- {c['full_name']} | {c['role_title']} | {c.get('linkedin_url', '')}"
-            for c in li_candidates[:30]
-        )
-
-    synthesis_prompt = (
-        "You are an expert B2B SDR assistant. A sales rep asked:\n"
-        f"Company: {target_company}\n"
-        f"Request: \"{query}\"\n"
-        + (f"Conversation context:\n{history_ctx}\n" if history_ctx else "")
-        + "\n## Research findings:\n"
-        + (f"### Perplexity web research:\n{perp_content}\n" if perp_content else "")
-        + li_section
-        + "\n\n## Task:\n"
-        "Extract ALL matching contacts from the research above. Prefer LinkedIn-verified entries. "
-        "Deduplicate by name. Include web-found people if they are clearly at the target company.\n\n"
-        "Return ONLY this JSON (no markdown fences):\n"
-        "{\n"
-        "  \"message\": \"1-2 sentence conversational summary of what you found\",\n"
-        "  \"candidates\": [\n"
-        "    {\n"
-        "      \"full_name\": \"First Last\",\n"
-        "      \"role_title\": \"Exact current job title\",\n"
-        "      \"company\": \"Company name\",\n"
-        "      \"linkedin_url\": \"https://linkedin.com/in/slug or null\",\n"
-        "      \"linkedin_verified\": true,\n"
-        "      \"source\": \"linkedin or web\",\n"
-        "      \"confidence\": \"high or medium or low\"\n"
-        "    }\n"
-        "  ]\n"
-        "}"
-    )
-
-    synthesis_raw = await _bedrock_claude(synthesis_prompt, max_tokens=3000, temperature=0)
-
-    candidates: list[dict] = []
-    message = ""
-    try:
-        clean = _re.sub(r'```(?:json)?\s*', '', synthesis_raw).strip().rstrip('`').strip()
-        m2 = _re.search(r'\{.*\}', clean, _re.DOTALL)
-        if m2:
-            parsed = _json.loads(m2.group(0))
-            message = parsed.get("message", "")
-            for i, c in enumerate(parsed.get("candidates", [])):
-                if isinstance(c, dict) and c.get("full_name"):
-                    candidates.append({
-                        "index": i,
-                        "full_name": c.get("full_name", ""),
-                        "role_title": c.get("role_title", ""),
-                        "company": c.get("company") or target_company,
-                        "linkedin_url": c.get("linkedin_url") or "",
-                        "linkedin_verified": bool(c.get("linkedin_verified", False)),
-                        "source": c.get("source", "web"),
-                        "confidence": c.get("confidence", "medium"),
-                        "group": "scout",
-                        "is_new": True,
-                    })
-    except Exception as e:
-        logger.warning("scout_synthesis_parse_error", error=str(e), raw=synthesis_raw[:200])
-
-    if not message:
-        if candidates:
-            n = len(candidates)
-            message = f"Found {n} contact{'s' if n != 1 else ''} at {target_company} matching your request."
-        else:
-            message = (
-                f"I searched Perplexity and LinkedIn for \"{query}\" at {target_company} "
-                "but couldn't find specific people. Try a different role name or check the company name."
-            )
-
-    return {"candidates": candidates, "message": message}
+    """Run the LangGraph Scout agent — full enrichment pipeline."""
+    from backend.agents.scout import run_scout
+    return await run_scout(query, company, history)
 
 
-async def _scout_commit(candidate: dict) -> int:
-    """Write a scout-found candidate directly to the First Clean List sheet."""
-    from backend.tools import sheets
-
-    full_name: str = candidate.get("full_name", "")
-    parts = full_name.strip().split(" ", 1)
-    first_name = parts[0] if parts else ""
-    last_name = parts[1] if len(parts) > 1 else ""
-
-    company = candidate.get("company", "")
-    role_title = candidate.get("role_title", "")
-    linkedin_url = candidate.get("linkedin_url", "")
-
-    # Buying role classification
-    role_lower = role_title.lower()
-    if any(k in role_lower for k in ["chief", "ceo", "cfo", "cmo", "cto", "cdo", "coo", "cpo"]):
-        buying_role = "DM"
-    elif any(k in role_lower for k in ["vp", "vice president", "head of", "director"]):
-        buying_role = "DM"
-    else:
-        buying_role = "Influencer"
-
-    await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
-    row = [
-        company,        # A  Company Name
-        company,        # B  Normalized Company Name
-        "",             # C  Domain (unknown)
-        "",             # D  Account Type
-        "",             # E  Account Size
-        "",             # F  Country
-        first_name,     # G  First Name
-        last_name,      # H  Last Name
-        role_title,     # I  Job Title
-        buying_role,    # J  Buying Role
-        linkedin_url,   # K  LinkedIn URL
-        "",             # L  Email
-        "",             # M  Phone-1
-        "",             # N  Phone-2
-    ]
-    written_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, row)
-    logger.info("scout_commit_written", name=full_name, row=written_row)
-    return written_row
+async def _scout_commit(candidate: dict) -> dict:
+    """Write enriched scout candidate to Final Filtered List (cols A–U)."""
+    from backend.agents.scout import commit_to_sheet
+    ctx = {
+        "domain": candidate.get("company_domain", ""),
+        "account_type": candidate.get("company_account_type", ""),
+        "account_size": candidate.get("company_account_size", ""),
+    }
+    return await commit_to_sheet(candidate, ctx)
 
 
 app = create_app()

@@ -715,3 +715,60 @@ async def search_people(
 
     await asyncio.gather(*[_search_one(title) for title in role_titles])
     return results
+
+
+async def search_person_by_name(
+    full_name: str,
+    org_id: str = "",
+    limit: int = 5,
+) -> list[SearchedPerson]:
+    """
+    Search LinkedIn for a specific person by full name.
+    Optionally filtered by company org_id.
+    Used by Scout AI to find LinkedIn URLs for web-only contacts (no URL from initial search).
+    """
+    await _init_pool()
+    settings = get_settings()
+    if not settings.unipile_api_key or not full_name:
+        return []
+
+    account_id = _next_account_id()
+    payload: dict = {
+        "api": "classic",
+        "category": "people",
+        "keywords": full_name,
+    }
+    if org_id:
+        payload["company"] = [str(org_id)]
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{_base_url()}/linkedin/search",
+                params={"account_id": account_id, "limit": min(limit, 25)},
+                json=payload,
+                headers=_headers(),
+            )
+        if resp.status_code != 200:
+            logger.warning("unipile_name_search_error", name=full_name, status=resp.status_code)
+            return []
+
+        items = resp.json().get("items", [])
+        results: list[SearchedPerson] = []
+        for item in items:
+            pid = item.get("public_identifier", "")
+            if not pid:
+                continue
+            results.append({
+                "full_name": item.get("name", ""),
+                "linkedin_url": f"https://www.linkedin.com/in/{pid}",
+                "public_identifier": pid,
+                "headline": item.get("headline"),
+                "location": item.get("location"),
+                "network_distance": item.get("network_distance"),
+            })
+        logger.info("unipile_name_search_done", name=full_name, found=len(results))
+        return results
+    except Exception as e:
+        logger.warning("unipile_name_search_exception", name=full_name, error=str(e))
+        return []

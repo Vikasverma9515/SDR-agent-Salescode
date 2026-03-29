@@ -1499,21 +1499,70 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
     link_not_found = not bool(org_id)
     sales_nav_url = ""
     if org_id:
-        sales_nav_url = _build_sales_nav_url(
-            org_id,
-            company.normalized_name or company.raw_name,
-            effective_region,
-        )
+        # Detect whether the region is embedded in the company name itself
+        # (e.g. "Diageo España", "Heineken Iberia").
+        name_implied_region = bool(_detect_region_from_name(company.raw_name))
 
-    # ---- Fallback: keyword-based Sales Nav URL ----
+        if company.account_size == "Small" and name_implied_region:
+            # The org_id we found belongs to the regional subsidiary (e.g. Diageo Spain,
+            # ~130 employees). Instead, use the global parent so Sales Nav shows the full
+            # headcount (e.g. Diageo global, ~13k employees) with no region filter.
+            global_name = parsed.get("global_name") or ""
+            global_org_id = None
+
+            if global_name:
+                # 1) Check candidates already fetched during the Unipile lookup
+                for match in all_linkedin_matches:
+                    m_name = (match.get("name") or "").lower()
+                    if m_name == global_name.lower() or m_name.startswith(global_name.lower() + " "):
+                        if match["org_id"] != org_id:
+                            global_org_id = match["org_id"]
+                            break
+
+                # 2) Fresh Unipile lookup for the global name if still not found
+                if not global_org_id:
+                    try:
+                        g_info = await unipile.get_company_org_id(global_name)
+                        if g_info.get("org_id") and g_info["org_id"] != org_id:
+                            global_org_id = g_info["org_id"]
+                    except Exception:
+                        pass
+
+            use_org_id = global_org_id or org_id
+            use_name = global_name or company.normalized_name or company.raw_name
+            sales_nav_url = _build_sales_nav_url(use_org_id, use_name, "")
+        else:
+            # Non-name-implied Small → no region filter (avoids missing employees)
+            # Medium / Large → apply effective_region as normal
+            url_region = "" if company.account_size == "Small" else effective_region
+            sales_nav_url = _build_sales_nav_url(
+                org_id,
+                company.normalized_name or company.raw_name,
+                url_region,
+            )
+
+    # ---- Fallback: keyword-based Sales Nav URL (with region if available) ----
     if not sales_nav_url:
         logger.warning("enrich_no_org_id_keyword_fallback", company=company.raw_name,
                        candidates_tried=len(candidate_names))
         await _log(f"[{company.raw_name}] no LinkedIn page found — using keyword search fallback", "warning")
         encoded_name = quote(lookup_name, safe="")
+        # Apply region filter in the keyword fallback URL the same way _build_sales_nav_url does
+        fallback_region_filter = ""
+        if effective_region:
+            _fb_region_key = effective_region.strip().lower()
+            _fb_region_id = REGION_IDS.get(_fb_region_key)
+            if _fb_region_id:
+                _fb_region_text = quote(effective_region.strip(), safe="")
+                fallback_region_filter = (
+                    f"%2Cfilters%3AList((type%3AREGION%2C"
+                    f"values%3AList((id%3A{_fb_region_id}%2C"
+                    f"text%3A{_fb_region_text}%2CselectionType%3AINCLUDED))))"
+                )
         sales_nav_url = (
             f"https://www.linkedin.com/sales/search/people?"
-            f"query=(keywords%3A{encoded_name})"
+            f"query=(recentSearchParam%3A(doLogHistory%3Atrue)%2C"
+            f"keywords%3A{encoded_name}{fallback_region_filter})"
         )
 
     # ---- Compute LinkedIn confidence ----

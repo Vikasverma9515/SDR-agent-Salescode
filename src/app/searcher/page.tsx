@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
+import { useSearcherStore, useVeriStore } from '@/lib/stores';
 import { useRouter } from 'next/navigation';
 import { apiUrl } from '@/lib/api';
 import LogStream from '@/components/LogStream';
@@ -158,10 +159,22 @@ interface ScoutCandidate {
   company: string;
   linkedin_url: string;
   linkedin_verified: boolean;
+  linkedin_status?: string;
+  employment_verified?: string;
+  actual_title?: string;
+  email?: string;
+  email_status?: string;
+  buying_role?: string;
   source: string;
   confidence: string;
+  exists_in_sheet?: boolean;
+  sheet_name?: string;
+  sheet_row?: number;
+  company_domain?: string;
+  company_account_type?: string;
+  company_account_size?: string;
   added?: boolean;
-  sendStatus?: 'idle' | 'sending' | 'sent' | 'error';
+  sendStatus?: 'idle' | 'sending' | 'sent' | 'error' | 'duplicate';
 }
 interface ScoutMessage {
   role: 'user' | 'assistant';
@@ -174,50 +187,71 @@ interface ScoutMessage {
 // ---------------------------------------------------------------------------
 export default function SearcherPage() {
   const router = useRouter();
-  const [companies, setCompanies] = useState('');
-  const [dmRoles, setDmRoles] = useState(DEFAULT_DM_ROLES);
-  const [running, setRunning] = useState(false);
-  const [threadId, setThreadId] = useState<string | null>(null);
-  const [result, setResult] = useState<any>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [veriThreadId, setVeriThreadId] = useState<string | null>(null);
+  const {
+    companies, dmRoles, autoMode, autoVeri,
+    running, threadId, error, result, veriThreadId,
+    scanProgress, elapsedSecs, scanDone,
+    liveContacts, recentActivity,
+    roleEvent, selectedBuckets: selectedBucketsArr, roleSubmitting,
+    selectionEvent, selectedIndices: selectedIndicesArr, selSubmitting,
+    contactTab, leftTab,
+    findMorePrompt, findMoreLoading,
+    scoutMessages, scoutAdded,
+  } = useSearcherStore();
 
-  // Per-company progress
-  const [scanProgress, setScanProgress] = useState<Record<string, string>>({});
-  const [elapsedSecs, setElapsedSecs] = useState(0);
+  // Convert arrays → Sets for existing code compatibility
+  const selectedBuckets = new Set(selectedBucketsArr);
+  const selectedIndices = new Set(selectedIndicesArr);
+
+  const setCompanies    = (v: string) => useSearcherStore.setState({ companies: v });
+  const setDmRoles      = (v: string) => useSearcherStore.setState({ dmRoles: v });
+  const setAutoMode     = (fn: boolean | ((v: boolean) => boolean)) =>
+    useSearcherStore.setState(s => ({ autoMode: typeof fn === 'function' ? fn(s.autoMode) : fn }));
+  const setAutoVeri     = (fn: boolean | ((v: boolean) => boolean)) =>
+    useSearcherStore.setState(s => ({ autoVeri: typeof fn === 'function' ? fn(s.autoVeri) : fn }));
+  const setRunning      = (v: boolean) => useSearcherStore.setState({ running: v });
+  const setThreadId     = (v: string | null) => useSearcherStore.setState({ threadId: v });
+  const setError        = (v: string | null) => useSearcherStore.setState({ error: v });
+  const setResult       = (v: any) => useSearcherStore.setState({ result: v });
+  const setVeriThreadId = (v: string | null) => useSearcherStore.setState({ veriThreadId: v });
+  const setScanProgress = (fn: Record<string, string> | ((p: Record<string, string>) => Record<string, string>)) =>
+    useSearcherStore.setState(s => ({ scanProgress: typeof fn === 'function' ? fn(s.scanProgress) : fn }));
+  const setElapsedSecs  = (fn: number | ((n: number) => number)) =>
+    useSearcherStore.setState(s => ({ elapsedSecs: typeof fn === 'function' ? fn(s.elapsedSecs) : fn }));
+  const setScanDone     = (v: boolean) => useSearcherStore.setState({ scanDone: v });
+  const setLiveContacts = (fn: ContactData[] | ((p: ContactData[]) => ContactData[])) =>
+    useSearcherStore.setState(s => ({ liveContacts: typeof fn === 'function' ? fn(s.liveContacts) : fn }));
+  const setRecentActivity = (fn: string[] | ((p: string[]) => string[])) =>
+    useSearcherStore.setState(s => ({ recentActivity: typeof fn === 'function' ? fn(s.recentActivity) : fn }));
+  const setRoleEvent    = (v: RoleSelectionEvent | null) => useSearcherStore.setState({ roleEvent: v });
+  const setSelectedBuckets = (fn: Set<string> | ((p: Set<string>) => Set<string>)) =>
+    useSearcherStore.setState(s => {
+      const prev = new Set(s.selectedBuckets);
+      const next = typeof fn === 'function' ? fn(prev) : fn;
+      return { selectedBuckets: Array.from(next) };
+    });
+  const setRoleSubmitting = (v: boolean) => useSearcherStore.setState({ roleSubmitting: v });
+  const setSelectionEvent = (v: ContactSelectionEvent | null) => useSearcherStore.setState({ selectionEvent: v });
+  const setSelectedIndices = (fn: Set<number> | ((p: Set<number>) => Set<number>)) =>
+    useSearcherStore.setState(s => {
+      const prev = new Set(s.selectedIndices);
+      const next = typeof fn === 'function' ? fn(prev) : fn;
+      return { selectedIndices: Array.from(next) };
+    });
+  const setSelSubmitting  = (v: boolean) => useSearcherStore.setState({ selSubmitting: v });
+  const setContactTab     = (v: 'matched' | 'bonus' | 'all') => useSearcherStore.setState({ contactTab: v });
+  const setLeftTab        = (v: 'config' | 'scout') => useSearcherStore.setState({ leftTab: v });
+  const setFindMorePrompt = (v: string) => useSearcherStore.setState({ findMorePrompt: v });
+  const setFindMoreLoading = (v: boolean) => useSearcherStore.setState({ findMoreLoading: v });
+  const setScoutMessages  = (fn: ScoutMessage[] | ((p: ScoutMessage[]) => ScoutMessage[])) =>
+    useSearcherStore.setState(s => ({ scoutMessages: typeof fn === 'function' ? fn(s.scoutMessages) : fn }));
+  const setScoutAdded     = (fn: ScoutCandidate[] | ((p: ScoutCandidate[]) => ScoutCandidate[])) =>
+    useSearcherStore.setState(s => ({ scoutAdded: typeof fn === 'function' ? fn(s.scoutAdded) : fn }));
+
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [scanDone, setScanDone] = useState(false);
-
-  // Live contact feed — written one by one as they hit the sheet
-  const [liveContacts, setLiveContacts] = useState<ContactData[]>([]);
-
-  // Role bucket selection (step 1: which departments)
-  const [roleEvent, setRoleEvent] = useState<RoleSelectionEvent | null>(null);
-  const [selectedBuckets, setSelectedBuckets] = useState<Set<string>>(new Set());
-  const [roleSubmitting, setRoleSubmitting] = useState(false);
-
-  // Contact selection (step 2: which people)
-  const [selectionEvent, setSelectionEvent] = useState<ContactSelectionEvent | null>(null);
-  const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
-  const [selSubmitting, setSelSubmitting] = useState(false);
-
-  // Contact panel tab
-  const [contactTab, setContactTab] = useState<'matched' | 'bonus' | 'all'>('matched');
-
-  // AI Scout chat
-  const [leftTab, setLeftTab] = useState<'config' | 'scout'>('config');
-  const [scoutMessages, setScoutMessages] = useState<ScoutMessage[]>([]);
   const [scoutInput, setScoutInput] = useState('');
   const [scoutLoading, setScoutLoading] = useState(false);
-  const [scoutAdded, setScoutAdded] = useState<ScoutCandidate[]>([]);
   const scoutScrollRef = useRef<HTMLDivElement>(null);
-
-  // Find More
-  const [findMorePrompt, setFindMorePrompt] = useState('');
-  const [findMoreLoading, setFindMoreLoading] = useState(false);
-
-  // Live activity feed — recent log messages shown in the right panel
-  const [recentActivity, setRecentActivity] = useState<string[]>([]);
 
   const handleEvent = useCallback((msg: any) => {
     // Capture log messages for the live activity panel
@@ -235,13 +269,36 @@ export default function SearcherPage() {
         return next;
       });
       setRunning(false);
+      setThreadId(null);
       setResult(msg.data);
       setScanDone(true);
       setSelectionEvent(null);
-      if (msg.data?.veri_thread_id) setVeriThreadId(msg.data.veri_thread_id);
+      if (msg.data?.veri_thread_id) {
+        setVeriThreadId(msg.data.veri_thread_id);
+        // Sync to Veri store so navigating to /veri (or being already there) auto-connects
+        useVeriStore.setState({
+          threadId: msg.data.veri_thread_id,
+          running: true,
+          result: null,
+          error: null,
+          cancelled: false,
+          paused: false,
+        });
+      }
+    } else if (msg.type === 'paused') {
+      useSearcherStore.setState({ paused: true });
+    } else if (msg.type === 'resumed') {
+      useSearcherStore.setState({ paused: false });
+    } else if (msg.type === 'cancelled') {
+      if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
+      setRunning(false);
+      setSelectionEvent(null);
+      setRoleEvent(null);
+      useSearcherStore.setState({ cancelled: true, paused: false });
     } else if (msg.type === 'error') {
       if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
       setRunning(false);
+      if (typeof window !== 'undefined') localStorage.removeItem('searcher_thread_id');
       setError(msg.data.error);
     } else if (msg.type === 'company_progress') {
       const { company, status } = msg.data;
@@ -352,10 +409,17 @@ export default function SearcherPage() {
         }),
       });
       const data = await resp.json();
+      // Attach company context to each candidate so commit has it
+      const candidates: ScoutCandidate[] = (data.candidates || []).map((c: ScoutCandidate) => ({
+        ...c,
+        company_domain: c.company_domain || data.company_domain || '',
+        company_account_type: c.company_account_type || data.company_account_type || '',
+        company_account_size: c.company_account_size || data.company_account_size || '',
+      }));
       const assistantMsg: ScoutMessage = {
         role: 'assistant',
         content: data.message || 'Done.',
-        candidates: data.candidates || [],
+        candidates,
       };
       setScoutMessages(prev => [...prev, assistantMsg]);
       setTimeout(() => {
@@ -391,11 +455,24 @@ export default function SearcherPage() {
           company: candidate.company,
           linkedin_url: candidate.linkedin_url,
           linkedin_verified: candidate.linkedin_verified,
+          linkedin_status: candidate.linkedin_status || '',
+          employment_verified: candidate.employment_verified || '',
+          title_match: candidate.title_match || '',
+          actual_title: candidate.actual_title || '',
+          email: candidate.email || '',
+          email_status: candidate.email_status || '',
+          buying_role: candidate.buying_role || '',
           source: candidate.source,
           confidence: candidate.confidence,
+          company_domain: candidate.company_domain || '',
+          company_account_type: candidate.company_account_type || '',
+          company_account_size: candidate.company_account_size || '',
         }),
       });
-      if (resp.ok) {
+      const data = resp.ok ? await resp.json() : null;
+      if (data?.status === 'duplicate') {
+        setScoutAdded(prev => prev.map((c, i) => i === idx ? { ...c, sendStatus: 'duplicate' } : c));
+      } else if (resp.ok) {
         setScoutAdded(prev => prev.map((c, i) => i === idx ? { ...c, sendStatus: 'sent' } : c));
       } else {
         setScoutAdded(prev => prev.map((c, i) => i === idx ? { ...c, sendStatus: 'error' } : c));
@@ -405,7 +482,19 @@ export default function SearcherPage() {
     }
   };
 
+  const handleStop = async () => {
+    if (!threadId) return;
+    try { await fetch(apiUrl(`/api/runs/${threadId}/cancel`), { method: 'POST' }); } catch { /* ignore */ }
+  };
+
+  const handlePauseResume = async () => {
+    if (!threadId) return;
+    const paused = useSearcherStore.getState().paused;
+    try { await fetch(apiUrl(`/api/runs/${threadId}/${paused ? 'resume' : 'pause'}`), { method: 'POST' }); } catch { /* ignore */ }
+  };
+
   const handleRun = async () => {
+    useSearcherStore.setState({ cancelled: false });
     if (!companies.trim()) return;
     setRunning(true);
     setResult(null);
@@ -430,6 +519,8 @@ export default function SearcherPage() {
         body: JSON.stringify({
           companies: companies.trim(),
           dm_roles: dmRoles.trim() || DEFAULT_DM_ROLES,
+          auto_approve: autoMode,
+          auto_trigger_veri: autoVeri,
         }),
       });
       const data = await resp.json();
@@ -460,13 +551,35 @@ export default function SearcherPage() {
         </div>
         <div className="flex items-center gap-4">
           {running && (
-            <div className="flex items-center gap-2">
-              <div className="relative flex h-1.5 w-1.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-teal-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-teal-400" />
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <div className="relative flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-teal-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-teal-400" />
+                </div>
+                <span className="text-[9px] font-bold text-white/75 uppercase tracking-[0.25em]">Discovering</span>
               </div>
-              <span className="text-[9px] font-bold text-white/75 uppercase tracking-[0.25em]">Discovering</span>
+              <button
+                onClick={handlePauseResume}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg border text-[9px] font-bold uppercase tracking-widest transition-colors ${
+                  useSearcherStore.getState().paused
+                    ? 'border-teal-500/30 bg-teal-500/10 text-teal-400 hover:bg-teal-500/20'
+                    : 'border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+                }`}
+              >
+                <span>{useSearcherStore.getState().paused ? '▶' : '⏸'}</span>
+                <span>{useSearcherStore.getState().paused ? 'Resume' : 'Pause'}</span>
+              </button>
+              <button
+                onClick={handleStop}
+                className="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-red-500/30 bg-red-500/10 text-red-400 text-[9px] font-bold uppercase tracking-widest hover:bg-red-500/20 transition-colors"
+              >
+                <span>■</span><span>Stop</span>
+              </button>
             </div>
+          )}
+          {useSearcherStore.getState().cancelled && !running && (
+            <span className="text-[9px] font-bold text-red-400/70 uppercase tracking-widest">Stopped</span>
           )}
           {scanDone && result && (
             <div className="flex items-center gap-3">
@@ -541,22 +654,66 @@ export default function SearcherPage() {
                 />
               </div>
 
-              {/* Run button */}
-              <div className="flex-shrink-0 flex items-center justify-end">
-                <button
-                  onClick={handleRun}
-                  disabled={running || !companies.trim()}
-                  className="flex items-center gap-2 px-5 py-2 rounded-xl bg-white text-black text-[10px] font-bold uppercase tracking-[0.12em] hover:bg-white/90 disabled:bg-white/10 disabled:text-white/55 transition-all duration-200"
-                >
-                  {running ? (
-                    <>
-                      <div className="w-2.5 h-2.5 border-2 border-black/20 border-t-black rounded-full animate-spin" />
-                      <span>Scanning…</span>
-                    </>
-                  ) : (
-                    <span>Run Discovery</span>
-                  )}
-                </button>
+              {/* Mode toggles + Run button */}
+              <div className="flex-shrink-0 flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  {/* Searcher: Auto / Manual toggle */}
+                  <button
+                    onClick={() => setAutoMode(v => !v)}
+                    disabled={running}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all duration-200 disabled:opacity-40"
+                    style={autoMode
+                      ? { borderColor: 'rgba(52,211,153,0.35)', background: 'rgba(52,211,153,0.07)' }
+                      : { borderColor: 'rgba(255,255,255,0.08)', background: 'transparent' }}
+                  >
+                    <div className={`w-7 h-3.5 rounded-full relative transition-colors duration-200 ${autoMode ? 'bg-teal-400/60' : 'bg-white/10'}`}>
+                      <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all duration-200 ${autoMode ? 'left-[14px] bg-teal-300' : 'left-0.5 bg-white/40'}`} />
+                    </div>
+                    <span className={`text-[9px] font-bold uppercase tracking-widest transition-colors ${autoMode ? 'text-teal-400' : 'text-white/35'}`}>
+                      Searcher: {autoMode ? 'Auto' : 'Manual'}
+                    </span>
+                  </button>
+                  <span className={`text-[8px] ${autoMode ? 'text-teal-400/50' : 'text-white/20'}`}>
+                    {autoMode ? 'Writes all matched — no pauses' : 'Pauses for role & contact approval'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {/* Veri: Auto / Manual toggle */}
+                  <button
+                    onClick={() => setAutoVeri(v => !v)}
+                    disabled={running}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all duration-200 disabled:opacity-40"
+                    style={autoVeri
+                      ? { borderColor: 'rgba(167,139,250,0.35)', background: 'rgba(167,139,250,0.07)' }
+                      : { borderColor: 'rgba(255,255,255,0.08)', background: 'transparent' }}
+                  >
+                    <div className={`w-7 h-3.5 rounded-full relative transition-colors duration-200 ${autoVeri ? 'bg-violet-400/60' : 'bg-white/10'}`}>
+                      <div className={`absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all duration-200 ${autoVeri ? 'left-[14px] bg-violet-300' : 'left-0.5 bg-white/40'}`} />
+                    </div>
+                    <span className={`text-[9px] font-bold uppercase tracking-widest transition-colors ${autoVeri ? 'text-violet-400' : 'text-white/35'}`}>
+                      Veri: {autoVeri ? 'Auto' : 'Skip'}
+                    </span>
+                  </button>
+                  <span className={`text-[8px] ${autoVeri ? 'text-violet-400/50' : 'text-white/20'}`}>
+                    {autoVeri ? 'Auto-verifies contacts after discovery' : 'Veri skipped — run manually later'}
+                  </span>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    onClick={handleRun}
+                    disabled={running || !companies.trim()}
+                    className="flex items-center gap-2 px-5 py-2 rounded-xl bg-white text-black text-[10px] font-bold uppercase tracking-[0.12em] hover:bg-white/90 disabled:bg-white/10 disabled:text-white/55 transition-all duration-200"
+                  >
+                    {running ? (
+                      <>
+                        <div className="w-2.5 h-2.5 border-2 border-black/20 border-t-black rounded-full animate-spin" />
+                        <span>Scanning…</span>
+                      </>
+                    ) : (
+                      <span>Run Discovery</span>
+                    )}
+                  </button>
+                </div>
               </div>
 
               {/* Pipeline log — fills remaining space */}
@@ -643,45 +800,75 @@ export default function SearcherPage() {
                     </div>
                     {/* Candidate cards from assistant */}
                     {msg.role === 'assistant' && msg.candidates && msg.candidates.length > 0 && (
-                      <div className="w-full space-y-1.5">
+                      <div className="w-full space-y-2">
                         {msg.candidates.map((c, ci) => {
                           const alreadyAdded = scoutAdded.some(a => a.full_name === c.full_name);
+                          const liConfirmed = c.linkedin_status === 'CONFIRMED';
+                          const dmRole = c.buying_role === 'Decision Maker';
+                          const emailOk = c.email_status === 'valid' || c.email_status === 'catch-all';
                           return (
-                            <div key={ci} className="border border-white/[0.07] rounded-xl bg-white/[0.02] overflow-hidden">
-                              <div className="flex items-center gap-2.5 px-3 py-2.5">
-                                <div className="w-7 h-7 rounded-lg bg-violet-400/15 flex items-center justify-center text-[9px] font-bold text-violet-400/80 flex-shrink-0">
+                            <div key={ci} className={`rounded-xl overflow-hidden border ${c.exists_in_sheet ? 'border-amber-500/30 bg-amber-500/[0.03]' : 'border-white/[0.07] bg-white/[0.02]'}`}>
+                              {/* Duplicate warning banner */}
+                              {c.exists_in_sheet && (
+                                <div className="px-3 py-1.5 border-b border-amber-500/20 flex items-center gap-1.5">
+                                  <span className="text-amber-400 text-[9px]">⚠</span>
+                                  <span className="text-[8px] text-amber-400/80 uppercase tracking-wide font-bold">
+                                    Already in {c.sheet_name}{c.sheet_row ? ` · row ${c.sheet_row}` : ''}
+                                  </span>
+                                </div>
+                              )}
+                              <div className="flex items-start gap-2.5 px-3 py-2.5">
+                                <div className="w-7 h-7 rounded-lg bg-violet-400/15 flex items-center justify-center text-[9px] font-bold text-violet-400/80 flex-shrink-0 mt-0.5">
                                   {c.full_name.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
                                 </div>
                                 <div className="min-w-0 flex-1">
-                                  <div className="text-[11px] font-semibold text-white/85 truncate">{c.full_name}</div>
-                                  <div className="text-[9px] text-white/40 truncate uppercase tracking-wide">{c.role_title}</div>
-                                  <div className="text-[8px] text-white/25 truncate">{c.company}</div>
-                                </div>
-                                <div className="flex items-center gap-1.5 flex-shrink-0">
-                                  {c.linkedin_url && (
-                                    <a
-                                      href={c.linkedin_url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      onClick={e => e.stopPropagation()}
-                                      className="text-[8px] font-bold text-white/25 hover:text-teal-400 uppercase tracking-widest transition-colors px-1.5 py-0.5 rounded border border-white/10 hover:border-teal-400/30"
-                                    >
-                                      LI
-                                    </a>
+                                  <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+                                    <span className="text-[11px] font-semibold text-white/85">{c.full_name}</span>
+                                    {/* Buying role badge */}
+                                    {c.buying_role && (
+                                      <span className={`text-[7px] font-bold px-1 py-0.5 rounded uppercase tracking-widest ${dmRole ? 'bg-violet-400/20 text-violet-400' : 'bg-white/[0.06] text-white/30'}`}>
+                                        {dmRole ? 'DM' : 'Inf'}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="text-[9px] text-white/40 uppercase tracking-wide truncate">{c.role_title}</div>
+                                  {/* Email row */}
+                                  {c.email && (
+                                    <div className="flex items-center gap-1 mt-1">
+                                      <div className={`w-1 h-1 rounded-full flex-shrink-0 ${emailOk ? 'bg-emerald-400' : c.email_status === 'unknown' ? 'bg-amber-400' : 'bg-red-400'}`} />
+                                      <span className="text-[9px] font-mono text-white/40 truncate">{c.email}</span>
+                                    </div>
                                   )}
-                                  <span className={`text-[7px] font-bold px-1.5 py-0.5 rounded uppercase tracking-widest ${c.confidence === 'high' ? 'bg-emerald-400/15 text-emerald-400' :
-                                    c.confidence === 'medium' ? 'bg-amber-400/15 text-amber-400' :
-                                      'bg-white/[0.06] text-white/30'
-                                    }`}>{c.confidence}</span>
+                                </div>
+                                <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                                  <div className="flex items-center gap-1">
+                                    {/* LinkedIn button + verified badge */}
+                                    {c.linkedin_url && (
+                                      <a
+                                        href={c.linkedin_url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        onClick={e => e.stopPropagation()}
+                                        className={`text-[8px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors ${liConfirmed ? 'border-emerald-400/30 text-emerald-400 hover:bg-emerald-400/10' : 'border-white/10 text-white/25 hover:text-teal-400 hover:border-teal-400/30'}`}
+                                      >
+                                        {liConfirmed ? '✓ LI' : 'LI'}
+                                      </a>
+                                    )}
+                                    {/* Confidence */}
+                                    <span className={`text-[7px] font-bold px-1.5 py-0.5 rounded uppercase tracking-widest ${c.confidence === 'high' ? 'bg-emerald-400/15 text-emerald-400' : c.confidence === 'medium' ? 'bg-amber-400/15 text-amber-400' : 'bg-white/[0.06] text-white/30'}`}>
+                                      {c.confidence}
+                                    </span>
+                                  </div>
                                   <button
                                     onClick={() => handleScoutAdd(c)}
-                                    disabled={alreadyAdded}
-                                    className={`text-[8px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-lg transition-all ${alreadyAdded
-                                      ? 'bg-white/5 text-white/20 cursor-default'
+                                    disabled={alreadyAdded || !!c.exists_in_sheet}
+                                    className={`text-[8px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-lg transition-all ${
+                                      alreadyAdded ? 'bg-white/5 text-white/20 cursor-default'
+                                      : c.exists_in_sheet ? 'bg-amber-400/10 text-amber-400/50 cursor-default'
                                       : 'bg-violet-400/20 text-violet-400 hover:bg-violet-400/30 border border-violet-400/20'
-                                      }`}
+                                    }`}
                                   >
-                                    {alreadyAdded ? '✓' : '+ Add'}
+                                    {alreadyAdded ? '✓' : c.exists_in_sheet ? 'Exists' : '+ Add'}
                                   </button>
                                 </div>
                               </div>
@@ -988,41 +1175,61 @@ export default function SearcherPage() {
                     </div>
                   </div>
                   <div className="divide-y divide-violet-400/[0.06]">
-                    {scoutAdded.map((c, idx) => (
-                      <div key={idx} className="px-5 py-3 flex items-center gap-3">
-                        <div className="w-7 h-7 rounded-lg bg-violet-400/15 flex items-center justify-center text-[9px] font-bold text-violet-400/70 flex-shrink-0">
-                          {c.full_name.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="text-xs font-semibold text-white/85 truncate">{c.full_name}</div>
-                          <div className="text-[9px] text-white/40 truncate uppercase tracking-wide">{c.role_title}</div>
-                          <div className="text-[8px] text-white/25 truncate">{c.company}</div>
-                        </div>
-                        <div className="flex items-center gap-1.5 flex-shrink-0">
-                          {c.linkedin_url && (
-                            <a href={c.linkedin_url} target="_blank" rel="noopener noreferrer"
-                              className="text-[8px] font-bold text-white/25 hover:text-teal-400 uppercase tracking-widest transition-colors px-1.5 py-0.5 rounded border border-white/10 hover:border-teal-400/30">
-                              LI
-                            </a>
-                          )}
-                          {c.linkedin_verified && <span className="text-[7px] text-emerald-400/70 font-bold">✓ LI</span>}
-                          <button
-                            onClick={() => handleScoutSendToSheet(idx)}
-                            disabled={c.sendStatus === 'sending' || c.sendStatus === 'sent'}
-                            className={`text-[8px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg transition-all ${c.sendStatus === 'sent'
-                              ? 'bg-emerald-400/10 text-emerald-400 border border-emerald-400/20 cursor-default'
-                              : c.sendStatus === 'error'
-                                ? 'bg-red-400/10 text-red-400 border border-red-400/20'
-                                : c.sendStatus === 'sending'
-                                  ? 'bg-white/5 text-white/30 cursor-not-allowed'
-                                  : 'bg-violet-400/15 text-violet-400 border border-violet-400/20 hover:bg-violet-400/25'
+                    {scoutAdded.map((c, idx) => {
+                      const liOk = c.linkedin_status === 'CONFIRMED';
+                      const emailOk = c.email_status === 'valid' || c.email_status === 'catch-all';
+                      return (
+                        <div key={idx} className="px-4 py-3 flex items-start gap-3">
+                          <div className="w-7 h-7 rounded-lg bg-violet-400/15 flex items-center justify-center text-[9px] font-bold text-violet-400/70 flex-shrink-0 mt-0.5">
+                            {c.full_name.split(' ').map((n: string) => n[0]).join('').slice(0, 2)}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-[11px] font-semibold text-white/85 truncate">{c.full_name}</span>
+                              {c.buying_role && (
+                                <span className={`text-[7px] font-bold px-1 py-0.5 rounded uppercase tracking-widest flex-shrink-0 ${c.buying_role === 'Decision Maker' ? 'bg-violet-400/20 text-violet-400' : 'bg-white/[0.06] text-white/30'}`}>
+                                  {c.buying_role === 'Decision Maker' ? 'DM' : 'Inf'}
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[9px] text-white/40 uppercase tracking-wide truncate">{c.role_title}</div>
+                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                              {c.linkedin_url && (
+                                <a href={c.linkedin_url} target="_blank" rel="noopener noreferrer"
+                                  className={`text-[8px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors ${liOk ? 'border-emerald-400/30 text-emerald-400' : 'border-white/10 text-white/25 hover:text-teal-400'}`}>
+                                  {liOk ? '✓ LI' : 'LI'}
+                                </a>
+                              )}
+                              {c.email && (
+                                <span className="flex items-center gap-1">
+                                  <div className={`w-1 h-1 rounded-full ${emailOk ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                                  <span className="text-[8px] font-mono text-white/35 truncate max-w-[120px]">{c.email}</span>
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex-shrink-0 mt-0.5">
+                            <button
+                              onClick={() => handleScoutSendToSheet(idx)}
+                              disabled={c.sendStatus === 'sending' || c.sendStatus === 'sent' || c.sendStatus === 'duplicate'}
+                              className={`text-[8px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-lg transition-all ${
+                                c.sendStatus === 'sent' ? 'bg-emerald-400/10 text-emerald-400 border border-emerald-400/20 cursor-default'
+                                : c.sendStatus === 'duplicate' ? 'bg-amber-400/10 text-amber-400 border border-amber-400/20 cursor-default'
+                                : c.sendStatus === 'error' ? 'bg-red-400/10 text-red-400 border border-red-400/20'
+                                : c.sendStatus === 'sending' ? 'bg-white/5 text-white/30 cursor-not-allowed'
+                                : 'bg-violet-400/15 text-violet-400 border border-violet-400/20 hover:bg-violet-400/25'
                               }`}
-                          >
-                            {c.sendStatus === 'sent' ? '✓ Sent' : c.sendStatus === 'sending' ? '…' : c.sendStatus === 'error' ? 'Retry' : '↑ Sheet'}
-                          </button>
+                            >
+                              {c.sendStatus === 'sent' ? '✓ Sent'
+                                : c.sendStatus === 'duplicate' ? '⚠ Exists'
+                                : c.sendStatus === 'sending' ? '…'
+                                : c.sendStatus === 'error' ? 'Retry'
+                                : '↑ Sheet'}
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}

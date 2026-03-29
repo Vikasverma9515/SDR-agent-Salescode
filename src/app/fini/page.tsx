@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { useFiniStore } from '@/lib/stores';
 import { apiUrl } from '@/lib/api';
 import LogStream from '@/components/LogStream';
 
@@ -462,23 +463,29 @@ function ReviewCardItem({
 // Main Page
 // ---------------------------------------------------------------------------
 export default function FiniPage() {
-  const [companies, setCompanies] = useState('');
-  const [sdr, setSdr] = useState('');
-  const [region, setRegion] = useState('');
-  const [submitN8n, setSubmitN8n] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [threadId, setThreadId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // Review cards
-  const [reviewCards, setReviewCards] = useState<ReviewCard[]>([]);
-  const [enrichmentDone, setEnrichmentDone] = useState(false);
-  const [enrichmentStats, setEnrichmentStats] = useState<{ processed: number; errors: string[] } | null>(null);
-
-  // Per-company progress: name → 'queued' | 'processing' | 'done' | 'error'
-  const [enrichProgress, setEnrichProgress] = useState<Record<string, string>>({});
-  const [elapsedSecs, setElapsedSecs] = useState(0);
-  const [isSendingAll, setIsSendingAll] = useState(false);
+  const {
+    companies, sdr, region, submitN8n,
+    running, threadId, error,
+    reviewCards, enrichmentDone, enrichmentStats,
+    enrichProgress, elapsedSecs, isSendingAll,
+  } = useFiniStore();
+  const setCompanies   = (v: string)  => useFiniStore.setState({ companies: v });
+  const setSdr         = (v: string)  => useFiniStore.setState({ sdr: v });
+  const setRegion      = (v: string)  => useFiniStore.setState({ region: v });
+  const setSubmitN8n   = (fn: boolean | ((v: boolean) => boolean)) =>
+    useFiniStore.setState(s => ({ submitN8n: typeof fn === 'function' ? fn(s.submitN8n) : fn }));
+  const setRunning     = (v: boolean) => useFiniStore.setState({ running: v });
+  const setThreadId    = (v: string | null) => useFiniStore.setState({ threadId: v });
+  const setError       = (v: string | null) => useFiniStore.setState({ error: v });
+  const setEnrichmentDone  = (v: boolean) => useFiniStore.setState({ enrichmentDone: v });
+  const setEnrichmentStats = (v: any)     => useFiniStore.setState({ enrichmentStats: v });
+  const setElapsedSecs     = (fn: ((s: number) => number) | number) =>
+    useFiniStore.setState(s => ({ elapsedSecs: typeof fn === 'function' ? fn(s.elapsedSecs) : fn }));
+  const setIsSendingAll = (v: boolean) => useFiniStore.setState({ isSendingAll: v });
+  const setEnrichProgress = (fn: ((p: Record<string, string>) => Record<string, string>) | Record<string, string>) =>
+    useFiniStore.setState(s => ({ enrichProgress: typeof fn === 'function' ? fn(s.enrichProgress) : fn }));
+  const setReviewCards = (fn: ((p: ReviewCard[]) => ReviewCard[]) | ReviewCard[]) =>
+    useFiniStore.setState(s => ({ reviewCards: typeof fn === 'function' ? fn(s.reviewCards) : fn }));
   const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const applyCompletedData = useCallback((data: any) => {
@@ -539,13 +546,27 @@ export default function FiniPage() {
   const handleEvent = useCallback((msg: any) => {
     if (msg.type === 'completed') {
       if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
-      // Mark all remaining as done
       setEnrichProgress(prev => {
         const next = { ...prev };
         Object.keys(next).forEach(k => { if (next[k] !== 'error') next[k] = 'done'; });
         return next;
       });
-      applyCompletedData(msg.data);
+      // If cards already exist (WS reconnect after navigation), preserve their statuses — don't rebuild
+      const existingCards = useFiniStore.getState().reviewCards;
+      if (existingCards.length === 0) {
+        applyCompletedData(msg.data);
+      } else {
+        setEnrichmentDone(true);
+        setRunning(false);
+      }
+    } else if (msg.type === 'paused') {
+      useFiniStore.setState({ paused: true });
+    } else if (msg.type === 'resumed') {
+      useFiniStore.setState({ paused: false });
+    } else if (msg.type === 'cancelled') {
+      if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
+      setRunning(false);
+      useFiniStore.setState({ cancelled: true, paused: false });
     } else if (msg.type === 'error') {
       if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null; }
       setRunning(false);
@@ -569,7 +590,11 @@ export default function FiniPage() {
           if (resp.ok) {
             const data = await resp.json();
             if (data.status === 'completed' && data.companies?.length > 0) {
-              if (!cancelled) applyCompletedData(data);
+              if (!cancelled) {
+                const existingCards = useFiniStore.getState().reviewCards;
+                if (existingCards.length === 0) applyCompletedData(data);
+                else { setEnrichmentDone(true); setRunning(false); }
+              }
               break;
             }
           }
@@ -580,6 +605,19 @@ export default function FiniPage() {
     poll();
     return () => { cancelled = true; };
   }, [threadId, running, applyCompletedData]);
+
+  const handleStop = async () => {
+    if (!threadId) return;
+    try { await fetch(apiUrl(`/api/runs/${threadId}/cancel`), { method: 'POST' }); } catch { /* ignore */ }
+  };
+
+  const handlePauseResume = async () => {
+    if (!threadId) return;
+    const paused = useFiniStore.getState().paused;
+    try {
+      await fetch(apiUrl(`/api/runs/${threadId}/${paused ? 'resume' : 'pause'}`), { method: 'POST' });
+    } catch { /* ignore */ }
+  };
 
   const handleRun = async () => {
     if (!companies.trim()) return;
@@ -737,13 +775,35 @@ export default function FiniPage() {
         </div>
         <div className="flex items-center gap-4">
           {running && (
-            <div className="flex items-center gap-2">
-              <div className="relative flex h-1.5 w-1.5">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500" />
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <div className="relative flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500" />
+                </div>
+                <span className="text-[9px] font-bold text-white/75 uppercase tracking-[0.25em]">Enriching</span>
               </div>
-              <span className="text-[9px] font-bold text-white/75 uppercase tracking-[0.25em]">Enriching</span>
+              <button
+                onClick={handlePauseResume}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg border text-[9px] font-bold uppercase tracking-widest transition-colors ${
+                  useFiniStore.getState().paused
+                    ? 'border-teal-500/30 bg-teal-500/10 text-teal-400 hover:bg-teal-500/20'
+                    : 'border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20'
+                }`}
+              >
+                <span>{useFiniStore.getState().paused ? '▶' : '⏸'}</span>
+                <span>{useFiniStore.getState().paused ? 'Resume' : 'Pause'}</span>
+              </button>
+              <button
+                onClick={handleStop}
+                className="flex items-center gap-1.5 px-3 py-1 rounded-lg border border-red-500/30 bg-red-500/10 text-red-400 text-[9px] font-bold uppercase tracking-widest hover:bg-red-500/20 transition-colors"
+              >
+                <span>■</span><span>Stop</span>
+              </button>
             </div>
+          )}
+          {useFiniStore.getState().cancelled && !running && (
+            <span className="text-[9px] font-bold text-red-400/70 uppercase tracking-widest">Stopped</span>
           )}
           {enrichmentDone && enrichmentStats && (
             <div className="flex items-center gap-3">
@@ -1040,6 +1100,7 @@ export default function FiniPage() {
           <div className="p-6 grid grid-cols-1 xl:grid-cols-3 gap-4">
             {reviewCards.map((card, index) => {
               if (card.isCandidate) return null;
+              if (card.status === 'skipped') return null;
               return (
                 <ReviewCardItem
                   key={`${card.data.raw_name}-${index}`}

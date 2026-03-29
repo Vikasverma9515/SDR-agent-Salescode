@@ -28,6 +28,7 @@ TARGET_ACCOUNTS = "Target Accounts"
 FIRST_CLEAN_LIST = "First Clean List"
 SEARCHER_OUTPUT = "Searcher Output"
 FINAL_FILTERED_LIST = "Final Filtered List"
+REJECTED_PROFILES = "Reject profiles"
 
 _SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -293,6 +294,54 @@ SEARCHER_OUTPUT_HEADERS = [
     "Email Address",   # G
     "Email Status",    # H
 ]
+
+REJECTED_PROFILES_HEADERS = [
+    "Company Name",                               # A
+    "Normalized Company Name (Parent Group)",     # B
+    "Company Domain Name",                        # C
+    "Account Type",                               # D
+    "Account Size",                               # E
+    "Country",                                    # F
+    "First Name",                                 # G
+    "Last Name",                                  # H
+    "Job Title (English)",                        # I
+    "Buying Role",                                # J
+    "LinkedIn URL",                               # K
+    "Email",                                      # L
+    "Phone-1",                                    # M
+    "Phone-2",                                    # N
+    "LinkedIn Status",                            # O
+    "Employment Verified",                        # P
+    "Title Match",                                # Q
+    "Actual Title Found",                         # R
+    "Reject Reason",                              # S
+    "Verification Notes",                         # T
+    "Verified On",                                # U
+]
+
+async def delete_rows_batch(tab_name: str, row_nums: list[int]) -> None:
+    """
+    Delete multiple rows by their 1-based row numbers.
+    Must be called with rows sorted in DESCENDING order so that deleting
+    a lower-numbered row doesn't shift the indices of remaining rows.
+    """
+    if not row_nums:
+        return
+    sorted_rows = sorted(row_nums, reverse=True)
+    for attempt in range(3):
+        try:
+            sheet = _get_sheet(tab_name)
+            for row in sorted_rows:
+                await _run_sync(sheet.delete_rows, row)
+                logger.info("sheet_row_deleted", tab=tab_name, row=row)
+            return
+        except gspread.exceptions.APIError as e:
+            if attempt == 2:
+                raise
+            wait = 2 ** (attempt + 1)
+            logger.warning("sheet_delete_retry", tab=tab_name, attempt=attempt, wait=wait, error=str(e))
+            await asyncio.sleep(wait)
+
 
 # Column index constants for Veri write-back (1-based)
 FINAL_FILTERED_LIST_VERI_COL_START = 15  # column O

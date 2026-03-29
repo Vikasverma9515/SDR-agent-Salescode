@@ -116,6 +116,8 @@ class SearcherState(BaseModel):
     fcl_row_end: int | None = None        # last row written
     errors: Annotated[list[str], operator.add] = Field(default_factory=list)
     thread_id: str | None = None  # used to emit per-company progress events
+    # If True: skip SDR pause steps (role selection + contact approval) and auto-write all matched contacts
+    auto_approve: bool = False
 
 
 class VeriState(BaseModel):
@@ -130,8 +132,11 @@ class VeriState(BaseModel):
     status: Literal["running", "completed", "failed"] = "running"
     row_start: int | None = None  # 1-based data row (not header), inclusive
     row_end: int | None = None    # 1-based data row, inclusive
-    # Raw row values from First Clean List keyed by contact index (for copying to Final Filtered List)
+    thread_id: str | None = None   # injected by API so emit calls work
+    # Raw A-N values keyed by contact index (copied to Rejected Profiles for REJECT contacts)
     raw_rows: dict[int, list] = Field(default_factory=dict)
+    # Actual 1-based sheet row number keyed by contact index (for in-place update of cols O-U)
+    sheet_row_nums: dict[int, int] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

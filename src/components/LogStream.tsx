@@ -64,8 +64,8 @@ export default function LogStream({ threadId, onEvent }: LogStreamProps) {
       if (msg.type === 'log') {
         setLogs(p => [...p, { level: msg.level, message: msg.message, ts: msg.timestamp }]);
         if (onEventRef.current) onEventRef.current(msg);
-      } else if (msg.type === 'company_progress') {
-        // Pass to parent silently — don't pollute the terminal log
+      } else if (msg.type === 'company_progress' || msg.type === 'veri_contact' || msg.type === 'veri_step') {
+        // Pass to parent silently — rendered by dedicated activity feed
         if (onEventRef.current) onEventRef.current(msg);
       } else {
         const label = msg.type === 'completed' ? 'done' : msg.type === 'error' ? 'error' : 'pause';

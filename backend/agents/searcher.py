@@ -70,6 +70,13 @@ _DM_KEYWORDS = {
     "direttore digitale", "responsabile marketing", "responsabile commerciale",
     # German
     "geschäftsführer", "leiter marketing", "leiter vertrieb", "leiter digital",
+    # Senior manager tiers that qualify as DM (national/zonal/cluster scope)
+    "national sales manager", "national manager", "national head",
+    "zonal sales manager", "zonal manager", "zonal head",
+    "cluster manager", "regional head", "area director",
+    "key account director", "trade marketing director", "trade marketing manager",
+    "category director", "category head", "commercial head",
+    "business head", "business director", "business development director",
 }
 
 _INFLUENCER_KEYWORDS = {
@@ -923,6 +930,17 @@ async def await_full_selection(state: SearcherState) -> SearcherState:
         return state.model_copy(update={"pending_dm_candidates": []})
     if not state.thread_id:
         return state.model_copy(update={"pending_dm_candidates": []})
+
+    # Auto mode: skip SDR pause, take all matched contacts automatically
+    if state.auto_approve:
+        from backend.utils.progress import emit_log as _emit_log
+        await _emit_log(state.thread_id,
+                        f"Auto mode — processing all {len(matched)} matched contacts for {state.target_company}",
+                        level="info")
+        return state.model_copy(update={
+            "discovered_contacts": list(matched),
+            "pending_dm_candidates": [],
+        })
 
     from backend.utils import dm_selection as _dm_sel
     from backend.utils.progress import _queues as _pq, emit_log as _emit_log, emit as _emit_progress
@@ -2071,6 +2089,20 @@ async def await_role_selection(state: SearcherState) -> SearcherState:
     if not state.thread_id:
         return state
 
+    # Auto mode: skip SDR pause, select all role buckets automatically
+    if state.auto_approve:
+        from backend.utils.progress import emit_log as _emit_log
+        all_indices: set[int] = set()
+        for b in state.role_buckets:
+            all_indices.update(b.get("people_indices", []))
+        filtered = [state.discovered_contacts[i] for i in sorted(all_indices)
+                    if i < len(state.discovered_contacts)]
+        await _emit_log(state.thread_id,
+                        f"Auto mode — selecting all {len(filtered)} contacts across all role buckets for {state.target_company}",
+                        level="info")
+        return state.model_copy(update={"discovered_contacts": filtered})
+
+
     from backend.utils import role_selection as _rs
     from backend.utils.progress import _queues as _pq, emit_log as _emit_log, emit as _emit_progress
     from datetime import datetime as _dt, timezone as _tz
@@ -2553,7 +2585,7 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                 ]
                 await sheets.append_row(sheets.SEARCHER_OUTPUT, so_row)
 
-                await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
+                await sheets.ensure_headers(sheets.FINAL_FILTERED_LIST, sheets.FINAL_FILTERED_LIST_HEADERS)
                 name_parts = contact.full_name.strip().split(None, 1)
                 first_name = name_parts[0] if name_parts else ""
                 last_name  = name_parts[1] if len(name_parts) > 1 else ""
@@ -2571,7 +2603,7 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                     contact.email or "",
                     "", "",  # Phone-1, Phone-2
                 ]
-                written_fcl_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
+                written_fcl_row = await sheets.append_row(sheets.FINAL_FILTERED_LIST, fcl_row)
                 data_row = written_fcl_row - 1
                 if fcl_start_box[0] is None:
                     fcl_start_box[0] = data_row
@@ -2636,8 +2668,17 @@ async def write_contacts_to_sheet(state: SearcherState) -> SearcherState:
 # Node: advance_or_finish
 # ---------------------------------------------------------------------------
 
-def advance_or_finish(state: SearcherState) -> SearcherState:
+async def advance_or_finish(state: SearcherState) -> SearcherState:
     """Advance to next company or mark as completed."""
+    # Pause gate — blocks here between companies if user pressed pause
+    if state.thread_id:
+        from backend.utils.pause import await_if_paused
+        from backend.utils.progress import emit_log as _emit_log
+        from backend.utils.pause import is_paused
+        if is_paused(state.thread_id):
+            await _emit_log(state.thread_id, "Paused between companies — press Resume to continue", level="info")
+        await await_if_paused(state.thread_id)
+
     if not state.target_companies:
         return state.model_copy(update={"phase": "done"})
     next_index = state.current_index + 1
