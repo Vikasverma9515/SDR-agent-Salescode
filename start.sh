@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# SCAI ProspectOps - Quick Start Script
-# Run this once to set up the environment, then use it to start the UI.
+# SCAI ProspectOps - Start Script (Unified)
+# Runs the Python backend (backend.main) and Next.js dev server concurrently from the root.
 
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -12,16 +13,23 @@ echo "  ║       SCAI ProspectOps - Start           ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo ""
 
-# Check Python
+# ─── Python check ────────────────────────────────────────────────────────────
 if ! command -v python3 &>/dev/null; then
   echo "❌ Python 3.11+ is required. Please install it first."
   exit 1
 fi
-
 PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 echo "✓ Python $PYTHON_VERSION"
 
-# Check .env
+# ─── Node check ──────────────────────────────────────────────────────────────
+if ! command -v node &>/dev/null; then
+  echo "❌ Node.js 18+ is required. Please install it first."
+  exit 1
+fi
+NODE_VERSION=$(node -v)
+echo "✓ Node $NODE_VERSION"
+
+# ─── .env check ──────────────────────────────────────────────────────────────
 if [ ! -f ".env" ]; then
   echo "⚠️  No .env file found. Copying from .env.example..."
   cp .env.example .env
@@ -31,51 +39,77 @@ if [ ! -f ".env" ]; then
 fi
 echo "✓ .env found"
 
-# Create credentials directory
+# ─── Directories ─────────────────────────────────────────────────────────────
 mkdir -p credentials checkpoints logs
 
-# Install Python dependencies
+# ─── Python venv + deps ──────────────────────────────────────────────────────
 if [ ! -d ".venv" ]; then
   echo "📦 Creating virtual environment..."
   python3 -m venv .venv
 fi
-
 source .venv/bin/activate
 echo "📦 Installing Python dependencies..."
+# Use -e . to pick up package metadata from pyproject.toml
 pip install -e . -q
 
-# Build UI
-if [ -d "ui" ]; then
-  if [ ! -d "ui/node_modules" ]; then
-    echo "📦 Installing UI dependencies..."
-    cd ui && npm install -q && cd ..
-  fi
-
-  echo "🔨 Building UI..."
-  # On first run on a new Mac, Gatekeeper may block the rollup native binary.
-  # Fix: clear quarantine flag, or wipe node_modules and reinstall.
-  if ! (cd ui && npm run build -s 2>&1); then
-    echo "⚠️  Build failed (likely Gatekeeper/rollup issue). Clearing node_modules and retrying..."
-    cd ui && xattr -dr com.apple.quarantine node_modules 2>/dev/null; rm -rf node_modules package-lock.json
-    npm install -q && npm run build -s && cd ..
-  fi
-  echo "✓ UI built"
+# ─── Next.js deps ────────────────────────────────────────────────────────────
+if [ ! -d "node_modules" ]; then
+  echo "📦 Installing Next.js dependencies..."
+  npm install -q
 fi
+echo "✓ Next.js dependencies ready"
+
+# ─── Port cleanup ────────────────────────────────────────────────────────────
+lsof -ti:8080 | xargs kill -9 2>/dev/null || true
+lsof -ti:3000 | xargs kill -9 2>/dev/null || true
 
 echo ""
 echo "  ╔══════════════════════════════════════════╗"
-echo "  ║   Starting SCAI ProspectOps UI Server    ║"
+echo "  ║   Starting SCAI ProspectOps Stack        ║"
+echo "  ╠══════════════════════════════════════════╣"
+echo "  ║  API  (Python) →  http://localhost:8080   ║"
+echo "  ║  UI   (Next.js) → http://localhost:3000   ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo ""
-echo "  🌐 Opening at: http://localhost:8080"
-echo "  Press Ctrl+C to stop"
+echo "  Press Ctrl+C to stop both servers"
 echo ""
 
-# Kill anything already on port 8080
-lsof -ti:8080 | xargs kill -9 2>/dev/null || true
+# ─── Cleanup on exit ─────────────────────────────────────────────────────────
+cleanup() {
+  echo ""
+  echo "  🛑 Stopping servers..."
+  # Cleanly kill children
+  j=$(jobs -p)
+  if [ -n "$j" ]; then
+    kill $j 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
 
-# Open browser after a short delay
-(sleep 2 && open "http://localhost:8080" 2>/dev/null) &
+# ─── Start FastAPI backend ────────────────────────────────────────────────────
+# Use python -m backend.main as the new entry point
+python -m backend.main ui &
+BACKEND_PID=$!
+echo "  🐍 Backend started (PID $BACKEND_PID)"
 
-# Start the server
-python -m src.main ui
+# ─── Wait for backend to be ready ────────────────────────────────────────────
+echo "  ⏳ Waiting for backend..."
+for i in $(seq 1 30); do
+  if curl -s http://localhost:8080/api/health &>/dev/null; then
+    echo "  ✓ Backend ready"
+    break
+  fi
+  sleep 1
+done
+
+# ─── Start Next.js dev server ─────────────────────────────────────────────────
+# Next.js is now in the root
+npm run dev &
+NEXTJS_PID=$!
+echo "  ⚡ Next.js started (PID $NEXTJS_PID)"
+
+# ─── Open browser ────────────────────────────────────────────────────────────
+(sleep 4 && open "http://localhost:3000" 2>/dev/null) &
+
+# ─── Wait ────────────────────────────────────────────────────────────────────
+wait

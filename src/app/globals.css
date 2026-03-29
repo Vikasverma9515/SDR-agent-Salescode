@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  
+  --color-enterprise-bg: #080a12;
+  --color-enterprise-card: rgba(15, 23, 42, 0.4);
+  --color-enterprise-border: rgba(255, 255, 255, 0.1);
+}
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  body {
+    background: #080a12;
+    color: #f1f5f9;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+  ::-webkit-scrollbar-thumb:hover { background: #475569; }
+}
+
+@layer components {
+  /* Enterprise Buttons */
+  .btn-primary {
+    @apply relative bg-blue-600 hover:bg-blue-500 text-white font-medium px-6 py-2.5 rounded-xl
+           transition-all duration-300 focus:outline-none disabled:opacity-40
+           disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm tracking-wide;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
+  }
+  .btn-primary:hover:not(:disabled) {
+    @apply -translate-y-0.5 shadow-blue-500/40;
+    box-shadow: 0 8px 20px rgba(37, 99, 235, 0.4);
+  }
+  .btn-primary:active:not(:disabled) {
+    @apply translate-y-0;
+  }
+
+  .btn-secondary {
+    @apply relative bg-white/5 hover:bg-white/10 text-slate-200 font-medium px-6 py-2.5 rounded-xl
+           transition-all duration-300 border border-white/10 hover:border-white/20
+           flex items-center justify-center gap-2 text-sm;
+  }
+
+  .btn-danger {
+    @apply bg-red-500/10 hover:bg-red-500/20 text-red-400 font-medium px-6 py-2.5 rounded-xl
+           transition-all duration-300 border border-red-500/20 flex items-center justify-center gap-2 text-sm;
+  }
+
+  /* Glassmorphic Cards */
+  .card {
+    @apply relative bg-slate-900/40 border border-white/10 rounded-2xl p-6
+           backdrop-blur-xl transition-all duration-300;
+  }
+  .card-hover:hover {
+    @apply border-white/20 bg-slate-900/60 shadow-2xl shadow-black/20;
+  }
+
+  /* Form Fields */
+  .input-field {
+    @apply bg-slate-950/50 border border-white/10 rounded-xl px-4 py-3 text-slate-100
+           placeholder-slate-500 focus:outline-none focus:border-blue-500/50
+           focus:bg-slate-950/80 transition-all duration-300 w-full text-sm;
+  }
+  .input-field:focus {
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.2), 0 0 20px rgba(59, 130, 246, 0.1);
+  }
+
+  /* Status Badges */
+  .badge {
+    @apply text-[11px] font-semibold px-2.5 py-1 rounded-lg uppercase tracking-wider border shadow-sm;
+  }
+  .badge-verified {
+    @apply text-emerald-400 border-emerald-500/20 bg-emerald-500/10;
+  }
+  .badge-review {
+    @apply text-amber-400 border-amber-500/20 bg-amber-500/10;
+  }
+  .badge-reject {
+    @apply text-red-400 border-red-500/20 bg-red-500/10;
+  }
+  .badge-pending {
+    @apply text-slate-400 border-white/10 bg-white/5;
+  }
+
+  /* Layout Panels */
+  .panel {
+    @apply bg-slate-900/30 border border-white/10 rounded-2xl overflow-hidden backdrop-blur-md;
+  }
+  .panel-header {
+    @apply px-5 py-4 border-b border-white/10 flex items-center justify-between bg-white/[0.02];
+  }
+}
+
+/* Typography Overrides */
+h1, h2, h3, h4 { @apply tracking-tight font-semibold text-slate-50; }
+
+/* Background Depth */
+.bg-ambient {
+  position: fixed;
+  inset: 0;
+  background: 
+    radial-gradient(circle at 0% 0%, rgba(37, 99, 235, 0.05) 0%, transparent 40%),
+    radial-gradient(circle at 100% 100%, rgba(139, 92, 246, 0.05) 0%, transparent 40%),
+    #080a12;
+  z-index: -1;
+}
+
+/* List/Table Styles */
+.list-item {
+  @apply flex items-center gap-4 p-4 border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-colors duration-200;
+}
+
+/* Glassy Navigation Overlay */
+.nav-active {
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.1), transparent);
+  border-left: 2px solid #3b82f6;
+}
+
+/* Animations */
+.page-transition {
+  animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.ping-slow {
+  @apply absolute rounded-full opacity-60;
+  animation: ping-slow 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@keyframes ping-slow {
+  75%, 100% { transform: scale(2); opacity: 0; }
+}
+
+/* Scroll Hide for Sidebar */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
