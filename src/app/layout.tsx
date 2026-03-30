@@ -52,7 +52,7 @@ export default function RootLayout({
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
               </span>
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest tabular-nums">
-                Prod Alpha 2.1
+                Prod Alpha 2.2
               </span>
             </div>
           </div>
