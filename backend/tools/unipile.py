@@ -513,22 +513,41 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
         result["full_name"] = f"{first} {last}".strip() or data.get("name") or None
 
         # --- Primary: use work_experience entries ---
-        # Find current position: current==true OR end is null/empty
+        # Collect ALL current positions (end is null/missing = still active).
+        # People freelance / hold multiple roles — target company may not be
+        # the topmost entry.  We check every current position for a match.
         experiences = data.get("work_experience", []) or []
-        current_exp = None
+        current_positions: list[dict] = []
         for exp in experiences:
             if not exp.get("end"):  # end is null/missing = current position
-                current_exp = exp
-                break  # topmost current entry wins
+                current_positions.append(exp)
 
-        if current_exp:
-            current_company = (current_exp.get("company") or "").strip() or None
-            current_role = (current_exp.get("position") or current_exp.get("role") or "").strip() or None
-            result["current_company"] = current_company
-            result["current_role"] = current_role
-            result["still_employed"] = True
-            if current_company:
-                result["at_target_company"] = _company_matches(current_company, target_company)
+        if current_positions:
+            # Check if ANY current position matches the target company
+            matched_exp = None
+            for exp in current_positions:
+                co = (exp.get("company") or "").strip()
+                if co and _company_matches(co, target_company):
+                    matched_exp = exp
+                    break
+
+            if matched_exp:
+                # Target company found among current positions
+                current_company = (matched_exp.get("company") or "").strip() or None
+                current_role = (matched_exp.get("position") or matched_exp.get("role") or "").strip() or None
+                result["current_company"] = current_company
+                result["current_role"] = current_role
+                result["still_employed"] = True
+                result["at_target_company"] = True
+            else:
+                # Target not found — report the topmost current position
+                top = current_positions[0]
+                current_company = (top.get("company") or "").strip() or None
+                current_role = (top.get("position") or top.get("role") or "").strip() or None
+                result["current_company"] = current_company
+                result["current_role"] = current_role
+                result["still_employed"] = True
+                result["at_target_company"] = False
         else:
             # --- Fallback: parse headline if no experience data returned ---
             headline = data.get("headline", "") or ""
@@ -547,7 +566,8 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
             current_role=result["current_role"],
             target=target_company,
             match=result["at_target_company"],
-            source="experience" if current_exp else "headline",
+            current_positions=len(current_positions) if current_positions else 0,
+            source="experience" if current_positions else "headline",
         )
 
     except Exception as e:

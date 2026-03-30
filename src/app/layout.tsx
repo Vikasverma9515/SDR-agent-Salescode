@@ -33,13 +33,13 @@ export default function RootLayout({
         className={`${inter.variable} ${jetbrainsMono.variable} antialiased h-screen overflow-hidden selection:bg-blue-500/30 flex bg-[#080a12] text-[#f1f5f9] font-sans`}
       >
         <div className="bg-ambient" />
-        
+
         <Sidebar />
 
         <main className="flex-1 overflow-y-auto no-scrollbar relative">
           {/* Dynamic Scan Line (Subtle) */}
           <div className="fixed top-0 left-0 right-0 h-[1px] bg-gradient-to-r from-transparent via-blue-500/10 to-transparent pointer-events-none z-50 animate-[scan_10s_linear_infinite]" />
-          
+
           <div className="page-transition min-h-full pb-20">
             {children}
           </div>
@@ -52,7 +52,7 @@ export default function RootLayout({
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
               </span>
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest tabular-nums">
-                Prod Alpha 2.2
+                Prod Alpha 2.3
               </span>
             </div>
           </div>
