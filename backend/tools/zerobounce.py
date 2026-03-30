@@ -21,6 +21,7 @@ logger = get_logger("zerobounce")
 
 _cache: dict[str, "ZeroBounceResult"] = {}
 _credits_checked: bool = False  # check credits once per process start, not per call
+_credits_ok: bool = True        # set to False when 0 credits detected — skips all future API calls
 
 
 class ZeroBounceResult(TypedDict):
@@ -33,6 +34,23 @@ class ZeroBounceResult(TypedDict):
     mx_found: bool
     smtp_provider: str | None
     error: str | None
+
+
+async def check_credits_upfront() -> int:
+    """
+    Check ZeroBounce credits before a batch run.
+    Sets _credits_ok=False when 0 so all subsequent validate_email calls short-circuit.
+    Returns the credit count (0 = disabled for this run).
+    """
+    global _credits_checked, _credits_ok
+    try:
+        credits = await get_credits()
+        _credits_checked = True
+        if credits == 0:
+            _credits_ok = False
+        return credits
+    except Exception:
+        return -1  # unknown — let individual calls handle it
 
 
 async def get_credits() -> int:
@@ -70,7 +88,7 @@ async def validate_email(email: str) -> ZeroBounceResult:
     await zerobounce_limiter.acquire()
 
     # Check credits once per process — not on every call
-    global _credits_checked
+    global _credits_checked, _credits_ok
     if not _credits_checked:
         _credits_checked = True
         try:
@@ -82,9 +100,15 @@ async def validate_email(email: str) -> ZeroBounceResult:
                     threshold=settings.zerobounce_credit_warning,
                 )
             if credits == 0:
+                _credits_ok = False
+                logger.warning("zerobounce_no_credits", msg="Skipping all email validation — 0 credits remaining")
                 return _error_result(email, "ZeroBounce has 0 credits remaining")
         except Exception as e:
             logger.warning("zerobounce_credit_check_failed", error=str(e))
+
+    # Short-circuit: if we already know credits are exhausted, don't hit the API
+    if not _credits_ok:
+        return _error_result(email, "ZeroBounce has 0 credits remaining")
 
     # Validate
     for attempt in range(3):

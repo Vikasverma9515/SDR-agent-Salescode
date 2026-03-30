@@ -39,7 +39,7 @@ from backend.tools import theorg
 from backend.tools.llm import llm_complete
 from backend.tools.search import search
 from backend.utils.logging import get_logger
-from backend.utils.progress import emit_veri_contact, emit_veri_step
+from backend.utils.progress import emit_veri_contact, emit_veri_step, emit_system_warning
 
 logger = get_logger("veri")
 
@@ -70,13 +70,16 @@ async def read_final_list(state: VeriState) -> VeriState:
         raw_all = await sheets.read_all_rows(sheets.FINAL_FILTERED_LIST)
         records = await sheets.read_all_records(sheets.FINAL_FILTERED_LIST)
 
-        # row_offset: 0-based index of the first record in raw_all/records we'll process.
-        # Sheet row = row_offset + idx + 2  (row 1 is header, so data starts at row 2)
-        row_offset = (state.row_start - 1) if state.row_start is not None else 0
+        # row_offset: 0-based index of the first record we process.
+        # records[i] = sheet row (i + 2)  — header is row 1, first data row is row 2.
+        # So to map records[idx] → sheet_row:  sheet_row = row_offset + idx + 2
+        # For row_start=1123: start_index = 1123 - 2 = 1121, row_offset = 1121
+        # → sheet_row_nums[0] = 1121 + 0 + 2 = 1123 ✓
+        row_offset = (state.row_start - 2) if state.row_start is not None else 0
 
         if state.row_start is not None:
-            start = state.row_start - 1
-            end = state.row_end if state.row_end is not None else len(records)
+            start = state.row_start - 2          # 0-based index of first wanted row
+            end   = (state.row_end - 1) if state.row_end is not None else len(records)  # inclusive end → exclusive slice
             raw_all = raw_all[start:end]
             records = records[start:end]
             logger.info("veri_row_range", row_start=state.row_start, row_end=state.row_end, count=len(records))
@@ -165,6 +168,20 @@ async def parallel_verify_all(state: VeriState) -> VeriState:
     """Verify all contacts concurrently (Semaphore(6) to respect rate limits)."""
     if not state.contacts:
         return state.model_copy(update={"status": "completed"})
+
+    # ── ZeroBounce credit check ──────────────────────────────────────────────
+    zb_credits = await zb.check_credits_upfront()
+    if zb_credits == 0:
+        await emit_system_warning(
+            state.thread_id,
+            "zb_no_credits",
+            "ZeroBounce has 0 credits — email validation is disabled for this run. "
+            "Contacts are verified by LinkedIn signals only. "
+            "Refill credits at zerobounce.com to re-enable email filtering.",
+        )
+        logger.warning("veri_zb_disabled", reason="0 credits")
+    elif zb_credits > 0:
+        logger.info("veri_zb_credits", remaining=zb_credits)
 
     sem = asyncio.Semaphore(6)
     sheet_lock = asyncio.Lock()
@@ -560,7 +577,7 @@ async def _verify_one(
     evidence["role_match_final"] = role_match
 
     email_ok = zb_result.get("status") in ("valid", "catch-all")
-    status, notes, reject_reason = _build_verdict(
+    status, notes, reject_reason, review_flags = _build_verdict(
         identity, employment, role_match, email_ok, contact, audit, zb_result, evidence
     )
 
@@ -583,6 +600,9 @@ async def _verify_one(
     # ─────────────────────────────────────────────────────────────────────────
     # Phase 4: Write to correct sheet tab (serialised via lock)
     # ─────────────────────────────────────────────────────────────────────────
+    _final_sheet_row: int | None = None      # row in Final Filtered List
+    _reject_sheet_row: int | None = None     # row written to Reject profiles
+
     async with sheet_lock:
         try:
             li_at = audit.get("at_target_company", False)
@@ -614,6 +634,7 @@ async def _verify_one(
                 state.sheet_row_nums.get(idx)
                 or state.sheet_row_nums.get(str(idx))
             )
+            _final_sheet_row = sheet_row
 
             # Always update cols O-U in Final Filtered List (in place, no new rows)
             if sheet_row:
@@ -651,6 +672,7 @@ async def _verify_one(
                 reject_row_num = await sheets.append_row(
                     sheets.REJECTED_PROFILES, raw_cols_an + reject_cols
                 )
+                _reject_sheet_row = reject_row_num
                 logger.info("veri_rejected", contact=contact.full_name,
                             reason=reject_reason, row=reject_row_num)
                 await emit_veri_step(state.thread_id, contact.full_name, contact.company,
@@ -670,9 +692,115 @@ async def _verify_one(
                 "scoring", "sheet", f"write error: {e}", "error")
 
     _evidence.pop(idx, None)
+    _zb_skipped = bool(zb_result.get("error"))
+
+    # ── Per-signal data for frontend coloured blocks ────────────────────────
+    _li_valid    = audit.get("valid", False)
+    _li_at       = audit.get("at_target_company", False)
+    _li_employed = audit.get("still_employed", False)
+    _li_company  = audit.get("current_company") or ""
+    _li_role     = audit.get("current_role") or ""
+    _li_error    = audit.get("error") or ""
+
+    if _li_valid and _li_at and _li_employed:
+        _li_signal = "confirmed"
+        _li_detail = f"at {contact.company}"
+        if _li_role:
+            _li_detail += f", {_li_role}"
+    elif _li_valid and _li_at and not _li_employed:
+        _li_signal = "uncertain"
+        _li_detail = "profile found but employment uncertain"
+    elif _li_valid and _li_company and not _li_at:
+        _li_signal = "moved"
+        _li_detail = f"now at {_li_company}"
+    elif _li_error:
+        _li_signal = "error"
+        _err_short = _li_error[:60]
+        _li_detail = f"{_err_short}"
+    elif not contact.linkedin_url:
+        _li_signal = "no_url"
+        _li_detail = "no LinkedIn URL in sheet"
+    else:
+        _li_signal = "uncertain"
+        _li_detail = "profile inaccessible"
+
+    _zb_status = zb_result.get("status", "no_email")
+    _email_val = contact.email or ""
+    _zb_score  = zb_result.get("score", 0)
+    if _zb_skipped:
+        _email_signal = "skipped"
+        _email_detail = "ZeroBounce offline — not validated"
+    elif _zb_status == "valid":
+        _email_signal = "valid"
+        _email_detail = f"{_email_val} · valid"
+    elif _zb_status == "catch-all":
+        _email_signal = "catch-all"
+        _email_detail = f"{_email_val} · catch-all domain"
+    elif _zb_status == "unknown":
+        _email_signal = "unknown"
+        _email_detail = f"{_email_val} · unverifiable (score={_zb_score})"
+    elif _zb_status == "invalid":
+        _email_signal = "invalid"
+        _email_detail = f"{_email_val} · bouncing"
+    elif _zb_status == "no_email" or not _email_val:
+        _email_signal = "no_email"
+        _email_detail = "no email address found"
+    else:
+        _email_signal = _zb_status
+        _email_detail = f"{_email_val} · {_zb_status}"
+
+    _web_pos   = [s for s in ["ddg", "tavily", "perplexity"] if evidence.get(f"{s}_positive")]
+    _web_stale = [s for s in ["ddg", "tavily", "perplexity"] if evidence.get(f"{s}_stale")]
+    _theorg    = evidence.get("theorg_found", False)
+    if _web_pos:
+        _web_signal = "positive"
+        sources = [s.upper() if s == "ddg" else s.capitalize() for s in _web_pos]
+        if _theorg:
+            sources.append("TheOrg")
+        _web_detail = " + ".join(sources) + " confirmed"
+    elif _theorg:
+        _web_signal = "positive"
+        _web_detail = "TheOrg confirmed"
+    elif len(_web_stale) >= 2:
+        _web_signal = "stale"
+        sources = [s.upper() if s == "ddg" else s.capitalize() for s in _web_stale]
+        _web_detail = " + ".join(sources) + " show stale signals"
+    else:
+        _web_signal = "inconclusive"
+        _web_detail = "no definitive web signals"
+
+    _title_signal = role_match.lower()  # "match" | "mismatch" | "unknown"
+    _sheet_title  = contact.role_title or ""
+    if _title_signal == "match":
+        _title_detail = f"'{_sheet_title}' confirmed"
+        if _li_role:
+            _title_detail = f"'{_sheet_title}' ≈ '{_li_role}'"
+    elif _title_signal == "mismatch":
+        _title_detail = f"'{_sheet_title}' ≠ '{_li_role or '?'}'"
+    else:
+        _title_detail = "no LinkedIn role to compare"
+
+    _signals = {
+        "linkedin":        _li_signal,
+        "linkedin_detail": _li_detail,
+        "email":           _email_signal,
+        "email_detail":    _email_detail,
+        "web":             _web_signal,
+        "web_detail":      _web_detail,
+        "title":           _title_signal,
+        "title_detail":    _title_detail,
+    }
+    # ────────────────────────────────────────────────────────────────────────
+
     await emit_veri_contact(
         state.thread_id, contact.full_name, contact.company, "done",
         status=contact.verification_status,
+        reject_reason=reject_reason if contact.verification_status == "REJECT" else "",
+        sheet_row=_final_sheet_row if contact.verification_status != "REJECT" else None,
+        reject_sheet_row=_reject_sheet_row,
+        review_flags=review_flags if contact.verification_status == "REVIEW" else [],
+        email_validated=not _zb_skipped,
+        signals=_signals,
     )
     return contact
 
@@ -879,11 +1007,12 @@ def _compare_titles_fast(sheet_title: str, found_title: str) -> str:
 def _build_verdict(
     identity: str, employment: str, role_match: str,
     email_ok: bool, contact: Contact, audit: dict, zb_result: dict, evidence: dict,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, list[str]]:
     """
-    Returns (status, notes, reject_reason).
+    Returns (status, notes, reject_reason, review_flags).
     status: VERIFIED | REVIEW | REJECT
     reject_reason: short string explaining why rejected (empty if not REJECT)
+    review_flags: list of specific issues to review (for REVIEW contacts)
     """
     parts: list[str] = []
 
@@ -893,23 +1022,29 @@ def _build_verdict(
     li_at = audit.get("at_target_company", False)
     li_employed = audit.get("still_employed", False)
     li_error = audit.get("error") or ""
+    zb_status = zb_result.get("status", "no_email")
+    zb_score = zb_result.get("score")
+    zb_error = zb_result.get("error") or ""      # non-empty = ZeroBounce unavailable (0 credits / API error)
+    zb_skipped = bool(zb_error)                  # True → email validation didn't run; don't penalize contact
+    has_email = bool(contact.email and contact.email.strip())
+    email_val = contact.email or "none"
+
+    # LinkedIn fully confirmed = profile loaded + at target + still employed
+    li_fully_confirmed = li_valid and li_at and li_employed
 
     if li_valid:
         li_summary = "LinkedIn: profile loaded"
         if li_company:
-            li_summary += f", current company='{li_company}'"
+            li_summary += f", company='{li_company}'"
         if li_role:
-            li_summary += f", current role='{li_role}'"
-        li_summary += f", at_target={li_at}, still_employed={li_employed}"
+            li_summary += f", role='{li_role}'"
+        li_summary += f", at_target={li_at}, employed={li_employed}"
         parts.append(li_summary)
     elif li_error:
-        parts.append(f"LinkedIn: {li_error}")
+        parts.append(f"LinkedIn error: {li_error[:120]}")
     else:
         parts.append("LinkedIn: no URL or profile inaccessible")
 
-    zb_status = zb_result.get("status", "no_email")
-    zb_score = zb_result.get("score")
-    email_val = contact.email or "none"
     if zb_score is not None:
         parts.append(f"Email: {email_val} → {zb_status} (score={zb_score})")
     else:
@@ -921,14 +1056,11 @@ def _build_verdict(
         parts.append(f"Web confirms: {', '.join(web_positives)}")
     if web_stales:
         parts.append(f"Web stale signals: {', '.join(web_stales)}")
-
     if evidence.get("theorg_found"):
         theorg_title = evidence.get("theorg_title", "")
         parts.append(f"TheOrg: found{f', title={theorg_title}' if theorg_title else ''}")
-
     if evidence.get("llm_reasoning"):
         parts.append(f"LLM: {evidence['llm_reasoning']}")
-
     if li_role and contact.role_title:
         parts.append(f"Role: sheet='{contact.role_title}' vs LinkedIn='{li_role}' → {role_match}")
     elif contact.role_title:
@@ -940,39 +1072,104 @@ def _build_verdict(
 
     # 1. No identity confirmation at all
     if identity == "UNCONFIRMED":
-        if not email_ok:
-            return "REJECT", f"REJECT: No profile or web confirmation, email invalid. {evidence_str}", \
-                   "Identity unconfirmed and email invalid"
-        return "REVIEW", f"REVIEW: Email valid but no profile/web confirmation. {evidence_str}", ""
+        # Only REJECT if email is definitively bad — not when ZeroBounce was unavailable
+        if not email_ok and not (zb_skipped and has_email):
+            return ("REJECT",
+                    f"REJECT: No profile or web confirmation, email invalid. {evidence_str}",
+                    "Identity unconfirmed and email invalid",
+                    [])
+        flags_unconfirmed: list[str] = ["No LinkedIn profile or web confirmation found"]
+        if zb_skipped and has_email:
+            flags_unconfirmed.append("Email present but not validated (ZeroBounce offline)")
+        return ("REVIEW",
+                f"REVIEW: Email valid but no profile/web confirmation. {evidence_str}",
+                "",
+                flags_unconfirmed)
 
     # 2. LinkedIn shows they left this company
     if employment == "REJECTED":
         if li_company and not li_at:
             reason = f"LinkedIn shows person now at '{li_company}', not {contact.company}"
-            return "REJECT", f"REJECT: {reason}. {evidence_str}", reason
+            return "REJECT", f"REJECT: {reason}. {evidence_str}", reason, []
         reason = f"2+ sources indicate person left {contact.company}"
-        return "REJECT", f"REJECT: Stale role — {reason}. {evidence_str}", reason
+        return "REJECT", f"REJECT: Stale role — {reason}. {evidence_str}", reason, []
 
     # 3. LinkedIn confirmed at company
     if employment == "CONFIRMED":
         if role_match == "MISMATCH":
-            # Title is from a completely different function → wrong person for our ICP
             reason = (
                 f"Title mismatch: sheet='{contact.role_title}' vs "
                 f"LinkedIn='{li_role or evidence.get('theorg_title', '?')}'"
             )
-            return "REJECT", f"REJECT: {reason}. {evidence_str}", reason
+            return "REJECT", f"REJECT: {reason}. {evidence_str}", reason, []
+
+        # Smart upgrade: LinkedIn FULLY confirms presence (profile loaded, at company, still employed)
+        # + email is "unknown" (corporate domain blocks probing) OR ZeroBounce was unavailable (0 credits / API error)
+        # → VERIFIED. LinkedIn employment signal is stronger than ZeroBounce probe failure.
+        if li_fully_confirmed and (zb_status == "unknown" or zb_skipped) and role_match in ("MATCH", "UNKNOWN"):
+            note = "Email domain blocks probing but not invalid" if not zb_skipped else "Email validation skipped (ZeroBounce unavailable)"
+            return ("VERIFIED",
+                    f"VERIFIED: LinkedIn confirms at {contact.company}. {note}. {evidence_str}",
+                    "",
+                    [])
+
+        # ZeroBounce skipped but has email + LinkedIn confirmed → treat as deliverable
+        if zb_skipped and has_email and role_match in ("MATCH", "UNKNOWN"):
+            return ("VERIFIED",
+                    f"VERIFIED: LinkedIn confirms at {contact.company}. Email present but not validated (ZeroBounce unavailable). {evidence_str}",
+                    "",
+                    [])
+
         if email_ok and role_match in ("MATCH", "UNKNOWN"):
-            return "VERIFIED", f"VERIFIED: LinkedIn confirms at {contact.company}, email deliverable. {evidence_str}", ""
-        if not email_ok:
-            return "REVIEW", f"REVIEW: LinkedIn confirmed but email {zb_status}. {evidence_str}", ""
-        return "VERIFIED", f"VERIFIED: LinkedIn confirms at {contact.company}. {evidence_str}", ""
+            return ("VERIFIED",
+                    f"VERIFIED: LinkedIn confirms at {contact.company}, email deliverable. {evidence_str}",
+                    "",
+                    [])
 
-    # 4. Uncertain employment — escalate to REVIEW
+        # Remaining REVIEW cases — build specific flags
+        flags: list[str] = []
+        if zb_skipped and not has_email:
+            flags.append("No email address found — needs enrichment")
+        elif zb_status == "invalid":
+            flags.append(f"Email invalid/bouncing ({email_val})")
+        elif zb_status == "no_email":
+            flags.append("No email address found — needs enrichment")
+        elif zb_status == "unknown" and not li_fully_confirmed:
+            flags.append(f"Email unverifiable ({email_val} · score={zb_score})")
+        elif not email_ok:
+            flags.append(f"Email status: {zb_status} ({email_val})")
+        if li_error:
+            flags.append(f"LinkedIn error: {li_error[:80]}")
+        return ("REVIEW",
+                f"REVIEW: LinkedIn confirmed but email {zb_status}. {evidence_str}",
+                "",
+                flags)
+
+    # 4. Uncertain employment — build specific flags
+    flags: list[str] = []
+    if li_error:
+        flags.append(f"LinkedIn error: {li_error[:80]}")
+    elif not li_valid:
+        flags.append("LinkedIn profile inaccessible — verify manually")
+    if not email_ok:
+        if zb_status == "no_email":
+            flags.append("No email address — needs enrichment")
+        elif zb_status == "invalid":
+            flags.append(f"Email invalid ({email_val})")
+        else:
+            flags.append(f"Email unverifiable ({email_val} · {zb_status})")
+    if identity == "CONFIRMED" and not flags:
+        flags.append("Employment uncertain — LinkedIn audit incomplete")
+
     if email_ok and identity == "CONFIRMED":
-        return "REVIEW", f"REVIEW: Identity confirmed, email valid, but employment uncertain. {evidence_str}", ""
-
-    return "REVIEW", f"REVIEW: Insufficient evidence — LinkedIn inaccessible or private. {evidence_str}", ""
+        return ("REVIEW",
+                f"REVIEW: Identity confirmed, email valid, but employment uncertain. {evidence_str}",
+                "",
+                flags)
+    return ("REVIEW",
+            f"REVIEW: Insufficient evidence — LinkedIn inaccessible or private. {evidence_str}",
+            "",
+            flags)
 
 
 # ---------------------------------------------------------------------------

@@ -91,8 +91,14 @@ async def emit_veri_contact(
     thread_id: str | None,
     name: str,
     company: str,
-    phase: str,      # "queued" | "web" | "linkedin_zb" | "scoring" | "done"
-    status: str = "",  # "VERIFIED" | "REVIEW" | "REJECT" (for done phase)
+    phase: str,           # "queued" | "web" | "linkedin_zb" | "scoring" | "done"
+    status: str = "",     # "VERIFIED" | "REVIEW" | "REJECT" (for done phase)
+    reject_reason: str = "",   # short rejection reason for REJECT
+    sheet_row: int | None = None,         # row in Final Filtered List (VERIFIED/REVIEW)
+    reject_sheet_row: int | None = None,  # row written to Reject profiles (REJECT)
+    review_flags: list[str] | None = None,  # specific issues for REVIEW contacts
+    email_validated: bool = True,         # False when ZeroBounce was unavailable
+    signals: dict | None = None,          # per-check signal colours for frontend blocks
 ) -> None:
     """Emit a veri_contact event so the frontend can track per-contact progress."""
     if not thread_id:
@@ -108,7 +114,35 @@ async def emit_veri_contact(
                 "company": company,
                 "phase": phase,
                 "status": status,
+                "reject_reason": reject_reason,
+                "sheet_row": sheet_row,
+                "reject_sheet_row": reject_sheet_row,
+                "review_flags": review_flags or [],
+                "email_validated": email_validated,
+                "signals": signals or {},
             },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+async def emit_system_warning(
+    thread_id: str | None,
+    code: str,
+    message: str,
+) -> None:
+    """Emit a system-level warning banner event (e.g. ZeroBounce out of credits)."""
+    if not thread_id:
+        return
+    q = _queues.get(thread_id)
+    if not q:
+        return
+    try:
+        await q.put({
+            "type": "system_warning",
+            "code": code,
+            "message": message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
     except Exception:

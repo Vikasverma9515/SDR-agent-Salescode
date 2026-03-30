@@ -408,6 +408,16 @@ export default function SearcherPage() {
           history: scoutMessages.map(m => ({ role: m.role, content: m.content })),
         }),
       });
+      if (!resp.ok) {
+        let detail = `Server error (${resp.status})`;
+        try {
+          const errBody = await resp.json();
+          detail = errBody.detail || detail;
+        } catch {
+          // response wasn't JSON (e.g. proxy failure)
+        }
+        throw new Error(detail);
+      }
       const data = await resp.json();
       // Attach company context to each candidate so commit has it
       const candidates: ScoutCandidate[] = (data.candidates || []).map((c: ScoutCandidate) => ({
