@@ -36,17 +36,28 @@ async def emit(thread_id: str | None, company: str, status: str) -> None:
 
 
 async def emit_log(thread_id: str | None, message: str, level: str = "info") -> None:
-    """Emit a log-line event to the WebSocket pipeline log."""
+    """Emit a log-line event to the WebSocket pipeline log.
+
+    If the message starts with [company_name], the company field is automatically
+    extracted so the frontend can filter logs per company.
+    """
     if not thread_id:
         return
     q = _queues.get(thread_id)
     if not q:
         return
+    # Extract company name from [bracketed] prefix if present
+    company = None
+    import re
+    m = re.match(r'^\[([^\]]+)\]\s*', message)
+    if m:
+        company = m.group(1)
     try:
         await q.put({
             "type": "log",
             "level": level,
             "message": message,
+            "company": company,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
     except Exception:

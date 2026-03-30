@@ -19,11 +19,11 @@ from backend.utils.logging import get_logger
 logger = get_logger("n8n")
 
 
-async def submit_to_n8n(payload: dict[str, Any]) -> bool:
+async def submit_to_n8n(payload: dict[str, Any], skip_delay: bool = False) -> bool:
     """
     POST payload to n8n webhook.
     Returns True on success, False on failure.
-    Includes mandatory 60-second delay after each submission.
+    skip_delay=True for batch triggers (only one call, no need to rate-limit).
     """
     settings = get_settings()
 
@@ -44,12 +44,13 @@ async def submit_to_n8n(payload: dict[str, Any]) -> bool:
             logger.info(
                 "n8n_submitted",
                 status=resp.status_code,
-                company=payload.get("company_name", "unknown"),
+                company=payload.get("Company_Name", payload.get("company_name", "batch")),
             )
 
-            # Mandatory delay before next submission
-            logger.info("n8n_delay_start", seconds=settings.n8n_submission_delay)
-            await asyncio.sleep(settings.n8n_submission_delay)
+            # Delay between submissions (skip for single batch triggers)
+            if not skip_delay:
+                logger.info("n8n_delay_start", seconds=settings.n8n_submission_delay)
+                await asyncio.sleep(settings.n8n_submission_delay)
             return True
 
         except httpx.HTTPError as e:

@@ -116,6 +116,7 @@ interface FiniState {
   sdr: string;
   region: string;
   submitN8n: boolean;
+  autoMode: boolean;
   // Run
   running: boolean;
   threadId: string | null;
@@ -136,9 +137,10 @@ interface FiniState {
 
 const finiDefaults = {
   companies: '',
-  sdr: '',
+  sdr: 'Amy',
   region: '',
   submitN8n: false,
+  autoMode: false,
   running: false,
   threadId: null as string | null,
   error: null as string | null,

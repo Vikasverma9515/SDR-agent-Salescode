@@ -253,11 +253,16 @@ async def get_company_org_id(company_name: str) -> OrgInfo:
                 org_id = data.get("id")
                 name = data.get("name", "")
                 if org_id and _company_matches(name, company_name):
-                    logger.info("unipile_company_found", company=company_name, org_id=org_id, name=name, slug=slug)
+                    website = (
+                        data.get("website") or data.get("website_url")
+                        or data.get("domain") or data.get("company_url") or ""
+                    ).strip()
+                    logger.info("unipile_company_found", company=company_name, org_id=org_id, name=name, slug=slug, website=website or "(none)")
                     return {
                         "org_id": str(org_id),
                         "name": name,
                         "public_identifier": data.get("public_identifier"),
+                        "website": website,
                         "error": None,
                     }
                 else:
@@ -409,7 +414,7 @@ async def _search_company_keyword(company_name: str, account_id: str) -> list[di
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 f"{_base_url()}/linkedin/search",
-                params={"account_id": account_id, "limit": 5},
+                params={"account_id": account_id, "limit": 10},
                 json=payload,
                 headers=_headers(),
             )
@@ -424,19 +429,39 @@ async def _search_company_keyword(company_name: str, account_id: str) -> list[di
 
         data = resp.json()
         matches = []
+        skipped_showcases = []
         for item in data.get("items", []):
             org_id = str(item.get("id") or item.get("org_id") or "")
             name = (item.get("name") or "").strip()
             slug = item.get("public_identifier") or item.get("universal_name") or ""
             if not org_id or not name:
                 continue
+
+            # Detect and skip LinkedIn Showcase Pages — they don't exist in Sales Navigator.
+            # Showcase pages have type "SHOWCASE" or have a parent_id, or their slug
+            # pattern suggests a sub-page (e.g. "rippling-it", "rippling-spend").
+            item_type = (item.get("type") or item.get("organization_type") or "").upper()
+            has_parent = bool(item.get("parent_id") or item.get("parent"))
+            if item_type == "SHOWCASE" or has_parent:
+                skipped_showcases.append(name)
+                continue
+
             if _company_matches(name, company_name):
+                # Extract website/domain if LinkedIn has it
+                website = (
+                    item.get("website") or item.get("website_url")
+                    or item.get("domain") or item.get("company_url") or ""
+                ).strip()
                 matches.append({
                     "org_id": org_id,
                     "name": name,
                     "public_identifier": slug,
+                    "website": website,
                 })
 
+        if skipped_showcases:
+            logger.info("unipile_skipped_showcases",
+                        query=search_term, skipped=skipped_showcases)
         logger.info("unipile_company_keyword_search_done",
                     query=search_term, results=len(data.get("items", [])), matches=len(matches))
         return matches
@@ -445,6 +470,44 @@ async def _search_company_keyword(company_name: str, account_id: str) -> list[di
         logger.warning("unipile_company_keyword_search_exception",
                        company=company_name, error=str(e))
         return []
+
+
+async def get_company_domain(slug_or_org_id: str) -> str | None:
+    """
+    Fetch a company's website domain directly from LinkedIn via Unipile.
+    This is the most reliable source — no web search needed.
+    Returns bare domain (e.g. 'mahou.es') or None.
+    """
+    await _init_pool()
+    account_id = _next_account_id()
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{_base_url()}/linkedin/company/{slug_or_org_id}",
+                params={"account_id": account_id},
+                headers=_headers(),
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            website = (
+                data.get("website") or data.get("website_url")
+                or data.get("domain") or data.get("company_url") or ""
+            ).strip()
+            if website:
+                # Clean URL → bare domain
+                website = re.sub(r'^https?://(?:www\.)?', '', website)
+                website = re.sub(r'^www\.', '', website)
+                website = website.split('/')[0].strip().lower()
+                if re.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}', website):
+                    logger.info("unipile_company_domain_found",
+                                slug=slug_or_org_id, domain=website)
+                    return website
+    except Exception as e:
+        logger.warning("unipile_company_domain_error",
+                       slug=slug_or_org_id, error=str(e))
+    return None
 
 
 # ---------------------------------------------------------------------------

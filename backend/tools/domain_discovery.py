@@ -50,6 +50,59 @@ _SKIP_DOMAINS = {
     "zoominfo", "bloomberg", "reuters", "economictimes",
 }
 
+async def _llm_validate_domain(company_name: str, domain: str, context: dict | None = None) -> dict:
+    """
+    Use LLM reasoning to validate whether a domain actually belongs to a company.
+
+    Returns {"valid": bool, "reason": str, "suggested_domain": str|None}
+
+    This replaces brittle blocklists — the model reasons about whether the domain
+    makes sense given the company name, type, industry, parent brand, and region.
+    Catches: youtube.com for a beer distributor, salescode.io vs salescode.ai, etc.
+    """
+    from backend.tools.llm import llm_complete
+
+    ctx_parts = []
+    if context:
+        if context.get("company_type"):
+            ctx_parts.append(f"Company type: {context['company_type']}")
+        if context.get("parent_brand"):
+            ctx_parts.append(f"Parent/owner: {context['parent_brand']}")
+        if context.get("region"):
+            ctx_parts.append(f"Region: {context['region']}")
+    ctx_str = "; ".join(ctx_parts) if ctx_parts else "No additional context"
+
+    prompt = (
+        f"You are a B2B data quality validator. A domain discovery system found this result:\n\n"
+        f"Company: \"{company_name}\"\n"
+        f"Discovered domain: \"{domain}\"\n"
+        f"Context: {ctx_str}\n\n"
+        f"TASK: Does this domain ACTUALLY belong to this company?\n\n"
+        f"Think about:\n"
+        f"- Is this a major platform (YouTube, Facebook, LinkedIn, Google, Amazon, GitHub, etc.)? "
+        f"These are NEVER a company's corporate domain unless the company IS that platform.\n"
+        f"- Does the domain name relate to the company name at all?\n"
+        f"- Could this be the company's social media page URL being mistaken for their website?\n"
+        f"- Is this a generic/free email provider domain (gmail.com, outlook.com, yahoo.com)?\n"
+        f"- If the company is a subsidiary/distributor, the PARENT company's domain is acceptable.\n\n"
+        f"Return ONLY a JSON object (no markdown):\n"
+        f'{{"valid": true/false, "reason": "1 sentence why", "suggested_domain": null or "correct.com"}}'
+    )
+
+    try:
+        raw = await llm_complete(prompt, model="gpt-4.1-mini", max_tokens=150, temperature=0)
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', (raw or "").strip())
+        import json as _json
+        result = _json.loads(cleaned)
+        logger.info("domain_validation_result",
+                     company=company_name, domain=domain,
+                     valid=result.get("valid"), reason=result.get("reason"))
+        return result
+    except Exception as e:
+        logger.warning("domain_validation_error", company=company_name, error=str(e))
+        # On failure, fall back to basic heuristic check
+        return {"valid": True, "reason": "validation failed, accepting domain", "suggested_domain": None}
+
 
 class DomainInfo(TypedDict):
     domain: str | None
@@ -98,17 +151,52 @@ async def _ask_gpt_for_domain(company_name: str) -> str | None:
     return None
 
 
-async def discover_domain(company_name: str) -> DomainInfo:
+async def discover_domain(company_name: str, context: dict | None = None) -> DomainInfo:
     """
     Discover the official domain and email format for a company.
 
+    context: optional dict with keys like company_type, parent_brand, region
+    for smarter LLM validation of the discovered domain.
+
     Domain lookup strategy (stops at first success):
+    0. LinkedIn company page via Unipile (fastest, most reliable).
     1. LLM web search (OpenAI gpt-4o-search-preview → Claude Bedrock fallback).
     2. Fallback: search snippets + URLs via Perplexity/Tavily/DDG.
     """
-    # --- Step 1: GPT domain lookup (primary) ---
-    domain = await _ask_gpt_for_domain(company_name)
     sources_used: list[str] = []
+
+    # --- Step 0: LinkedIn domain via Unipile (fastest, most reliable) ---
+    # LinkedIn company pages almost always have a website field.
+    # Try both slug and org_id since either might work.
+    domain = None
+    _slugs_to_try = []
+    if context and context.get("linkedin_slug"):
+        _slugs_to_try.append(context["linkedin_slug"])
+    if context and context.get("org_id"):
+        _slugs_to_try.append(context["org_id"])
+    if not _slugs_to_try:
+        # Build a slug from company name as fallback
+        _built_slug = re.sub(r'[^a-z0-9\s]', ' ', company_name.lower()).strip()
+        _built_slug = '-'.join(_built_slug.split())
+        if _built_slug:
+            _slugs_to_try.append(_built_slug)
+
+    from backend.tools.unipile import get_company_domain
+    for _slug in _slugs_to_try:
+        if domain:
+            break
+        try:
+            domain = await get_company_domain(_slug)
+            if domain:
+                sources_used.append("linkedin")
+                logger.info("domain_from_linkedin", company=company_name, domain=domain, slug=_slug)
+        except Exception as e:
+            logger.warning("domain_linkedin_error", company=company_name, slug=_slug, error=str(e))
+
+    # --- Step 1: GPT web search (fallback if LinkedIn didn't have the domain) ---
+    if not domain:
+        logger.info("domain_linkedin_miss", company=company_name, note="trying GPT web search")
+        domain = await _ask_gpt_for_domain(company_name)
 
     if not domain:
         # --- Step 2: Search fallback ---
@@ -155,6 +243,50 @@ async def discover_domain(company_name: str) -> DomainInfo:
             domain = url_domain
         else:
             domain = url_domain or snippet_domain
+
+    # --- Smart validation: only validate SUSPICIOUS domains ---
+    # A domain is suspicious if the domain root doesn't relate to the company name.
+    # e.g. "youtube.com" for "Voldis" is suspicious; "heineken.com" for "Heineken" is not.
+    # This avoids an extra LLM call for obvious matches, keeping things fast.
+    if domain:
+        _domain_root = domain.split(".")[0].replace("-", "").lower()
+        _company_slug = re.sub(r"[^a-z0-9]", "", company_name.lower())
+        # Also check against parent brand name if available
+        _parent_slug = ""
+        if context and context.get("parent_brand"):
+            _parent_slug = re.sub(r"[^a-z0-9]", "", context["parent_brand"].lower())
+
+        _name_matches_domain = (
+            _domain_root in _company_slug
+            or _company_slug in _domain_root
+            or (_parent_slug and (_domain_root in _parent_slug or _parent_slug in _domain_root))
+        )
+
+        if not _name_matches_domain:
+            # Domain doesn't match company name — validate with LLM
+            logger.info("domain_suspicious_validating",
+                        company=company_name, domain=domain,
+                        reason="domain root doesn't match company name")
+            try:
+                validation = await asyncio.wait_for(
+                    _llm_validate_domain(company_name, domain, context),
+                    timeout=20,
+                )
+                if not validation.get("valid", True):
+                    logger.warning("domain_rejected_by_llm",
+                                   company=company_name, domain=domain,
+                                   reason=validation.get("reason"))
+                    suggested = validation.get("suggested_domain")
+                    if suggested and suggested != domain:
+                        logger.info("domain_trying_suggestion",
+                                    company=company_name, suggested=suggested)
+                        domain = suggested
+                    else:
+                        domain = None
+            except asyncio.TimeoutError:
+                logger.warning("domain_validation_timeout",
+                               company=company_name, domain=domain)
+                # On timeout, accept the domain rather than blocking
 
     if not domain:
         logger.warning("domain_not_found", company=company_name)

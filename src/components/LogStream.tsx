@@ -1,12 +1,13 @@
 'use client';
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { wsUrl } from '@/lib/api';
 
 interface Log {
   level: string;
   message: string;
   ts: string;
+  company?: string | null;
 }
 
 interface LogStreamProps {
@@ -15,35 +16,36 @@ interface LogStreamProps {
 }
 
 const COLORS: Record<string, string> = {
-  info: 'text-blue-400', 
-  warning: 'text-amber-400', 
+  info: 'text-blue-400',
+  warning: 'text-amber-400',
   error: 'text-red-400',
-  success: 'text-emerald-400', 
+  success: 'text-emerald-400',
   debug: 'text-gray-600',
-  system: 'text-gray-600', 
-  done: 'text-emerald-400', 
+  system: 'text-gray-600',
+  done: 'text-emerald-400',
   pause: 'text-amber-400',
 };
 
 const PREFIXES: Record<string, string> = {
-  info: 'INF', 
-  warning: 'WRN', 
-  error: 'ERR', 
+  info: 'INF',
+  warning: 'WRN',
+  error: 'ERR',
   success: 'OK ',
-  debug: 'DBG', 
-  system: 'SYS', 
-  done: 'DONE', 
+  debug: 'DBG',
+  system: 'SYS',
+  done: 'DONE',
   pause: 'WAIT',
 };
 
 export default function LogStream({ threadId, onEvent }: LogStreamProps) {
   const [logs, setLogs] = useState<Log[]>([]);
   const [connected, setConnected] = useState(false);
+  const [filter, setFilter] = useState<string | null>(null); // null = ALL
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const doneRef = useRef(false);
   const onEventRef = useRef(onEvent);
-  
+
   onEventRef.current = onEvent;
 
   const connect = useCallback(() => {
@@ -62,7 +64,7 @@ export default function LogStream({ threadId, onEvent }: LogStreamProps) {
       const msg = JSON.parse(e.data);
       if (msg.type === 'heartbeat') return;
       if (msg.type === 'log') {
-        setLogs(p => [...p, { level: msg.level, message: msg.message, ts: msg.timestamp }]);
+        setLogs(p => [...p, { level: msg.level, message: msg.message, ts: msg.timestamp, company: msg.company || null }]);
         if (onEventRef.current) onEventRef.current(msg);
       } else if (msg.type === 'company_progress' || msg.type === 'veri_contact' || msg.type === 'veri_step') {
         // Pass to parent silently — rendered by dedicated activity feed
@@ -106,6 +108,7 @@ export default function LogStream({ threadId, onEvent }: LogStreamProps) {
   useEffect(() => {
     doneRef.current = false;
     setLogs([]);
+    setFilter(null);
     if (threadId) connect();
     return () => {
       doneRef.current = true;
@@ -117,7 +120,24 @@ export default function LogStream({ threadId, onEvent }: LogStreamProps) {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
+  }, [logs, filter]);
+
+  // Extract unique company names from logs
+  const companies = useMemo(() => {
+    const set = new Set<string>();
+    for (const l of logs) {
+      if (l.company) set.add(l.company);
+    }
+    return Array.from(set);
   }, [logs]);
+
+  // Filtered logs
+  const visibleLogs = useMemo(() => {
+    if (!filter) return logs;
+    return logs.filter(l => l.company === filter || !l.company);
+  }, [logs, filter]);
+
+  const showTabs = companies.length > 1;
 
   return (
     <div className="panel overflow-hidden flex flex-col h-full">
@@ -136,11 +156,46 @@ export default function LogStream({ threadId, onEvent }: LogStreamProps) {
         </button>
       </div>
 
+      {/* Company filter tabs */}
+      {showTabs && (
+        <div className="flex items-center gap-1 px-4 py-2 border-b border-white/[0.06] bg-white/[0.01] overflow-x-auto no-scrollbar">
+          <button
+            onClick={() => setFilter(null)}
+            className={`px-2.5 py-1 rounded-md text-[9px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${
+              filter === null
+                ? 'bg-white/10 text-white/80'
+                : 'text-white/30 hover:text-white/50 hover:bg-white/5'
+            }`}
+          >
+            All ({logs.length})
+          </button>
+          {companies.map(c => {
+            const count = logs.filter(l => l.company === c).length;
+            return (
+              <button
+                key={c}
+                onClick={() => setFilter(f => f === c ? null : c)}
+                className={`px-2.5 py-1 rounded-md text-[9px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${
+                  filter === c
+                    ? 'bg-blue-500/20 text-blue-400'
+                    : 'text-white/30 hover:text-white/50 hover:bg-white/5'
+                }`}
+              >
+                {c} ({count})
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-0.5 font-mono text-[11px] bg-black/20 no-scrollbar">
-        {logs.length === 0 && (
+        {visibleLogs.length === 0 && !filter && (
           <span className="text-gray-700 animate-pulse">waiting for pipeline connection...</span>
         )}
-        {logs.map((log, i) => (
+        {visibleLogs.length === 0 && filter && (
+          <span className="text-gray-700">no logs for {filter}</span>
+        )}
+        {visibleLogs.map((log, i) => (
           <div key={i} className="flex items-baseline gap-3">
             <span className="text-gray-700 tabular-nums shrink-0">
               {new Date(log.ts).toLocaleTimeString('en-US', { hour12: false })}

@@ -170,8 +170,17 @@ interface CompanyData {
   size_confidence?: 'high' | 'medium' | 'low';
   // Option 3: agent notes
   agent_notes?: string;
-  // Option 5: alternative LinkedIn candidates
-  linkedin_candidates?: { org_id: string; name: string; slug: string; how: string }[];
+  // Alternative LinkedIn candidates — each independently enriched
+  linkedin_candidates?: {
+    org_id: string; name: string; slug: string; how: string;
+    domain?: string; email_format?: string; account_size?: string; account_type?: string;
+    sales_nav_url?: string; domain_confidence?: string; email_confidence?: string; size_confidence?: string;
+  }[];
+  // Auto-mode fields
+  auto_committed?: boolean;
+  selection_reasoning?: string;
+  // n8n status (updated via WebSocket)
+  n8n_status?: 'submitting' | 'submitted' | 'failed';
 }
 
 // ---------------------------------------------------------------------------
@@ -265,9 +274,10 @@ function ReviewCardItem({
             <span className={`text-[9px] font-bold uppercase tracking-widest ${hasRealLink ? 'text-white/65' : 'text-white/50'}`}>
               {hasRealLink ? 'Matched' : '⚠ Fallback'}
             </span>
-            {isSent && <span className="text-[9px] font-bold uppercase tracking-widest text-white/65">· Synced</span>}
+            {card.data.auto_committed && <span className="text-[9px] font-bold uppercase tracking-widest text-emerald-400/80">· Auto-committed</span>}
+            {isSent && !card.data.auto_committed && <span className="text-[9px] font-bold uppercase tracking-widest text-white/65">· Synced</span>}
             {isSkipped && <span className="text-[9px] uppercase tracking-widest text-white/50">· Skipped</span>}
-            {card.data.agent_notes && (
+            {(card.data.agent_notes || card.data.selection_reasoning) && (
               <button
                 onClick={() => setNotesOpen(o => !o)}
                 className="ml-auto text-[9px] text-white/40 hover:text-white/70 uppercase tracking-widest transition-colors"
@@ -277,10 +287,13 @@ function ReviewCardItem({
             )}
           </div>
 
-          {/* Agent notes panel (Option 3) */}
-          {notesOpen && card.data.agent_notes && (
-            <div className="mb-3 px-3 py-2.5 rounded-lg bg-white/[0.03] border border-white/[0.06] text-[10px] text-white/60 leading-relaxed">
-              {card.data.agent_notes}
+          {/* Agent notes panel */}
+          {notesOpen && (card.data.agent_notes || card.data.selection_reasoning) && (
+            <div className="mb-3 px-3 py-2.5 rounded-lg bg-white/[0.03] border border-white/[0.06] text-[10px] text-white/60 leading-relaxed space-y-1.5">
+              {card.data.agent_notes && <div>{card.data.agent_notes}</div>}
+              {card.data.selection_reasoning && (
+                <div className="text-blue-300/70 italic">AI reasoning: {card.data.selection_reasoning}</div>
+              )}
             </div>
           )}
 
@@ -449,9 +462,20 @@ function ReviewCardItem({
         )}
 
         {isSent && (
-          <div className="flex items-center gap-2 pt-1">
+          <div className="flex items-center gap-2 pt-1 flex-wrap">
             <span className="text-[11px] text-white/65 font-medium">Synchronized to Google Sheets</span>
-            {submitN8n && <span className="ml-auto text-[9px] text-white/50 uppercase tracking-widest">+ n8n</span>}
+            {card.data.n8n_status === 'submitted' && (
+              <span className="text-[9px] text-emerald-400/70 uppercase tracking-widest font-bold">· n8n sent</span>
+            )}
+            {card.data.n8n_status === 'submitting' && (
+              <span className="text-[9px] text-amber-400/70 uppercase tracking-widest font-bold animate-pulse">· n8n pending...</span>
+            )}
+            {card.data.n8n_status === 'failed' && (
+              <span className="text-[9px] text-red-400/70 uppercase tracking-widest font-bold">· n8n failed</span>
+            )}
+            {!card.data.n8n_status && submitN8n && (
+              <span className="ml-auto text-[9px] text-white/50 uppercase tracking-widest">+ n8n</span>
+            )}
           </div>
         )}
       </div>
@@ -464,7 +488,7 @@ function ReviewCardItem({
 // ---------------------------------------------------------------------------
 export default function FiniPage() {
   const {
-    companies, sdr, region, submitN8n,
+    companies, sdr, region, submitN8n, autoMode,
     running, threadId, error,
     reviewCards, enrichmentDone, enrichmentStats,
     enrichProgress, elapsedSecs, isSendingAll,
@@ -474,6 +498,8 @@ export default function FiniPage() {
   const setRegion      = (v: string)  => useFiniStore.setState({ region: v });
   const setSubmitN8n   = (fn: boolean | ((v: boolean) => boolean)) =>
     useFiniStore.setState(s => ({ submitN8n: typeof fn === 'function' ? fn(s.submitN8n) : fn }));
+  const setAutoMode    = (fn: boolean | ((v: boolean) => boolean)) =>
+    useFiniStore.setState(s => ({ autoMode: typeof fn === 'function' ? fn(s.autoMode) : fn }));
   const setRunning     = (v: boolean) => useFiniStore.setState({ running: v });
   const setThreadId    = (v: string | null) => useFiniStore.setState({ threadId: v });
   const setError       = (v: string | null) => useFiniStore.setState({ error: v });
@@ -500,14 +526,32 @@ export default function FiniPage() {
     setReviewCards(() => {
       const cards: ReviewCard[] = [];
       comps.forEach((c: CompanyData) => {
+        // Auto-committed companies show as already sent
+        if (c.auto_committed) {
+          cards.push({
+            data: c,
+            status: 'sent',
+            editCompanyName: c.company_name,
+            editRawName: c.raw_name,
+            editSalesNavUrl: c.sales_nav_url,
+            editDomain: c.domain,
+            editSdrAssigned: c.sdr_assigned,
+            editEmailFormat: c.email_format,
+            editAccountType: c.account_type || region || 'Global',
+            editAccountSize: c.account_size,
+          });
+          return;
+        }
+
         const candidates = c.linkedin_candidates || [];
-        const isMultiMatch = candidates.length > 1;
+        // If the backend already resolved with HIGH confidence, treat as single match
+        const alreadyResolved = c.linkedin_confidence === 'high' && c.selection_reasoning;
+        const isMultiMatch = candidates.length > 1 && !alreadyResolved;
 
         if (isMultiMatch) {
-          // Generate one card per candidate — SDR picks the right one
+          // Generate one card per candidate — each with independently enriched data
           candidates.forEach(cand => {
-            // Build Sales Nav URL for this specific candidate org
-            const navUrl = `https://www.linkedin.com/sales/search/people?query=(recentSearchParam%3A(doLogHistory%3Atrue)%2Cfilters%3AList((type%3ACURRENT_COMPANY%2Cvalues%3AList((id%3Aurn%253Ali%253Aorganization%253A${cand.org_id}%2Ctext%3A${encodeURIComponent(cand.name || cand.slug)}%2CselectionType%3AINCLUDED%2Cparent%3A(id%3A0))))))`;
+            const navUrl = cand.sales_nav_url || `https://www.linkedin.com/sales/search/people?query=(recentSearchParam%3A(doLogHistory%3Atrue)%2Cfilters%3AList((type%3ACURRENT_COMPANY%2Cvalues%3AList((id%3Aurn%253Ali%253Aorganization%253A${cand.org_id}%2Ctext%3A${encodeURIComponent(cand.name || cand.slug)}%2CselectionType%3AINCLUDED%2Cparent%3A(id%3A0))))))`;
             cards.push({
               data: { ...c, linkedin_org_id: cand.org_id, linkedin_candidates: candidates },
               status: 'pending',
@@ -516,11 +560,12 @@ export default function FiniPage() {
               editCompanyName: cand.name || c.company_name,
               editRawName: c.raw_name,
               editSalesNavUrl: navUrl,
-              editDomain: c.domain,
+              // Use per-candidate enriched data instead of cloning parent
+              editDomain: cand.domain || c.domain,
               editSdrAssigned: c.sdr_assigned,
-              editEmailFormat: c.email_format,
-              editAccountType: c.account_type || region || 'Global',
-              editAccountSize: c.account_size,
+              editEmailFormat: cand.email_format || c.email_format,
+              editAccountType: cand.account_type || c.account_type || region || 'Global',
+              editAccountSize: cand.account_size || c.account_size,
             });
           });
         } else {
@@ -574,8 +619,59 @@ export default function FiniPage() {
     } else if (msg.type === 'company_progress') {
       const { company, status } = msg.data;
       setEnrichProgress(prev => ({ ...prev, [company]: status }));
+    } else if (msg.type === 'company_enriched') {
+      // Stream card as soon as enrichment completes — don't wait for all
+      const c = msg.data as CompanyData & { card_status?: string };
+      const cardStatus = (c.card_status === 'sent' ? 'sent' : 'pending') as CardStatus;
+      const candidates = c.linkedin_candidates || [];
+      const alreadyResolved = c.linkedin_confidence === 'high' && c.selection_reasoning;
+      const isMultiMatch = candidates.length > 1 && !alreadyResolved;
+
+      setReviewCards(prev => {
+        // Don't add duplicate
+        if (prev.some(card => card.editRawName === c.raw_name)) return prev;
+
+        if (isMultiMatch) {
+          const newCards: ReviewCard[] = candidates.map(cand => ({
+            data: { ...c, linkedin_org_id: cand.org_id, linkedin_candidates: candidates },
+            status: 'pending' as CardStatus,
+            groupId: c.raw_name,
+            isCandidate: true,
+            editCompanyName: cand.name || c.company_name,
+            editRawName: c.raw_name,
+            editSalesNavUrl: cand.sales_nav_url || c.sales_nav_url,
+            editDomain: cand.domain || c.domain,
+            editSdrAssigned: c.sdr_assigned,
+            editEmailFormat: cand.email_format || c.email_format,
+            editAccountType: cand.account_type || c.account_type || region || 'Global',
+            editAccountSize: cand.account_size || c.account_size,
+          }));
+          return [...prev, ...newCards];
+        }
+
+        return [...prev, {
+          data: c,
+          status: cardStatus,
+          editCompanyName: c.company_name,
+          editRawName: c.raw_name,
+          editSalesNavUrl: c.sales_nav_url,
+          editDomain: c.domain,
+          editSdrAssigned: c.sdr_assigned,
+          editEmailFormat: c.email_format,
+          editAccountType: c.account_type || region || 'Global',
+          editAccountSize: c.account_size,
+        }];
+      });
+    } else if (msg.type === 'n8n_status') {
+      // Update n8n badge on the card
+      const { raw_name, status: n8nStatus } = msg.data;
+      setReviewCards(prev => prev.map(card =>
+        card.editRawName === raw_name
+          ? { ...card, data: { ...card.data, n8n_status: n8nStatus } }
+          : card
+      ));
     }
-  }, [applyCompletedData]);
+  }, [applyCompletedData, region]);
 
   // Fallback: if WS closes without delivering the completed event, poll REST
   useEffect(() => {
@@ -645,6 +741,7 @@ export default function FiniPage() {
           sdr: sdr.trim(),
           region: region.trim(),
           submit_n8n: submitN8n,
+          auto_mode: autoMode,
         }),
       });
       const data = await resp.json();
@@ -805,10 +902,10 @@ export default function FiniPage() {
           {useFiniStore.getState().cancelled && !running && (
             <span className="text-[9px] font-bold text-red-400/70 uppercase tracking-widest">Stopped</span>
           )}
-          {enrichmentDone && enrichmentStats && (
+          {reviewCards.length > 0 && (
             <div className="flex items-center gap-3">
               <div className="text-right">
-                <div className="text-xs font-bold text-white">{enrichmentStats.processed}</div>
+                <div className="text-xs font-bold text-white">{reviewCards.length}</div>
                 <div className="text-[9px] text-white/50 uppercase tracking-widest">Processed</div>
               </div>
               <div className="h-4 w-[1px] bg-white/10" />
@@ -871,6 +968,16 @@ export default function FiniPage() {
                 </button>
                 <span className="text-[10px] text-white/60">n8n Relay</span>
               </div>
+              <div className="flex items-center gap-2.5">
+                <button
+                  onClick={() => setAutoMode(v => !v)}
+                  disabled={running}
+                  className={`relative w-8 h-4 rounded-full transition-all duration-300 ${autoMode ? 'bg-emerald-400/80' : 'bg-white/10'}`}
+                >
+                  <div className={`absolute top-[2px] w-3 h-3 rounded-full shadow-sm transition-all duration-300 ${autoMode ? 'left-[18px] bg-black' : 'left-[2px] bg-white/40'}`} />
+                </button>
+                <span className="text-[10px] text-white/60">Auto Mode</span>
+              </div>
               <button
                 id="fini-run-btn"
                 onClick={handleRun}
@@ -909,7 +1016,7 @@ export default function FiniPage() {
             {companyList.length > 0 && !enrichmentDone && (
               <span className="text-[10px] font-bold text-white/55 uppercase tracking-widest">{companyList.length} queued</span>
             )}
-            {enrichmentDone && enrichmentStats && (
+            {reviewCards.length > 0 && (
               <div className="flex items-center gap-4 text-right">
                 <div><div className="text-sm font-bold text-white">{matchedCount}</div><div className="text-[9px] text-white/60 uppercase tracking-widest">Matched</div></div>
                 <div className="h-4 w-[1px] bg-white/10" />
@@ -1019,7 +1126,7 @@ export default function FiniPage() {
       </div>
 
       {/* ── Verify & Commit — full-width section below the grid ── */}
-      {enrichmentDone && reviewCards.length > 0 && (
+      {reviewCards.length > 0 && (
         <div className="mt-6 border border-white/[0.07] rounded-2xl bg-white/[0.02] overflow-hidden">
 
           {/* Section header + Send All */}

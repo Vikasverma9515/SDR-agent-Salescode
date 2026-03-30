@@ -25,7 +25,7 @@ from backend.utils.logging import get_logger
 logger = get_logger("llm")
 
 # Global semaphore — limits concurrent OpenAI/Bedrock calls across all companies
-_LLM_CONCURRENCY = 2
+_LLM_CONCURRENCY = 8
 _llm_semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
 
 # Circuit breaker — if OpenAI fails 2 times within 60s, switch to Bedrock permanently for this process

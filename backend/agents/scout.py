@@ -764,6 +764,46 @@ async def synthesize(state: ScoutState) -> dict:
     except Exception as e:
         logger.warning("scout_synthesis_parse_error", error=str(e))
 
+    # ── Post-synthesis enrichment ───────────────────────────────────────────
+    # Candidates from Perplexity text (not LinkedIn search) may reach here
+    # without linkedin_url or email.  Fill them in now so they reach the sheet.
+    org_id       = state.get("company_org_id", "")
+    email_format = state.get("email_format", "")
+    domain       = company_domain
+
+    async def _post_enrich(cand: dict) -> None:
+        # 1. Missing LinkedIn URL → name-based search
+        if not cand.get("linkedin_url") and cand.get("full_name"):
+            try:
+                from backend.tools.unipile import search_person_by_name
+                results = await _safe(
+                    search_person_by_name(cand["full_name"], org_id=org_id, limit=5),
+                    timeout=10, default=[], label="post_synth_li_search",
+                )
+                for p in results:
+                    if _names_match(p.get("full_name", ""), cand["full_name"]):
+                        cand["linkedin_url"] = p.get("linkedin_url", "")
+                        cand["linkedin_verified"] = True
+                        cand["source"] = "linkedin"
+                        logger.info("scout_post_synth_li_found", name=cand["full_name"], url=cand["linkedin_url"])
+                        break
+            except Exception as e:
+                logger.warning("scout_post_synth_li_error", name=cand.get("full_name"), error=str(e))
+
+        # 2. Missing email → generate from email_format + domain
+        if not cand.get("email") and cand.get("full_name") and (email_format or domain):
+            first, last = _parse_name(cand["full_name"])
+            email = _apply_email_format(email_format, first, last, domain)
+            if email and "@" in email:
+                cand["email"] = email
+                logger.info("scout_post_synth_email_gen", name=cand["full_name"], email=email)
+
+    needs_enrichment = [c for c in candidates if not c.get("linkedin_url") or not c.get("email")]
+    if needs_enrichment:
+        logger.info("scout_post_synth_enriching", count=len(needs_enrichment))
+        await asyncio.gather(*[_post_enrich(c) for c in needs_enrichment], return_exceptions=True)
+    # ────────────────────────────────────────────────────────────────────────
+
     # Fallback message
     if not message:
         if candidates:
@@ -903,6 +943,16 @@ async def commit_to_sheet(candidate: dict, company_context: dict | None = None) 
     buying_role  = candidate.get("buying_role") or _buying_role(role_title)
     linkedin_url = candidate.get("linkedin_url", "")
     email        = candidate.get("email", "")
+
+    # Safety net: generate email at commit time if still missing
+    domain = ctx.get("domain", "")
+    if not email and full_name and domain:
+        # Try basic firstname.lastname@domain pattern as fallback
+        f = re.sub(r"[^a-z]", "", _normalize(first))
+        l = re.sub(r"[^a-z]", "", _normalize(last))
+        if f and l:
+            email = f"{f}.{l}@{domain}"
+            logger.info("scout_commit_email_fallback", name=full_name, email=email)
 
     # Write cols A–N to Final Filtered List so Veri picks it up for full verification
     row = [

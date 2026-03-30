@@ -27,6 +27,7 @@ class FiniRunRequest(BaseModel):
     sdr: str = ""
     submit_n8n: bool = False
     region: str = ""  # e.g. "India", "LATAM", "Southeast Asia"
+    auto_mode: bool = False  # When True: auto-commit high-confidence, pause on ambiguous
 
 class SearcherRunRequest(BaseModel):
     # Comma-separated company names (must already exist in Target Accounts)
@@ -613,8 +614,12 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
     from backend.utils.progress import register as _reg_progress
 
     company_names = [c.strip() for c in req.companies.split(",") if c.strip()]
-    companies = [TargetCompany(raw_name=name, sdr_assigned=req.sdr or None) for name in company_names]
-    state = FiniState(companies=companies, submit_to_n8n=req.submit_n8n, region=req.region, thread_id=thread_id)
+    sdr = req.sdr.strip() or "Amy"
+    companies = [TargetCompany(raw_name=name, sdr_assigned=sdr) for name in company_names]
+    state = FiniState(
+        companies=companies, submit_to_n8n=req.submit_n8n, region=req.region,
+        thread_id=thread_id, auto_mode=req.auto_mode, sdr_name=sdr,
+    )
     config = {"configurable": {"thread_id": thread_id}}
 
     # Register queue so fini.py can emit per-company progress events
@@ -660,6 +665,8 @@ async def _fini_task(thread_id: str, req: FiniRunRequest):
                         "size_confidence": c.size_confidence,
                         "agent_notes": c.agent_notes,
                         "linkedin_candidates": c.linkedin_candidates,
+                        "auto_committed": c.auto_committed,
+                        "selection_reasoning": c.selection_reasoning,
                     }
                     for c in state.companies
                 ]

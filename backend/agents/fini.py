@@ -951,7 +951,7 @@ async def _smart_company_lookup(raw_name: str, region: str = "") -> dict:
             f"Example: {{\"company_type\":\"distributor\",\"clean_name\":\"Atocha Vallecas\","
             f"\"primary_slug\":\"atocha-vallecas\",\"alt_slugs\":[\"atocha-vallecas-sl\"],"
             f"\"parent_brand\":\"Mahou\",\"country\":\"ES\",\"has_own_page\":\"maybe\"}}",
-            max_tokens=350,
+            model="gpt-4.1", max_tokens=350,
         )
         # Strip markdown fences if present
         cleaned_raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', (analysis_raw or "").strip())
@@ -1104,7 +1104,7 @@ async def _llm_validate_linkedin_matches(target_company: str, candidates: list[d
         f'[{{"index": 0, "match_type": "EXACT", "reason": "..."}}]\n'
     )
     
-    response = await llm_complete(prompt, max_tokens=1000, temperature=0)
+    response = await llm_complete(prompt, model="gpt-4.1", max_tokens=1000, temperature=0)
     exact, parent, invalid = [], [], []
     try:
         match = _re.search(r'\[.*?\]', response, _re.DOTALL)
@@ -1329,6 +1329,7 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
                 "name": kr["name"],
                 "slug": kr.get("public_identifier", ""),
                 "how": "keyword_search",
+                "website": kr.get("website", ""),
             })
             if not org_id:
                 org_id = kr["org_id"]
@@ -1623,39 +1624,341 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
                 org_id=org_id or "(none)", region=effective_region or "(none)",
                 confidence=linkedin_confidence, link_not_found=link_not_found)
 
-    # --- Step 3: Domain + email format ---
-    await _log(f"[{company.raw_name}] discovering domain + email format")
-    domain_confidence = "low"
-    email_confidence = "low"
-    try:
-        name = company.normalized_name or company.raw_name
-        domain_info = await discover_domain(name)
-        if domain_info["domain"]:
-            dc = domain_info.get("confidence", "medium")
-            domain_confidence = dc
-            # email confidence matches domain confidence if format was probed, else low
-            email_confidence = dc if domain_info["email_format"] and "@" in domain_info["email_format"] else "low"
-            if email_confidence == "low" and domain_info["email_format"]:
-                email_confidence = "medium"  # default pattern but domain is known
-        company = company.model_copy(update={
-            "domain": domain_info["domain"],
-            "email_format": domain_info["email_format"],
-            "domain_confidence": domain_confidence,
-            "email_confidence": email_confidence,
-        })
-        if domain_info["domain"]:
-            notes_parts.append(f"Domain '{domain_info['domain']}' found ({domain_confidence} confidence).")
-            await _log(f"[{company.raw_name}] domain: {domain_info['domain']} · email: {domain_info.get('email_format') or 'unknown'}")
-        else:
-            notes_parts.append("Could not determine company domain.")
-    except Exception as e:
-        logger.warning("enrich_domain_error", company=company.raw_name, error=str(e))
-        notes_parts.append("Domain lookup failed.")
+    # --- Step 3: Per-candidate independent enrichment ---
+    # Each LinkedIn candidate is a DIFFERENT company — enrich domain/email/size independently.
 
-    # ---- Account size confidence ----
+    # Filter out likely LinkedIn Showcase Pages before enriching.
+    # Showcase pages (e.g. "Rippling IT", "Rippling Spend") are product sub-pages that
+    # don't exist in Sales Navigator's company filter — enriching them wastes API calls.
+    _raw_lower = re.sub(r'[^a-z0-9]', '', company.raw_name.lower())
+    _filtered_matches: list[dict] = []
+    _showcase_names: list[str] = []
+    for _m in all_linkedin_matches:
+        _m_name = (_m.get("name") or "").strip()
+        _m_lower = re.sub(r'[^a-z0-9]', '', _m_name.lower())
+        # A showcase page typically has the parent name as a prefix + extra word(s)
+        # e.g. "Rippling IT" starts with "Rippling" but is longer.
+        # Only flag as showcase if there's ALSO an exact match in the list.
+        is_potential_showcase = (
+            _m_lower != _raw_lower  # not exact match
+            and _m_lower.startswith(_raw_lower)  # starts with search term
+            and len(_m_lower) > len(_raw_lower) + 2  # has meaningful suffix
+        )
+        if is_potential_showcase and any(
+            re.sub(r'[^a-z0-9]', '', (x.get("name") or "").lower()) == _raw_lower
+            for x in all_linkedin_matches
+        ):
+            _showcase_names.append(_m_name)
+        else:
+            _filtered_matches.append(_m)
+
+    if _showcase_names:
+        await _log(f"[{company.raw_name}] filtered {len(_showcase_names)} showcase pages: {', '.join(_showcase_names)}")
+        logger.info("enrich_filtered_showcases", company=company.raw_name, showcases=_showcase_names)
+
+    # Optimization: if one candidate is a clear exact name match, only fully enrich that one
+    # and do lightweight enrichment (just Sales Nav URL) for the rest.
+    enriched_candidates: list[dict] = []
+    _exact_name_matches = [
+        c for c in _filtered_matches
+        if re.sub(r'[^a-z0-9]', '', (c.get("name") or "").lower()) == _raw_lower
+    ]
+    if len(_exact_name_matches) == 1 and len(_filtered_matches) > 1:
+        # One clear exact match — only fully enrich that one, others get Sales Nav URL only
+        primary = _exact_name_matches[0]
+        candidates_to_enrich = [primary]
+        lightweight_candidates = [c for c in _filtered_matches if c is not primary][:4]
+    else:
+        candidates_to_enrich = _filtered_matches[:3]  # cap at 3 to avoid API waste
+        lightweight_candidates = _filtered_matches[3:5]
+
+    if candidates_to_enrich:
+        await _log(f"[{company.raw_name}] enriching {len(candidates_to_enrich)} candidate(s)"
+                   + (f" + {len(lightweight_candidates)} lightweight" if lightweight_candidates else ""))
+
+        async def _enrich_candidate(cand: dict) -> dict:
+            """Enrich a single LinkedIn candidate with domain, email, size."""
+            cand_name = cand.get("name") or company.normalized_name or company.raw_name
+            cand_org_id = cand.get("org_id")
+            cand_enriched = {**cand}  # copy original fields
+
+            # Build Sales Nav URL for this candidate.
+            _use_org_id = cand_org_id
+            _use_org_name = cand_name
+            _use_region = effective_region or ""
+
+            # For regional branches / distributors, use the PARENT company's org_id
+            # since the branch page often has 0 employees in Sales Navigator.
+            _ctype = smart.get("company_type", "")
+            _parent = smart.get("parent_brand", "")
+            if _ctype in ("regional_branch", "distributor", "subsidiary") and _parent and cand_org_id:
+                try:
+                    parent_org = await unipile.get_company_org_id(_parent)
+                    if parent_org.get("org_id"):
+                        _use_org_id = parent_org["org_id"]
+                        _use_org_name = parent_org.get("name") or _parent
+                        await _log(f"[{company.raw_name}] using parent org ({_parent}) for Sales Nav")
+                except Exception:
+                    pass
+
+            # Check employee count in region — if < 400, drop region filter
+            if _use_org_id and _use_region:
+                _region_key = _use_region.strip().lower()
+                _region_id = REGION_IDS.get(_region_key, "")
+                if _region_id:
+                    try:
+                        regional_count = await unipile.count_employees_in_region(
+                            _use_org_id, _region_id
+                        )
+                        if regional_count < 400:
+                            await _log(
+                                f"[{company.raw_name}] {regional_count} people in {_use_region} "
+                                f"(< 400) — removing region filter"
+                            )
+                            _use_region = ""
+                        else:
+                            await _log(f"[{company.raw_name}] {regional_count} people in {_use_region} — keeping filter")
+                    except Exception:
+                        pass  # on error, keep the region filter
+
+            if _use_org_id:
+                cand_enriched["sales_nav_url"] = _build_sales_nav_url(
+                    _use_org_id, _use_org_name, _use_region
+                )
+
+            # Domain + email format
+            try:
+                # Pass company context — includes LinkedIn slug so domain discovery
+                # can fetch the domain directly from LinkedIn (fastest path).
+                _domain_ctx = {
+                    "company_type": smart.get("company_type"),
+                    "parent_brand": smart.get("parent_brand"),
+                    "region": effective_region,
+                    "linkedin_slug": cand.get("public_identifier") or cand.get("slug") or "",
+                    "org_id": cand.get("org_id") or "",
+                }
+
+                # Fast path: if LinkedIn keyword search already returned the website, use it
+                _linkedin_website = (cand.get("website") or "").strip()
+                if _linkedin_website:
+                    _linkedin_website = re.sub(r'^https?://(?:www\.)?', '', _linkedin_website)
+                    _linkedin_website = re.sub(r'^www\.', '', _linkedin_website)
+                    _linkedin_website = _linkedin_website.split('/')[0].strip().lower()
+
+                # --- Find domain — no tight timeouts, let each step complete ---
+                found_domain = None
+
+                if _linkedin_website and re.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}$', _linkedin_website):
+                    found_domain = _linkedin_website
+                    await _log(f"[{company.raw_name}] {cand_name}: domain from LinkedIn = {found_domain}")
+                else:
+                    # Full discovery: LinkedIn page → GPT web search → Perplexity → email probing
+                    d_info = await discover_domain(cand_name, context=_domain_ctx)
+                    found_domain = d_info.get("domain")
+                    if d_info.get("email_format") and "@" in d_info["email_format"]:
+                        cand_enriched["_email_from_discovery"] = d_info["email_format"]
+
+                # Parent fallback if no domain found
+                if not found_domain and smart.get("parent_brand"):
+                    parent_name = smart["parent_brand"]
+                    await _log(f"[{company.raw_name}] no domain for {cand_name}, trying parent: {parent_name}")
+                    d_info = await discover_domain(parent_name, context=_domain_ctx)
+                    found_domain = d_info.get("domain")
+                    if found_domain:
+                        await _log(f"[{company.raw_name}] using parent domain: {found_domain}")
+                        if d_info.get("email_format") and "@" in d_info["email_format"]:
+                            cand_enriched["_email_from_discovery"] = d_info["email_format"]
+
+                # --- Probe email format if not already found ---
+                email_fmt = cand_enriched.pop("_email_from_discovery", None)
+                if found_domain and not email_fmt:
+                    try:
+                        from backend.tools.domain_discovery import _probe_email_format
+                        email_fmt = await _probe_email_format(cand_name, found_domain)
+                    except Exception as e:
+                        logger.warning("email_probe_error", candidate=cand_name, error=str(e))
+
+                if not email_fmt and found_domain:
+                    email_fmt = f"{{first}}.{{last}}@{found_domain}"
+
+                d_info = {
+                    "domain": found_domain,
+                    "email_format": email_fmt,
+                    "confidence": "high" if (email_fmt and found_domain) else ("medium" if found_domain else "low"),
+                }
+
+                cand_enriched["domain"] = d_info["domain"]
+                cand_enriched["email_format"] = d_info["email_format"]
+                dc = d_info.get("confidence", "low")
+                cand_enriched["domain_confidence"] = dc
+                ec = dc if d_info["email_format"] and "@" in d_info["email_format"] else "low"
+                if ec == "low" and d_info["email_format"]:
+                    ec = "medium"
+                cand_enriched["email_confidence"] = ec
+                if d_info["domain"]:
+                    await _log(f"[{company.raw_name}] {cand_name}: domain={d_info['domain']} · email={d_info.get('email_format') or '?'}")
+                else:
+                    await _log(f"[{company.raw_name}] {cand_name}: no domain found")
+            except Exception as e:
+                logger.warning("enrich_candidate_domain_error", candidate=cand_name, error=str(e))
+                cand_enriched["domain"] = None
+                cand_enriched["email_format"] = None
+                cand_enriched["domain_confidence"] = "low"
+                cand_enriched["email_confidence"] = "low"
+
+            # Account size
+            try:
+                cand_enriched["account_size"] = await _fetch_account_size(cand_name)
+                sc = "medium" if cand_enriched["account_size"] and cand_enriched["account_size"] != "Medium" else "low"
+                cand_enriched["size_confidence"] = sc
+            except Exception:
+                cand_enriched["account_size"] = "Medium"
+                cand_enriched["size_confidence"] = "low"
+
+            # Account type (region)
+            cand_enriched["account_type"] = effective_region.title() if effective_region else "Global"
+
+            return cand_enriched
+
+        # Enrich all candidates in parallel
+        enrich_tasks = [_enrich_candidate(c) for c in candidates_to_enrich]
+        enrich_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
+        for i, result in enumerate(enrich_results):
+            if isinstance(result, Exception):
+                logger.warning("enrich_candidate_failed", candidate=candidates_to_enrich[i].get("name"), error=str(result))
+                enriched_candidates.append({**candidates_to_enrich[i], "domain": None, "email_format": None})
+            else:
+                enriched_candidates.append(result)
+
+        # Add lightweight candidates (Sales Nav URL only — no domain/email probing)
+        for lc in lightweight_candidates:
+            lc_name = lc.get("name") or company.raw_name
+            lc_enriched = {**lc}
+            if lc.get("org_id"):
+                lc_enriched["sales_nav_url"] = _build_sales_nav_url(
+                    lc["org_id"], lc_name, effective_region or ""
+                )
+            lc_enriched["domain"] = None
+            lc_enriched["email_format"] = None
+            lc_enriched["account_size"] = None
+            lc_enriched["account_type"] = effective_region.title() if effective_region else "Global"
+            enriched_candidates.append(lc_enriched)
+    else:
+        # No LinkedIn matches — do single domain discovery with normalized name
+        await _log(f"[{company.raw_name}] no LinkedIn matches — discovering domain for raw name")
+        try:
+            name = company.normalized_name or company.raw_name
+            domain_info = await discover_domain(name)
+            company = company.model_copy(update={
+                "domain": domain_info["domain"],
+                "email_format": domain_info["email_format"],
+                "domain_confidence": domain_info.get("confidence", "low"),
+                "email_confidence": "medium" if domain_info["email_format"] else "low",
+            })
+            if domain_info["domain"]:
+                notes_parts.append(f"Domain '{domain_info['domain']}' found.")
+                await _log(f"[{company.raw_name}] domain: {domain_info['domain']}")
+        except Exception as e:
+            logger.warning("enrich_domain_error", company=company.raw_name, error=str(e))
+            notes_parts.append("Domain lookup failed.")
+
+    # --- Step 4: LLM reasoning — pick the best candidate ---
+    selection_reasoning = None
+    if len(enriched_candidates) >= 1:
+        from backend.tools.llm import llm_complete as _llm_pick
+
+        # Build context for the LLM
+        cand_lines = []
+        for i, ec in enumerate(enriched_candidates):
+            cand_lines.append(
+                f"{i}. \"{ec.get('name')}\" — org_id={ec.get('org_id')}, "
+                f"domain={ec.get('domain') or '?'}, size={ec.get('account_size') or '?'}, "
+                f"match_method={ec.get('how', '?')}"
+            )
+        cand_text = "\n".join(cand_lines)
+
+        pick_prompt = (
+            f"You are a B2B sales research AI. A user searched for the company: \"{company.raw_name}\"\n\n"
+            f"LinkedIn returned these candidates, each independently enriched:\n{cand_text}\n\n"
+            f"TASK: Decide which candidate is the BEST match for \"{company.raw_name}\".\n\n"
+            f"RULES:\n"
+            f"- Pick the candidate whose name most closely matches the user's search intent.\n"
+            f"- Prefer candidates with a confirmed domain over those without.\n"
+            f"- If the search term is generic (e.g. 'yellow'), pick the most prominent/well-known company.\n"
+            f"- If there's a clear exact match, mark confidence as HIGH.\n"
+            f"- If ambiguous (multiple plausible matches), mark confidence as LOW and explain why.\n\n"
+            f"Return ONLY a JSON object (no markdown):\n"
+            f'{{"best_index": 0, "confidence": "HIGH"|"LOW", '
+            f'"reasoning": "2-3 sentence explanation of your choice and why others were rejected"}}'
+        )
+
+        try:
+            await _log(f"[{company.raw_name}] reasoning about {len(enriched_candidates)} candidates...")
+            pick_raw = await _llm_pick(pick_prompt, model="gpt-4.1", max_tokens=300, temperature=0)
+            pick_cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', (pick_raw or "").strip())
+            import json as _json
+            pick_data = _json.loads(pick_cleaned)
+            best_idx = int(pick_data.get("best_index", 0))
+            pick_confidence = pick_data.get("confidence", "LOW").upper()
+            selection_reasoning = pick_data.get("reasoning", "")
+
+            if 0 <= best_idx < len(enriched_candidates):
+                best = enriched_candidates[best_idx]
+            else:
+                best = enriched_candidates[0]
+                pick_confidence = "LOW"
+
+            await _log(
+                f"[{company.raw_name}] best match: \"{best.get('name')}\" "
+                f"(confidence: {pick_confidence}) — {selection_reasoning}",
+                "success" if pick_confidence == "HIGH" else "info",
+            )
+
+            # Apply the best candidate's data to the company
+            org_id = best.get("org_id")
+            company = company.model_copy(update={
+                "linkedin_org_id": org_id,
+                "sales_nav_url": best.get("sales_nav_url") or company.sales_nav_url,
+                "domain": best.get("domain"),
+                "email_format": best.get("email_format"),
+                "domain_confidence": best.get("domain_confidence", "low"),
+                "email_confidence": best.get("email_confidence", "low"),
+                "account_size": best.get("account_size") or company.account_size,
+                "account_type": best.get("account_type") or company.account_type,
+                "linkedin_confidence": "high" if pick_confidence == "HIGH" else "medium",
+                "linkedin_candidates": enriched_candidates,
+                "selection_reasoning": selection_reasoning,
+            })
+
+            # Determine auto-commit eligibility
+            is_auto_eligible = (
+                pick_confidence == "HIGH"
+                and best.get("domain")
+                and company.linkedin_org_id
+            )
+            if is_auto_eligible:
+                notes_parts.append(f"Auto-eligible: high-confidence match for \"{best.get('name')}\".")
+            else:
+                notes_parts.append(f"Needs review: {selection_reasoning}")
+
+        except Exception as e:
+            logger.warning("llm_pick_failed", company=company.raw_name, error=str(e))
+            # Fallback: use first candidate
+            if enriched_candidates:
+                best = enriched_candidates[0]
+                company = company.model_copy(update={
+                    "domain": best.get("domain"),
+                    "email_format": best.get("email_format"),
+                    "domain_confidence": best.get("domain_confidence", "low"),
+                    "email_confidence": best.get("email_confidence", "low"),
+                    "account_size": best.get("account_size") or company.account_size,
+                    "linkedin_candidates": enriched_candidates,
+                })
+            notes_parts.append("LLM candidate selection failed — using first match.")
+
+    # ---- Final assembly ----
     account_size = company.account_size
     size_confidence = "medium" if account_size and account_size != "Medium" else "low"
-
     agent_notes = " ".join(notes_parts) if notes_parts else None
 
     company = company.model_copy(update={
@@ -1669,7 +1972,8 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
         normalized=company.normalized_name,
         org_id=company.linkedin_org_id or "(none)",
         domain=company.domain or "(none)",
-        linkedin_confidence=linkedin_confidence,
+        linkedin_confidence=company.linkedin_confidence,
+        candidates=len(enriched_candidates),
         agent_notes=agent_notes,
     )
     return company
@@ -1694,31 +1998,114 @@ async def _enrich_with_progress(company: TargetCompany, region: str, thread_id: 
 
 async def parallel_enrich_all(state: FiniState) -> FiniState:
     """
-    Enrich ALL companies concurrently.
-    Returns the enriched list for frontend review.
+    Enrich companies with controlled parallelism (3 at a time).
+    Streams each card to the frontend as soon as it completes.
+    Auto-commits high-confidence matches to sheet + n8n immediately.
     """
     if state.enrichment_done:
         return state
 
-    logger.info("fini_parallel_enrich_start", count=len(state.companies))
+    total = len(state.companies)
+    logger.info("fini_enrich_start", count=total, auto_mode=state.auto_mode)
+    from backend.utils.progress import emit_log as _emit_log
 
-    tasks = [
-        _enrich_with_progress(company, state.region, state.thread_id)
-        for company in state.companies
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    _CONCURRENCY = 3
+    sem = asyncio.Semaphore(_CONCURRENCY)
+    await _emit_log(state.thread_id,
+                    f"Enriching {total} companies ({_CONCURRENCY} at a time)...")
 
     companies = list(state.companies)
-    errors = []
+    errors: list[str] = []
+    _completed = {"count": 0, "auto": 0, "review": 0}
+    _lock = asyncio.Lock()
+    # Background n8n tasks — fire and forget, don't block enrichment
+    _n8n_tasks: list[asyncio.Task] = []
 
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            errors.append(f"Enrichment failed for {companies[i].raw_name}: {result}")
-            logger.error("enrich_company_failed", company=companies[i].raw_name, error=str(result))
-        else:
-            companies[i] = result
+    async def _process_one(i: int, company: TargetCompany) -> None:
+        async with sem:
+            # --- Enrich ---
+            try:
+                result = await _enrich_with_progress(company, state.region, state.thread_id)
+                async with _lock:
+                    companies[i] = result
+            except Exception as e:
+                async with _lock:
+                    errors.append(f"{company.raw_name}: {e}")
+                logger.error("enrich_company_failed", company=company.raw_name, error=str(e))
+                await _emit_log(state.thread_id,
+                                f"[{company.raw_name}] failed: {e}", "error")
+                # Stream error card
+                await _emit_enriched_card(state.thread_id, companies[i], "error")
+                return
 
-    logger.info("fini_parallel_enrich_done", count=len(companies), errors=len(errors))
+            comp = companies[i]
+            async with _lock:
+                _completed["count"] += 1
+                done = _completed["count"]
+
+            # --- Stream card to frontend immediately ---
+            is_auto_eligible = (
+                state.auto_mode
+                and comp.linkedin_confidence == "high"
+                and comp.domain
+                and comp.linkedin_org_id
+                and comp.sales_nav_url
+            )
+
+            if is_auto_eligible:
+                # Auto-commit to sheet
+                try:
+                    row_num = await _auto_commit_to_sheet(comp, state.sdr_name, state.region)
+                    async with _lock:
+                        companies[i] = comp.model_copy(update={
+                            "auto_committed": True,
+                            "sheet_row_written": True,
+                        })
+                        comp = companies[i]
+                        _completed["auto"] += 1
+                    await _emit_log(state.thread_id,
+                                    f"[{comp.raw_name}] auto-committed to sheet row {row_num} ({done}/{total})",
+                                    "success")
+
+                    # n8n trigger in background (non-blocking)
+                    if state.submit_to_n8n:
+                        task = asyncio.create_task(
+                            _background_n8n_submit(comp, row_num, state.sdr_name, state.thread_id)
+                        )
+                        _n8n_tasks.append(task)
+
+                except Exception as e:
+                    logger.warning("auto_commit_failed", company=comp.raw_name, error=str(e))
+                    await _emit_log(state.thread_id,
+                                    f"[{comp.raw_name}] auto-commit failed: {e}", "warning")
+            else:
+                async with _lock:
+                    _completed["review"] += 1
+                reason = comp.selection_reasoning or "needs review"
+                await _emit_log(state.thread_id,
+                                f"[{comp.raw_name}] needs review — {reason} ({done}/{total})",
+                                "info")
+
+            # Stream the card to frontend
+            await _emit_enriched_card(state.thread_id, comp, "sent" if comp.auto_committed else "pending")
+
+    # Launch all tasks with semaphore controlling concurrency
+    tasks = [_process_one(i, c) for i, c in enumerate(companies)]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Wait for any background n8n tasks to finish
+    if _n8n_tasks:
+        await _emit_log(state.thread_id,
+                        f"Waiting for {len(_n8n_tasks)} n8n submissions to complete...")
+        await asyncio.gather(*_n8n_tasks, return_exceptions=True)
+
+    auto_n = _completed["auto"]
+    review_n = _completed["review"]
+    await _emit_log(state.thread_id,
+                    f"Done. {auto_n} auto-committed, {review_n} need review, {len(errors)} errors.",
+                    "success")
+
+    logger.info("fini_enrich_done", count=total, auto=auto_n, review=review_n, errors=len(errors))
 
     return state.model_copy(update={
         "companies": companies,
@@ -1726,6 +2113,116 @@ async def parallel_enrich_all(state: FiniState) -> FiniState:
         "status": "completed",
         "errors": errors,
     })
+
+
+async def _emit_enriched_card(thread_id: str | None, comp: TargetCompany, card_status: str):
+    """Emit a company_enriched event so the frontend can show the card immediately."""
+    if not thread_id:
+        return
+    from backend.utils.progress import _queues
+    q = _queues.get(thread_id)
+    if not q:
+        return
+    from datetime import datetime, timezone
+    try:
+        await q.put({
+            "type": "company_enriched",
+            "data": {
+                "raw_name": comp.raw_name,
+                "company_name": comp.normalized_name or comp.raw_name,
+                "sales_nav_url": comp.sales_nav_url or "",
+                "domain": comp.domain or "",
+                "sdr_assigned": comp.sdr_assigned or "",
+                "email_format": comp.email_format or "",
+                "account_type": comp.account_type or "",
+                "account_size": comp.account_size or "",
+                "linkedin_org_id": comp.linkedin_org_id or "",
+                "linkedin_confidence": comp.linkedin_confidence,
+                "domain_confidence": comp.domain_confidence,
+                "email_confidence": comp.email_confidence,
+                "size_confidence": comp.size_confidence,
+                "agent_notes": comp.agent_notes,
+                "linkedin_candidates": comp.linkedin_candidates,
+                "auto_committed": comp.auto_committed,
+                "selection_reasoning": comp.selection_reasoning,
+                "card_status": card_status,  # "sent" | "pending" | "error"
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+async def _background_n8n_submit(comp: TargetCompany, row_num: int, sdr_name: str, thread_id: str | None):
+    """Submit to n8n in background — doesn't block enrichment of other companies."""
+    from backend.utils.progress import emit_log as _emit_log
+    try:
+        await _emit_log(thread_id, f"[{comp.raw_name}] n8n: submitting...", "info")
+        await _auto_submit_n8n(comp, row_num, sdr_name)
+        await _emit_log(thread_id, f"[{comp.raw_name}] n8n: submitted", "success")
+        # Emit update so frontend can mark n8n status
+        await _emit_n8n_status(thread_id, comp.raw_name, "submitted")
+    except Exception as e:
+        logger.warning("background_n8n_failed", company=comp.raw_name, error=str(e))
+        await _emit_log(thread_id, f"[{comp.raw_name}] n8n: failed — {e}", "warning")
+        await _emit_n8n_status(thread_id, comp.raw_name, "failed")
+
+
+async def _emit_n8n_status(thread_id: str | None, raw_name: str, status: str):
+    """Emit n8n status update so frontend can update the card badge."""
+    if not thread_id:
+        return
+    from backend.utils.progress import _queues
+    q = _queues.get(thread_id)
+    if not q:
+        return
+    from datetime import datetime, timezone
+    try:
+        await q.put({
+            "type": "n8n_status",
+            "data": {"raw_name": raw_name, "status": status},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+async def _auto_commit_to_sheet(company: TargetCompany, sdr_name: str, region: str) -> int:
+    """Write an auto-committed company to the Target Accounts sheet. Returns row number."""
+    from backend.tools import sheets
+
+    row_data = [
+        company.normalized_name or company.raw_name,  # A: Company Name
+        company.raw_name,                              # B: Parent/Raw Name
+        company.sales_nav_url or "",                   # C: Sales Navigator Link
+        company.domain or "",                          # D: Company Domain
+        sdr_name or "",                                # E: SDR Name
+        company.email_format or "",                    # F: Email Format
+        company.account_type or region or "Global",    # G: Account Type
+        company.account_size or "Medium",              # H: Account Size
+        "",                                            # I: (reserved)
+        "",                                            # J: n8n status
+    ]
+    written_row = await sheets.append_row(sheets.TARGET_ACCOUNTS, row_data)
+    return written_row
+
+
+async def _auto_submit_n8n(company: TargetCompany, row_num: int, sdr_name: str):
+    """Submit auto-committed company to n8n webhook."""
+    from backend.tools.n8n import submit_to_n8n, build_payload
+
+    payload = build_payload(
+        row=row_num,
+        company_name=company.normalized_name or company.raw_name,
+        parent_company_name=company.raw_name,
+        sales_nav_url=company.sales_nav_url or "",
+        domain=company.domain or "",
+        sdr_assigned=sdr_name or "",
+        email_format=company.email_format or "",
+        account_type=company.account_type or "Global",
+        account_size=company.account_size or "Medium",
+    )
+    await submit_to_n8n(payload)
 
 
 # ---------------------------------------------------------------------------

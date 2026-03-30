@@ -39,8 +39,15 @@ class TargetCompany(BaseModel):
     # Human-readable notes from the agent explaining what was found / any ambiguity
     agent_notes: str | None = None
 
-    # Top LinkedIn candidate matches (for Option 5 — user picks the right one)
-    linkedin_candidates: list[dict] = Field(default_factory=list)  # [{org_id, name, slug}]
+    # Top LinkedIn candidate matches — each candidate is independently enriched
+    # [{org_id, name, slug, how, domain, email_format, account_size, account_type,
+    #   sales_nav_url, domain_confidence, email_confidence, size_confidence}]
+    linkedin_candidates: list[dict] = Field(default_factory=list)
+
+    # Auto-mode: was this company auto-committed without human review?
+    auto_committed: bool = False
+    # LLM reasoning explaining why a particular candidate was chosen (shown in frontend)
+    selection_reasoning: str | None = None
 
 
 class Contact(BaseModel):
@@ -73,6 +80,8 @@ class FiniState(BaseModel):
     submit_to_n8n: bool = False
     region: str = ""  # operator-provided region, applied to all companies in this batch
     enrichment_done: bool = False  # True after parallel_enrich_all completes
+    auto_mode: bool = False         # When True: auto-commit high-confidence, pause on ambiguous
+    sdr_name: str = ""              # SDR name for auto-commit sheet writes
     errors: Annotated[list[str], operator.add] = Field(default_factory=list)
     status: Literal["running", "awaiting_confirmation", "completed", "failed"] = "running"
     thread_id: str | None = None  # used to emit per-company progress events
