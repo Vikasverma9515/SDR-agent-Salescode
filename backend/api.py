@@ -1125,9 +1125,12 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest, auto_trigger_v
         await _emit_event(thread_id, "cancelled", {"message": "Run stopped by user"})
     except Exception as e:
         import traceback
-        logger.error("searcher_task_error", error=str(e), traceback=traceback.format_exc())
-        print(f"[SEARCHER ERROR] {traceback.format_exc()}", flush=True)
+        tb = traceback.format_exc()
+        logger.error("searcher_task_error", error=str(e), traceback=tb)
+        print(f"[SEARCHER ERROR] {tb}", flush=True)
         _active_runs[thread_id]["status"] = "failed"
+        _active_runs[thread_id]["error"] = str(e)
+        _active_runs[thread_id]["traceback"] = tb[-500:]  # last 500 chars
         await _emit_event(thread_id, "error", {"error": str(e)})
     finally:
         _pause_util.unregister(thread_id)
@@ -1309,6 +1312,74 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
         else:
             state = result
 
+        # --- Auto-trigger Searcher gap-fill after Veri completes ---
+        run_info = _active_runs.get(thread_id, {})
+        triggered_by = run_info.get("auto_triggered_by", "")
+
+        # Build company list from all available sources
+        _companies_in_run: set[str] = set()
+
+        # Source 1: contacts that Veri just processed
+        for c in state.contacts:
+            if c.company:
+                _companies_in_run.add(c.company)
+
+        # Source 2: company_filter passed to this Veri task
+        if not _companies_in_run and company_filter:
+            _companies_in_run = {c.strip() for c in company_filter.split(",") if c.strip()}
+
+        # Source 3: read companies from the row range in sheet
+        if not _companies_in_run and (row_start or row_end):
+            try:
+                from backend.tools import sheets
+                records = await sheets.read_all_records(sheets.FIRST_CLEAN_LIST)
+                start_idx = (row_start - 2) if row_start else 0
+                end_idx = (row_end - 1) if row_end else len(records)
+                for rec in records[start_idx:end_idx]:
+                    co = str(rec.get("Company Name", "") or "").strip()
+                    if co:
+                        _companies_in_run.add(co)
+            except Exception as e:
+                print(f"[VERI CHAIN] row range fallback error: {e}", flush=True)
+
+        print(f"[VERI CHAIN] triggered_by='{triggered_by}', verified={state.verified_count}, "
+              f"contacts={len(state.contacts)}, companies={_companies_in_run}", flush=True)
+
+        # Trigger Searcher UNLESS this Veri was triggered by Searcher (prevents infinite loop)
+        if triggered_by == "searcher":
+            print("[VERI CHAIN] Veri round 2 done — chain complete, NOT triggering Searcher", flush=True)
+            await _emit_log(thread_id, "info", "Veri round 2 complete — chain finished")
+        elif _companies_in_run:
+            companies_str = ",".join(_companies_in_run)
+            searcher_thread = str(uuid.uuid4())
+            _log_queues[searcher_thread] = _PipelineQueue(searcher_thread)
+            _active_runs[searcher_thread] = {
+                "agent": "searcher",
+                "status": "running",
+                "thread_id": searcher_thread,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "auto_triggered_by": "veri",
+            }
+            searcher_req = SearcherRunRequest(
+                companies=companies_str,
+                auto_approve=True,
+                auto_trigger_veri=True,
+            )
+            print(f"[VERI CHAIN] TRIGGERING SEARCHER for: {companies_str}", flush=True)
+            await _emit_log(thread_id, "info", f"Triggering Searcher gap-fill for: {companies_str}")
+            try:
+                _active_tasks[searcher_thread] = asyncio.create_task(
+                    _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
+                )
+                await _emit_log(thread_id, "info", f"Searcher started (thread: {searcher_thread})")
+            except Exception as e:
+                print(f"[VERI CHAIN] ERROR creating Searcher task: {e}", flush=True)
+                import traceback
+                print(f"[VERI CHAIN] TRACEBACK: {traceback.format_exc()}", flush=True)
+        else:
+            print("[VERI CHAIN] No companies found — cannot trigger Searcher", flush=True)
+            await _emit_log(thread_id, "warning", "No companies found to trigger Searcher")
+
         _active_runs[thread_id]["status"] = "completed"
         await _emit_event(thread_id, "completed", {
             "verified": state.verified_count,
@@ -1316,98 +1387,6 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
             "rejected": state.rejected_count,
             "errors": state.errors,
         })
-
-        # --- Auto-trigger Searcher gap-fill after Veri completes ---
-        # Only trigger if this Veri was started by n8n/fini/auto-pipeline (not by Searcher)
-        # to prevent infinite loops: Veri → Searcher → Veri(round2) → STOP.
-        run_info = _active_runs.get(thread_id, {})
-        triggered_by = run_info.get("auto_triggered_by", "")
-        total_processed = state.verified_count + state.review_count + state.rejected_count
-        logger.info("veri_chain_check",
-                    triggered_by=triggered_by, verified=state.verified_count,
-                    review=state.review_count, rejected=state.rejected_count,
-                    total_contacts=len(state.contacts),
-                    company_filter=company_filter)
-
-        print(f"[VERI CHAIN] triggered_by={triggered_by}, verified={state.verified_count}, "
-              f"review={state.review_count}, contacts={len(state.contacts)}, "
-              f"company_filter={company_filter}", flush=True)
-        await _emit_log(thread_id, "info",
-            f"Veri chain check: triggered_by={triggered_by}, verified={state.verified_count}, "
-            f"review={state.review_count}, contacts={len(state.contacts)}")
-
-        # Trigger Searcher UNLESS this Veri was itself triggered by Searcher (prevents infinite loop)
-        should_trigger_searcher = triggered_by != "searcher"
-        print(f"[VERI CHAIN] should_trigger_searcher={should_trigger_searcher}", flush=True)
-
-        if should_trigger_searcher:
-            try:
-                # Get company names from contacts processed OR from the company_filter
-                _companies_in_run: set[str] = set()
-                for c in state.contacts:
-                    if c.company:
-                        _companies_in_run.add(c.company)
-                print(f"[VERI CHAIN] companies from contacts: {_companies_in_run}", flush=True)
-
-                # Fallback: if contacts list is empty, use company_filter
-                if not _companies_in_run and company_filter:
-                    _companies_in_run = {c.strip() for c in company_filter.split(",") if c.strip()}
-                    print(f"[VERI CHAIN] fallback from company_filter: {_companies_in_run}", flush=True)
-
-                # Fallback 2: if still empty, read companies from the sheet rows we just processed
-                if not _companies_in_run and (row_start or row_end):
-                    try:
-                        from backend.tools import sheets
-                        records = await sheets.read_all_records(sheets.FIRST_CLEAN_LIST)
-                        start_idx = (row_start - 2) if row_start else 0
-                        end_idx = (row_end - 1) if row_end else len(records)
-                        for rec in records[start_idx:end_idx]:
-                            co = str(rec.get("Company Name", "") or "").strip()
-                            if co:
-                                _companies_in_run.add(co)
-                        print(f"[VERI CHAIN] fallback from row range: {_companies_in_run}", flush=True)
-                    except Exception as e:
-                        print(f"[VERI CHAIN] row range fallback error: {e}", flush=True)
-
-                if _companies_in_run:
-                    companies_str = ",".join(_companies_in_run)
-                    searcher_thread = str(uuid.uuid4())
-                    _log_queues[searcher_thread] = _PipelineQueue(searcher_thread)
-                    _active_runs[searcher_thread] = {
-                        "agent": "searcher",
-                        "status": "running",
-                        "thread_id": searcher_thread,
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        "auto_triggered_by": "veri",
-                    }
-                    searcher_req = SearcherRunRequest(
-                        companies=companies_str,
-                        auto_approve=True,
-                        auto_trigger_veri=True,
-                    )
-                    print(f"[VERI CHAIN] TRIGGERING SEARCHER for: {companies_str}", flush=True)
-                    await _emit_log(thread_id, "info",
-                        f"Triggering Searcher gap-fill for: {companies_str}")
-                    _active_tasks[searcher_thread] = asyncio.create_task(
-                        _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
-                    )
-                    await _emit_log(thread_id, "info",
-                                    f"Auto-triggering Searcher gap-fill for {len(_companies_in_run)} companies: {companies_str}")
-                    logger.info("veri_auto_trigger_searcher",
-                                companies=len(_companies_in_run), searcher_thread=searcher_thread)
-                else:
-                    logger.warning("veri_no_companies_for_searcher",
-                                   total_processed=total_processed, company_filter=company_filter)
-            except Exception as e:
-                print(f"[VERI CHAIN] ERROR triggering Searcher: {e}", flush=True)
-                import traceback
-                print(f"[VERI CHAIN] TRACEBACK: {traceback.format_exc()}", flush=True)
-                logger.warning("veri_auto_searcher_error", error=str(e))
-                logger.warning("veri_auto_searcher_traceback", tb=traceback.format_exc())
-        else:
-            print(f"[VERI CHAIN] NOT triggering Searcher — this Veri was triggered by Searcher (round 2 done, stopping chain)", flush=True)
-            await _emit_log(thread_id, "info",
-                "Veri round 2 complete — chain finished (no further Searcher trigger)")
 
     except asyncio.CancelledError:
         logger.info("veri_task_cancelled", thread_id=thread_id)
