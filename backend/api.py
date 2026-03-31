@@ -1329,6 +1329,10 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                     total_contacts=len(state.contacts),
                     company_filter=company_filter)
 
+        print(f"[VERI CHAIN] triggered_by={triggered_by}, verified={state.verified_count}, "
+              f"review={state.review_count}, contacts={len(state.contacts)}, "
+              f"company_filter={company_filter}", flush=True)
+
         if triggered_by in ("n8n", "fini", "auto_pipeline"):
             try:
                 # Get company names from contacts processed OR from the company_filter
@@ -1336,10 +1340,12 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                 for c in state.contacts:
                     if c.company:
                         _companies_in_run.add(c.company)
+                print(f"[VERI CHAIN] companies from contacts: {_companies_in_run}", flush=True)
 
                 # Fallback: if contacts list is empty, use company_filter
                 if not _companies_in_run and company_filter:
                     _companies_in_run = {c.strip() for c in company_filter.split(",") if c.strip()}
+                    print(f"[VERI CHAIN] fallback from company_filter: {_companies_in_run}", flush=True)
 
                 if _companies_in_run:
                     companies_str = ",".join(_companies_in_run)
@@ -1357,6 +1363,7 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                         auto_approve=True,
                         auto_trigger_veri=True,
                     )
+                    print(f"[VERI CHAIN] TRIGGERING SEARCHER for: {companies_str}", flush=True)
                     _active_tasks[searcher_thread] = asyncio.create_task(
                         _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
                     )
@@ -1368,9 +1375,13 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                     logger.warning("veri_no_companies_for_searcher",
                                    total_processed=total_processed, company_filter=company_filter)
             except Exception as e:
-                logger.warning("veri_auto_searcher_error", error=str(e))
+                print(f"[VERI CHAIN] ERROR triggering Searcher: {e}", flush=True)
                 import traceback
+                print(f"[VERI CHAIN] TRACEBACK: {traceback.format_exc()}", flush=True)
+                logger.warning("veri_auto_searcher_error", error=str(e))
                 logger.warning("veri_auto_searcher_traceback", tb=traceback.format_exc())
+        else:
+            print(f"[VERI CHAIN] NOT triggering Searcher — triggered_by='{triggered_by}' not in allowed list", flush=True)
 
     except asyncio.CancelledError:
         logger.info("veri_task_cancelled", thread_id=thread_id)
