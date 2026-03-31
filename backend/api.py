@@ -1332,6 +1332,9 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
         print(f"[VERI CHAIN] triggered_by={triggered_by}, verified={state.verified_count}, "
               f"review={state.review_count}, contacts={len(state.contacts)}, "
               f"company_filter={company_filter}", flush=True)
+        await _emit_log(thread_id, "info",
+            f"Veri chain check: triggered_by={triggered_by}, verified={state.verified_count}, "
+            f"review={state.review_count}, contacts={len(state.contacts)}")
 
         if triggered_by in ("n8n", "fini", "auto_pipeline"):
             try:
@@ -1364,6 +1367,8 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                         auto_trigger_veri=True,
                     )
                     print(f"[VERI CHAIN] TRIGGERING SEARCHER for: {companies_str}", flush=True)
+                    await _emit_log(thread_id, "info",
+                        f"Triggering Searcher gap-fill for: {companies_str}")
                     _active_tasks[searcher_thread] = asyncio.create_task(
                         _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
                     )
@@ -1382,6 +1387,8 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                 logger.warning("veri_auto_searcher_traceback", tb=traceback.format_exc())
         else:
             print(f"[VERI CHAIN] NOT triggering Searcher — triggered_by='{triggered_by}' not in allowed list", flush=True)
+            await _emit_log(thread_id, "warning",
+                f"Searcher NOT triggered — triggered_by='{triggered_by}' (only n8n/fini/auto_pipeline triggers Searcher)")
 
     except asyncio.CancelledError:
         logger.info("veri_task_cancelled", thread_id=thread_id)
