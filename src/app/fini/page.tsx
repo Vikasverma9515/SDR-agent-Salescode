@@ -733,18 +733,19 @@ export default function FiniPage() {
     elapsedRef.current = setInterval(() => setElapsedSecs(s => s + 1), 1000);
 
     try {
-      // When both n8n relay + auto mode are ON, use the full auto-pipeline
-      // (Fini → n8n → poll → Veri → Searcher → Veri round 2)
-      const useAutoPipeline = submitN8n && autoMode;
-      const endpoint = useAutoPipeline ? '/api/pipeline/auto' : '/api/fini/run';
-      const payload = useAutoPipeline
-        ? { companies: companies.trim(), sdr: sdr.trim(), region: region.trim() }
-        : { companies: companies.trim(), sdr: sdr.trim(), region: region.trim(), submit_n8n: submitN8n, auto_mode: autoMode };
-
-      const resp = await fetch(apiUrl(endpoint), {
+      // Always use /api/fini/run — Fini shows review cards, submits to n8n.
+      // Veri + Searcher chain is triggered automatically when n8n calls
+      // POST /api/n8n/contacts with the enriched contacts JSON.
+      const resp = await fetch(apiUrl('/api/fini/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          companies: companies.trim(),
+          sdr: sdr.trim(),
+          region: region.trim(),
+          submit_n8n: submitN8n,
+          auto_mode: autoMode,
+        }),
       });
       const data = await resp.json();
       setThreadId(data.thread_id);
