@@ -682,6 +682,22 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Run not found")
         return _active_runs[thread_id]
 
+    @app.post("/api/runs/stop-all")
+    async def stop_all_runs() -> dict:
+        """Emergency kill switch — cancel ALL running agents."""
+        cancelled = []
+        for thread_id, task in list(_active_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+                _active_runs.get(thread_id, {})["status"] = "cancelled"
+                cancelled.append(thread_id)
+        logger.info("stop_all_runs", cancelled=len(cancelled))
+        return {
+            "status": "all_stopped",
+            "cancelled_count": len(cancelled),
+            "cancelled_threads": cancelled,
+        }
+
     @app.post("/api/runs/{thread_id}/cancel")
     async def cancel_run(thread_id: str) -> dict[str, str]:
         """Cancel a running pipeline task."""
