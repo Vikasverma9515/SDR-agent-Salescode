@@ -287,23 +287,82 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
     except Exception as e:
         logger.warning("searcher_existing_names_read_error", error=str(e))
 
-    # --- Step 3: check must-have tiers against existing contacts ---
-    # Gopal's rule: Searcher MUST confirm CEO, CTO, CSO exist for each company.
-    # Classify existing contacts into tiers, then find gaps.
-    existing_tiers: dict[str, list[str]] = {
-        "CEO/MD": [], "CTO/CIO": [], "CSO/Head of Sales": [],
-        "P1 Influencer": [], "Gatekeeper": [], "Unknown": [],
-    }
-    for title in existing_role_titles:
-        tier = _classify_role(title)
-        existing_tiers[tier].append(title)
+    # --- Step 3: LLM-powered gap analysis ---
+    # Use LLM to intelligently reason about which must-have roles are covered
+    # vs missing. Much smarter than keyword matching — understands that
+    # "General Manager Eurasia" = CEO/MD tier, "Head of Global Sales Enablement" ≠ CSO, etc.
+    from backend.tools.llm import llm_complete
+    import json as _json
 
-    # Determine which must-have tiers are missing
+    contacts_summary = "\n".join(f"- {t}" for t in existing_role_titles) if existing_role_titles else "(no contacts found)"
+
+    gap_prompt = (
+        f"You are a B2B sales intelligence analyst. Analyze the existing contacts for {state.target_company} "
+        f"and determine which of the 3 MUST-HAVE leadership tiers are covered vs missing.\n\n"
+        f"EXISTING CONTACTS (job titles):\n{contacts_summary}\n\n"
+        f"MUST-HAVE TIERS:\n"
+        f"1. CEO/MD — CEO, Managing Director, President, Founder, General Manager, Country Manager, COO\n"
+        f"2. CTO/CIO — CTO, CIO, Chief Digital Officer, VP Technology, VP Engineering, Head of IT/Digital/Technology\n"
+        f"3. CSO/Head of Sales — CSO, CRO, VP Sales, Head of Sales, Sales Director, CMO, Head of Marketing, Commercial Director\n\n"
+        f"RULES:\n"
+        f"- A title covers a tier ONLY if the person genuinely holds that level of responsibility\n"
+        f"- 'Director of Business Development' is NOT a CSO — it's mid-level\n"
+        f"- 'Associate Director of IT' is NOT a CTO — it's mid-level\n"
+        f"- 'VP, Managing Director' IS CEO/MD tier\n"
+        f"- 'CFO' is NOT any of these 3 tiers — it's finance\n"
+        f"- Be strict: only C-suite, VP-level, or Head-of-department count for the tier\n\n"
+        f"Return ONLY valid JSON (no markdown):\n"
+        f'{{"covered": [{{"tier": "CEO/MD", "covered_by": "title that covers it"}}], '
+        f'"missing": ["CTO/CIO", "CSO/Head of Sales"], '
+        f'"reasoning": "one sentence explaining your analysis"}}'
+    )
+
     missing_tiers: list[dict] = []
-    for tier_def in MUST_HAVE_TIERS:
-        tier_name = tier_def["tier"]
-        if not existing_tiers.get(tier_name):
-            missing_tiers.append(tier_def)
+    existing_tiers: dict[str, list[str]] = {"CEO/MD": [], "CTO/CIO": [], "CSO/Head of Sales": []}
+
+    try:
+        raw = await llm_complete(gap_prompt, model="gpt-4.1-mini", max_tokens=300, temperature=0)
+        import re as _re
+        cleaned = _re.sub(r'^```(?:json)?\s*|\s*```$', '', (raw or "").strip())
+        gap_result = _json.loads(cleaned)
+
+        covered_names = [c["tier"] for c in gap_result.get("covered", [])]
+        missing_names = gap_result.get("missing", [])
+        reasoning = gap_result.get("reasoning", "")
+
+        for c in gap_result.get("covered", []):
+            tier_name = c.get("tier", "")
+            covered_by = c.get("covered_by", "")
+            if tier_name in existing_tiers:
+                existing_tiers[tier_name].append(covered_by)
+
+        for tier_def in MUST_HAVE_TIERS:
+            if tier_def["tier"] in missing_names:
+                missing_tiers.append(tier_def)
+
+        logger.info("searcher_llm_gap_analysis",
+                    company=state.target_company,
+                    covered=covered_names, missing=missing_names,
+                    reasoning=reasoning)
+        await _emit_log(state.thread_id,
+            f"[{state.target_company}] LLM gap analysis: covered={covered_names}, "
+            f"missing={missing_names} — {reasoning}",
+            level="info" if missing_names else "success")
+
+    except Exception as e:
+        logger.warning("searcher_llm_gap_error", error=str(e),
+                       msg="Falling back to keyword matching")
+        await _emit_log(state.thread_id,
+            f"[{state.target_company}] LLM gap analysis failed ({e}), using keyword fallback",
+            level="warning")
+        # Fallback to keyword matching
+        for title in existing_role_titles:
+            tier = _classify_role(title)
+            if tier in existing_tiers:
+                existing_tiers[tier].append(title)
+        for tier_def in MUST_HAVE_TIERS:
+            if not existing_tiers.get(tier_def["tier"]):
+                missing_tiers.append(tier_def)
 
     # Build the missing_roles list from must-have tiers
     missing_roles = []
@@ -316,16 +375,13 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
             if role not in missing_roles:
                 missing_roles.append(role)
 
-    await _emit_log(state.thread_id,
-        f"[{state.target_company}] Existing mapping: "
-        + ", ".join(f"{k}: {len(v)}" for k, v in existing_tiers.items() if v)
-        + (f" | Missing tiers: {', '.join(t['tier'] for t in missing_tiers)}" if missing_tiers else " | All must-have tiers covered"),
-        level="info" if missing_tiers else "success")
-
     if not missing_roles:
         logger.info("searcher_gap_analysis_all_covered",
                     company=state.target_company,
-                    msg="All requested roles already covered in sheets")
+                    msg="All must-have roles covered — no gaps to fill")
+        await _emit_log(state.thread_id,
+            f"[{state.target_company}] All must-have tiers covered — no gaps to fill",
+            level="success")
         return state.model_copy(update={
             "target_org_id": org_id,
             "target_domain": domain,
@@ -346,7 +402,8 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
                 missing_tiers=[t["tier"] for t in missing_tiers],
                 missing_roles=missing_roles)
     await _emit_log(state.thread_id,
-        f"[{state.target_company}] Gap analysis done — {len(missing_roles)} missing role(s): {', '.join(missing_roles[:5])}{'…' if len(missing_roles) > 5 else ''}",
+        f"[{state.target_company}] Gap analysis done — missing: {', '.join(t['tier'] for t in missing_tiers)} "
+        f"→ searching for {len(missing_roles)} role(s)",
         level="info")
 
     logger.info(
