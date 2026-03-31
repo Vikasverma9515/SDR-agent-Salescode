@@ -1105,6 +1105,10 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest, auto_trigger_v
             ))
 
         _active_runs[thread_id]["status"] = "completed"
+        _active_runs[thread_id]["contacts_appended"] = state.total_contacts_written
+        _active_runs[thread_id]["contacts_discovered"] = len(state.discovered_contacts)
+        _active_runs[thread_id]["missing_roles"] = state.missing_dm_roles[:10]
+        _active_runs[thread_id]["errors"] = state.errors[:5]
         await _emit_event(thread_id, "completed", {
             "contacts_appended": state.total_contacts_written,
             "contacts": [c.model_dump() for c in state.discovered_contacts[:50]],
