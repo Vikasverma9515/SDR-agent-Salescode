@@ -17,6 +17,24 @@ const NAV_ITEMS = [
 export default function Sidebar() {
   const pathname = usePathname();
   const [configStatus, setConfigStatus] = useState<Record<string, boolean> | null>(null);
+  const [stopping, setStopping] = useState(false);
+  const [stopResult, setStopResult] = useState<string | null>(null);
+
+  const handleStopAll = async () => {
+    setStopping(true);
+    setStopResult(null);
+    try {
+      const resp = await fetch(apiUrl('/api/pipeline/stop-all'), { method: 'POST' });
+      const data = await resp.json();
+      setStopResult(`Stopped ${data.cancelled_count} agent(s)`);
+      setTimeout(() => setStopResult(null), 3000);
+    } catch {
+      setStopResult('Failed to stop');
+      setTimeout(() => setStopResult(null), 3000);
+    } finally {
+      setStopping(false);
+    }
+  };
 
   useEffect(() => {
     fetch(apiUrl('/api/config/check'))
@@ -77,6 +95,17 @@ export default function Sidebar() {
           );
         })}
       </nav>
+
+      {/* Emergency Stop */}
+      <div className="px-3 pb-2">
+        <button
+          onClick={handleStopAll}
+          disabled={stopping}
+          className="w-full py-2 px-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-[11px] font-semibold uppercase tracking-wider hover:bg-red-500/20 hover:border-red-500/30 transition-all disabled:opacity-50"
+        >
+          {stopping ? 'STOPPING...' : stopResult || 'STOP ALL AGENTS'}
+        </button>
+      </div>
 
       {/* System Health */}
       {configStatus && (

@@ -676,13 +676,8 @@ def create_app() -> FastAPI:
     async def list_runs() -> list[dict[str, Any]]:
         return list(_active_runs.values())
 
-    @app.get("/api/runs/{thread_id}")
-    async def get_run(thread_id: str) -> dict[str, Any]:
-        if thread_id not in _active_runs:
-            raise HTTPException(status_code=404, detail="Run not found")
-        return _active_runs[thread_id]
-
-    @app.post("/api/runs/stop-all")
+    # Static routes MUST come before /{thread_id} parameterized routes
+    @app.post("/api/pipeline/stop-all")
     async def stop_all_runs() -> dict:
         """Emergency kill switch — cancel ALL running agents."""
         cancelled = []
@@ -697,6 +692,12 @@ def create_app() -> FastAPI:
             "cancelled_count": len(cancelled),
             "cancelled_threads": cancelled,
         }
+
+    @app.get("/api/runs/{thread_id}")
+    async def get_run(thread_id: str) -> dict[str, Any]:
+        if thread_id not in _active_runs:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return _active_runs[thread_id]
 
     @app.post("/api/runs/{thread_id}/cancel")
     async def cancel_run(thread_id: str) -> dict[str, str]:
