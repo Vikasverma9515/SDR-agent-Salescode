@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { id: 'fini', href: '/fini', label: 'Fini', sub: 'Target Builder' },
   { id: 'searcher', href: '/searcher', label: 'Searcher', sub: 'Contact Discovery' },
   { id: 'veri', href: '/veri', label: 'Veri', sub: 'Contact QC' },
+  { id: 'command-center', href: '/command-center', label: 'Command', sub: 'Orchestrator' },
   { id: 'settings', href: '/settings', label: 'Settings', sub: null },
 ];
 

@@ -38,12 +38,34 @@ class SearcherRunRequest(BaseModel):
     auto_trigger_veri: bool = True  # if True, automatically start Veri after contacts are written
 
 class VeriRunRequest(BaseModel):
-    row_start: Optional[int] = None  # 1-based, inclusive (data rows, not header)
-    row_end: Optional[int] = None    # 1-based, inclusive
+    row_start: Optional[int] = None       # 1-based, inclusive (data rows, not header) — optional override
+    row_end: Optional[int] = None         # 1-based, inclusive — optional override
+    company_filter: Optional[str] = None  # only verify contacts for this company (auto-detect mode)
 
 class N8nCompleteRequest(BaseModel):
     row_start: Optional[int] = None  # 1-based data row range that n8n populated
     row_end: Optional[int] = None
+
+class N8nContactItem(BaseModel):
+    """Single contact from n8n."""
+    company_name: str
+    normalized_name: str = ""
+    domain: str = ""
+    account_type: str = ""
+    account_size: str = ""
+    country: str = ""
+    first_name: str
+    last_name: str
+    job_title: str = ""
+    buying_role: str = ""
+    linkedin_url: str = ""
+    email: str = ""
+    phone_1: str = ""
+    phone_2: str = ""
+
+class N8nContactsRequest(BaseModel):
+    """n8n sends enriched contacts as JSON → triggers full Veri + Searcher chain."""
+    contacts: list[N8nContactItem]
 
 class OperatorConfirmRequest(BaseModel):
     thread_id: str
@@ -82,6 +104,12 @@ class SelectRolesRequest(BaseModel):
 
 class FindMoreRequest(BaseModel):
     prompt: str  # SDR's natural-language request, e.g. "find the CEO and CFO"
+
+class AutoPipelineRequest(BaseModel):
+    """Trigger full auto pipeline: Fini → n8n → Veri → Searcher → Veri round 2."""
+    companies: str              # comma-separated company names
+    sdr: str = ""
+    region: str = ""
 
 class ProspectChatRequest(BaseModel):
     query: str                       # SDR's message
@@ -325,7 +353,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/searcher/scout-commit")
     async def scout_commit(req: ScoutCommitRequest) -> dict[str, Any]:
-        """Write enriched scout candidate to Final Filtered List (cols A–U)."""
+        """Write enriched scout candidate to First Clean List (cols A–U)."""
         try:
             result = await _scout_commit(req.model_dump())
             return result
@@ -383,9 +411,13 @@ def create_app() -> FastAPI:
         _log_queues[thread_id] = _PipelineQueue(thread_id)
         _active_runs[thread_id] = {"agent": "veri", "status": "running", "thread_id": thread_id, "started_at": datetime.now(timezone.utc).isoformat()}
 
-        _active_tasks[thread_id] = asyncio.create_task(_veri_task(thread_id, req.row_start, req.row_end))
+        _active_tasks[thread_id] = asyncio.create_task(
+            _veri_task(thread_id, req.row_start, req.row_end, company_filter=req.company_filter)
+        )
 
-        row_msg = f" (rows {req.row_start}–{req.row_end})" if req.row_start else " (all pending)"
+        row_msg = f" (rows {req.row_start}–{req.row_end})" if req.row_start else (
+            f" (company: {req.company_filter})" if req.company_filter else " (all unverified)"
+        )
         return RunResponse(
             thread_id=thread_id,
             status="started",
@@ -416,6 +448,134 @@ def create_app() -> FastAPI:
             thread_id=thread_id,
             status="started",
             message=f"Veri auto-triggered by n8n{row_msg}",
+        )
+
+    # ---------------------------------------------------------------------------
+    # n8n JSON contacts endpoint — receives contacts, writes to sheet, triggers chain
+    # ---------------------------------------------------------------------------
+
+    @app.post("/api/n8n/contacts", response_model=RunResponse)
+    async def n8n_contacts(req: N8nContactsRequest):
+        """
+        n8n sends enriched contacts as JSON.
+        1. Writes them to First Clean List (cols A–P)
+        2. Immediately triggers Veri → Searcher → Veri round 2
+
+        This is the MAIN endpoint for n8n to call at the end of its workflow.
+        No polling needed — the chain starts instantly.
+        """
+        if not req.contacts:
+            raise HTTPException(status_code=400, detail="No contacts provided")
+
+        from backend.tools import sheets
+
+        # Step 1: Write contacts to First Clean List
+        companies_seen: set[str] = set()
+        rows_written = 0
+        try:
+            await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
+            for c in req.contacts:
+                row = [
+                    c.company_name,                    # A
+                    c.normalized_name or c.company_name,  # B
+                    c.domain,                          # C
+                    c.account_type,                    # D
+                    c.account_size,                    # E
+                    c.country,                         # F
+                    c.first_name,                      # G
+                    c.last_name,                       # H
+                    c.job_title,                       # I
+                    c.buying_role,                     # J
+                    c.linkedin_url,                    # K
+                    c.email,                           # L
+                    c.phone_1,                         # M
+                    c.phone_2,                         # N
+                    "n8n",                             # O (Source)
+                    "",                                # P (Pipeline Status)
+                ]
+                await sheets.append_row(sheets.FIRST_CLEAN_LIST, row)
+                rows_written += 1
+                if c.company_name:
+                    companies_seen.add(c.company_name)
+            logger.info("n8n_contacts_written", count=rows_written, companies=list(companies_seen))
+        except Exception as e:
+            logger.error("n8n_contacts_write_error", error=str(e))
+            raise HTTPException(status_code=500, detail=f"Failed to write contacts to sheet: {e}")
+
+        # Step 2: Trigger Veri → Searcher → Veri chain
+        thread_id = str(uuid.uuid4())
+        _log_queues[thread_id] = _PipelineQueue(thread_id)
+        _active_runs[thread_id] = {
+            "agent": "veri",
+            "status": "running",
+            "thread_id": thread_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "auto_triggered_by": "n8n",
+        }
+        company_filter = ",".join(companies_seen) if companies_seen else None
+        asyncio.create_task(_veri_task(thread_id, company_filter=company_filter))
+
+        logger.info("n8n_contacts_chain_started",
+                    contacts=rows_written, companies=list(companies_seen), thread_id=thread_id)
+        return RunResponse(
+            thread_id=thread_id,
+            status="started",
+            message=f"Received {rows_written} contacts for {len(companies_seen)} companies. "
+                    f"Veri → Searcher → Veri chain started.",
+        )
+
+    # ---------------------------------------------------------------------------
+    # Auto-pipeline: Fini → n8n → Veri → Searcher → Veri (fully automatic)
+    # ---------------------------------------------------------------------------
+
+    @app.post("/api/pipeline/auto", response_model=RunResponse)
+    async def auto_pipeline(req: AutoPipelineRequest):
+        """
+        Fully automatic pipeline. Steps:
+        1. Fini enriches companies → submits to n8n
+        2. n8n populates First Clean List
+        3. Veri auto-verifies all unverified rows
+        4. Searcher finds role gaps → writes new contacts
+        5. Veri round 2 verifies Searcher's contacts
+        """
+        thread_id = str(uuid.uuid4())
+        _log_queues[thread_id] = _PipelineQueue(thread_id)
+        _active_runs[thread_id] = {
+            "agent": "auto_pipeline",
+            "status": "running",
+            "thread_id": thread_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Start Fini with auto_mode + n8n relay — the chain triggers automatically:
+        # Fini → n8n callback → Veri (auto_triggered_by=n8n) → Searcher → Veri round 2
+        fini_req = FiniRunRequest(
+            companies=req.companies,
+            sdr=req.sdr,
+            submit_n8n=True,
+            region=req.region,
+            auto_mode=True,
+        )
+
+        fini_thread = str(uuid.uuid4())
+        _log_queues[fini_thread] = _PipelineQueue(fini_thread)
+        _active_runs[fini_thread] = {
+            "agent": "fini",
+            "status": "running",
+            "thread_id": fini_thread,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "auto_triggered_by": "auto_pipeline",
+        }
+
+        _active_tasks[fini_thread] = asyncio.create_task(
+            _auto_pipeline_task(thread_id, fini_thread, fini_req, req.companies)
+        )
+
+        company_list = [c.strip() for c in req.companies.split(",") if c.strip()]
+        return RunResponse(
+            thread_id=thread_id,
+            status="started",
+            message=f"Auto-pipeline started for {len(company_list)} companies: {', '.join(company_list[:5])}",
         )
 
     # ---------------------------------------------------------------------------
@@ -461,6 +621,115 @@ def create_app() -> FastAPI:
         _active_runs.get(thread_id, {})["status"] = "running"
         await _emit_event(thread_id, "resumed", {"message": "Resumed"})
         return {"status": "running", "thread_id": thread_id}
+
+    # ---------------------------------------------------------------------------
+    # Orchestrator / Command Center endpoints
+    # ---------------------------------------------------------------------------
+
+    class OrchestratorTriggerRequest(BaseModel):
+        agent: str  # "fini" | "searcher" | "veri"
+        companies: list[str]
+        dm_roles: str = ""
+        row_start: Optional[int] = None
+        row_end: Optional[int] = None
+        auto_approve: bool = True
+
+    class OrchestratorAnalyzeRequest(BaseModel):
+        focus: str = ""
+
+    class AutoModeRequest(BaseModel):
+        enabled: bool
+        poll_interval_secs: int = 60
+        auto_trigger_searcher: bool = True
+        auto_trigger_veri: bool = True
+        dry_run: bool = False
+
+    @app.get("/api/orchestrator/status")
+    async def orchestrator_status(include_ai: bool = False, company: str = "", start_row: int = 1):
+        from backend.orchestrator import compute_full_status, run_ai_analysis
+        status = await compute_full_status(company_filter=company, start_row=start_row)
+        if include_ai:
+            status["ai_analysis"] = await run_ai_analysis(status["companies"])
+        return status
+
+    @app.post("/api/orchestrator/trigger")
+    async def orchestrator_trigger(req: OrchestratorTriggerRequest):
+        results = []
+        for company in req.companies:
+            thread_id = str(uuid.uuid4())
+            _log_queues[thread_id] = _PipelineQueue(thread_id)
+            _active_runs[thread_id] = {
+                "agent": req.agent, "status": "running",
+                "thread_id": thread_id,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "auto_triggered_by": "orchestrator",
+                "company": company,
+            }
+            if req.agent == "fini":
+                fini_req = FiniRunRequest(companies=company, auto_mode=True)
+                _active_tasks[thread_id] = asyncio.create_task(
+                    _fini_task(thread_id, fini_req)
+                )
+            elif req.agent == "searcher":
+                searcher_req = SearcherRunRequest(
+                    companies=company,
+                    dm_roles=req.dm_roles or "CEO,CTO,CIO,CSO,Head of Sales,CMO",
+                    auto_approve=req.auto_approve,
+                )
+                _active_tasks[thread_id] = asyncio.create_task(
+                    _searcher_task(thread_id, searcher_req)
+                )
+            elif req.agent == "veri":
+                _active_tasks[thread_id] = asyncio.create_task(
+                    _veri_task(thread_id, req.row_start, req.row_end)
+                )
+            results.append({"company": company, "agent": req.agent, "thread_id": thread_id, "status": "started"})
+        return {"triggered": results}
+
+    @app.post("/api/orchestrator/analyze")
+    async def orchestrator_analyze(req: OrchestratorAnalyzeRequest):
+        from backend.orchestrator import compute_full_status, run_ai_analysis
+        status = await compute_full_status()
+        return await run_ai_analysis(status["companies"], focus=req.focus)
+
+    @app.post("/api/orchestrator/auto-mode")
+    async def orchestrator_auto_mode_toggle(req: AutoModeRequest):
+        from backend.orchestrator import start_auto_mode, stop_auto_mode
+        if req.enabled:
+            # Create a trigger function that uses the existing task launchers
+            async def _trigger(agent: str, companies: list[str]):
+                for company in companies:
+                    tid = str(uuid.uuid4())
+                    _log_queues[tid] = _PipelineQueue(tid)
+                    _active_runs[tid] = {
+                        "agent": agent, "status": "running", "thread_id": tid,
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "auto_triggered_by": "auto_mode", "company": company,
+                    }
+                    if agent == "searcher":
+                        _active_tasks[tid] = asyncio.create_task(
+                            _searcher_task(tid, SearcherRunRequest(
+                                companies=company, auto_approve=True,
+                            ))
+                        )
+                    elif agent == "veri":
+                        _active_tasks[tid] = asyncio.create_task(
+                            _veri_task(tid)
+                        )
+
+            task_id = await start_auto_mode(
+                req.poll_interval_secs, req.auto_trigger_searcher,
+                req.auto_trigger_veri, req.dry_run, trigger_fn=_trigger,
+            )
+            return {"auto_mode": True, "poll_interval_secs": req.poll_interval_secs, "task_id": task_id}
+        else:
+            await stop_auto_mode()
+            return {"auto_mode": False}
+
+    @app.get("/api/orchestrator/auto-mode/status")
+    async def orchestrator_auto_mode_status():
+        from backend.orchestrator import get_auto_mode_status
+        return get_auto_mode_status()
 
     # ---------------------------------------------------------------------------
     # WebSocket for real-time logs
@@ -807,9 +1076,18 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest, auto_trigger_v
         else:
             state = result
 
-        # --- Auto-trigger Veri on newly written rows ---
+        # --- Auto-trigger Veri on newly written contacts ---
+        # Veri will auto-detect unverified rows (col U empty) for these companies.
+        # Using company_filter instead of row ranges — safer and works with auto-detect.
         veri_thread_id = None
-        if auto_trigger_veri and state.total_contacts_written > 0 and state.fcl_row_start is not None:
+        if auto_trigger_veri and state.total_contacts_written > 0:
+            # Get unique companies Searcher wrote contacts for
+            _searcher_companies: set[str] = set()
+            for c in state.discovered_contacts:
+                if c.company:
+                    _searcher_companies.add(c.company)
+            company_str = ",".join(_searcher_companies) if _searcher_companies else state.target_company
+
             veri_thread_id = str(uuid.uuid4())
             _log_queues[veri_thread_id] = _PipelineQueue(veri_thread_id)
             _active_runs[veri_thread_id] = {
@@ -817,15 +1095,13 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest, auto_trigger_v
                 "status": "running",
                 "thread_id": veri_thread_id,
                 "started_at": datetime.now(timezone.utc).isoformat(),
-                "auto_triggered_by": thread_id,
+                "auto_triggered_by": "searcher",
             }
             await _emit_log(thread_id, "info",
-                f"Auto-triggering Veri agent for rows {state.fcl_row_start}–{state.fcl_row_end} "
-                f"({state.total_contacts_written} contacts)")
+                f"Auto-triggering Veri for {state.total_contacts_written} new Searcher contacts")
             asyncio.create_task(_veri_task(
                 veri_thread_id,
-                row_start=state.fcl_row_start,
-                row_end=state.fcl_row_end,
+                company_filter=company_str,
             ))
 
         _active_runs[thread_id]["status"] = "completed"
@@ -857,8 +1133,146 @@ async def _searcher_task(thread_id: str, req: SearcherRunRequest, auto_trigger_v
         _pause_util.unregister(thread_id)
 
 
-async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None):
-    """Background task running the Veri agent."""
+async def _poll_for_new_rows(
+    company_names: list[str],
+    pipeline_thread: str,
+    timeout: int = 600,
+    poll_interval: int = 30,
+) -> int:
+    """
+    Poll First Clean List until new unverified rows appear for any of the given companies.
+    Returns the count of new rows found.
+    Raises TimeoutError if no rows appear within timeout seconds.
+    """
+    from backend.tools import sheets
+    elapsed = 0
+
+    while elapsed < timeout:
+        try:
+            records = await sheets.read_all_records(sheets.FIRST_CLEAN_LIST)
+            count = 0
+            for row in records:
+                company = str(row.get("Company Name", "") or "").strip()
+                overall = str(row.get("Overall Status", "") or "").strip()
+                if overall:
+                    continue  # already verified — skip
+                # Check if this row belongs to one of our companies
+                for target in company_names:
+                    if target.lower() in company.lower():
+                        count += 1
+                        break
+            if count > 0:
+                await _emit_log(pipeline_thread, "info",
+                    f"Auto-pipeline: found {count} new unverified rows in First Clean List")
+                return count
+        except Exception as e:
+            logger.warning("auto_pipeline_poll_error", error=str(e))
+
+        await _emit_log(pipeline_thread, "info",
+            f"Auto-pipeline: waiting for n8n… ({elapsed}s / {timeout}s)")
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+    raise TimeoutError(f"No new rows appeared in First Clean List after {timeout}s")
+
+
+async def _auto_pipeline_task(
+    pipeline_thread: str, fini_thread: str, fini_req: FiniRunRequest, companies_raw: str,
+):
+    """
+    Full auto-pipeline background task.
+
+    Flow:
+      1. Fini enriches companies → submits to n8n
+      2. Poll First Clean List until n8n rows appear (up to 10 min)
+      3. Veri verifies all unverified rows for these companies
+      4. Searcher finds role gaps → writes new contacts (auto-triggered by Veri)
+      5. Veri round 2 verifies Searcher's contacts (auto-triggered by Searcher)
+
+    Loop prevention via auto_triggered_by flags:
+      Veri(auto_pipeline) → triggers Searcher
+      Searcher(veri) → triggers Veri round 2
+      Veri(searcher) → STOPS
+    """
+    company_list = [c.strip() for c in companies_raw.split(",") if c.strip()]
+    try:
+        # ── Step 1: Run Fini ─────────────────────────────────────────────────
+        await _emit_log(pipeline_thread, "info",
+            f"Auto-pipeline: Step 1/3 — starting Fini for {len(company_list)} companies")
+        await _fini_task(fini_thread, fini_req)
+        await _emit_log(pipeline_thread, "info",
+            "Auto-pipeline: Fini complete. Waiting for n8n to populate First Clean List…")
+
+        # ── Step 2: Poll until n8n writes rows ───────────────────────────────
+        try:
+            new_count = await _poll_for_new_rows(
+                company_list, pipeline_thread, timeout=600, poll_interval=30,
+            )
+        except TimeoutError:
+            await _emit_log(pipeline_thread, "warning",
+                "Auto-pipeline: n8n did not populate within 10 minutes. "
+                "Running Veri anyway on any existing unverified rows…")
+            new_count = 0
+
+        # ── Step 3: Trigger Veri → Searcher → Veri chain ─────────────────────
+        veri_thread = str(uuid.uuid4())
+        _log_queues[veri_thread] = _PipelineQueue(veri_thread)
+        _active_runs[veri_thread] = {
+            "agent": "veri",
+            "status": "running",
+            "thread_id": veri_thread,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "auto_triggered_by": "auto_pipeline",  # Veri will auto-trigger Searcher on completion
+        }
+        company_filter = ",".join(company_list)
+        await _emit_log(pipeline_thread, "info",
+            f"Auto-pipeline: Step 2/3 — triggering Veri for {len(company_list)} companies "
+            f"({new_count} new rows detected)")
+
+        # Run Veri (blocking). When it completes, it auto-triggers Searcher
+        # (because auto_triggered_by="auto_pipeline"), which then auto-triggers
+        # Veri round 2 for newly written Searcher contacts.
+        await _veri_task(veri_thread, company_filter=company_filter)
+
+        # At this point: Veri round 1 is done, Searcher + Veri round 2 are running
+        # in background (fire-and-forget from _veri_task).
+        # Wait a bit for the Searcher chain to complete.
+        await _emit_log(pipeline_thread, "info",
+            "Auto-pipeline: Step 3/3 — Searcher + Veri round 2 running in background…")
+
+        # Poll for Searcher + Veri round 2 completion (check active runs)
+        for _ in range(60):  # up to 30 minutes
+            await asyncio.sleep(30)
+            # Check if any searcher/veri tasks triggered by this pipeline are still running
+            still_running = False
+            for run_id, run_info in _active_runs.items():
+                if run_info.get("status") == "running" and run_info.get("auto_triggered_by") in (
+                    "auto_pipeline", "veri", "searcher"
+                ):
+                    still_running = True
+                    break
+            if not still_running:
+                break
+
+        _active_runs[pipeline_thread]["status"] = "completed"
+        await _emit_log(pipeline_thread, "info",
+            f"Auto-pipeline: COMPLETE for {len(company_list)} companies")
+        await _emit_event(pipeline_thread, "completed", {
+            "message": f"Auto-pipeline complete for {len(company_list)} companies",
+            "companies": company_list,
+        })
+
+    except asyncio.CancelledError:
+        _active_runs[pipeline_thread]["status"] = "cancelled"
+        await _emit_event(pipeline_thread, "cancelled", {"message": "Auto-pipeline cancelled"})
+    except Exception as e:
+        logger.error("auto_pipeline_error", error=str(e))
+        _active_runs[pipeline_thread]["status"] = "failed"
+        await _emit_event(pipeline_thread, "error", {"error": str(e)})
+
+
+async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None, company_filter: str = None):
+    """Background task running the Veri agent on First Clean List."""
     from backend.agents.veri import build_veri_graph
     from backend.state import VeriState
     from backend.utils import pause as _pause_util
@@ -868,12 +1282,20 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None)
     if thread_id in _log_queues:
         _reg_progress(thread_id, _log_queues[thread_id])
 
-    state = VeriState(contacts=[], row_start=row_start, row_end=row_end, thread_id=thread_id)
+    state = VeriState(
+        contacts=[], row_start=row_start, row_end=row_end,
+        company_filter=company_filter, thread_id=thread_id,
+    )
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
         await asyncio.sleep(0.5)
-        range_msg = f" rows {row_start}–{row_end}" if row_start else " all pending contacts"
+        if company_filter:
+            range_msg = f" company={company_filter}"
+        elif row_start:
+            range_msg = f" rows {row_start}–{row_end}"
+        else:
+            range_msg = " all unverified contacts"
         await _emit_log(thread_id, "info", f"Starting Veri agent —{range_msg}")
         app_graph = await build_veri_graph()
 
@@ -895,6 +1317,45 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None)
             "errors": state.errors,
         })
 
+        # --- Auto-trigger Searcher gap-fill after Veri completes ---
+        # Only trigger if this Veri was started by n8n/fini/auto-pipeline (not by Searcher)
+        # to prevent infinite loops: Veri → Searcher → Veri(round2) → STOP.
+        run_info = _active_runs.get(thread_id, {})
+        triggered_by = run_info.get("auto_triggered_by", "")
+        if triggered_by in ("n8n", "fini", "auto_pipeline") and state.verified_count > 0:
+            try:
+                # Get unique companies from the contacts we just verified
+                _companies_in_run: set[str] = set()
+                for c in state.contacts:
+                    if c.company:
+                        _companies_in_run.add(c.company)
+
+                if _companies_in_run:
+                    companies_str = ",".join(_companies_in_run)
+                    searcher_thread = str(uuid.uuid4())
+                    _log_queues[searcher_thread] = _PipelineQueue(searcher_thread)
+                    _active_runs[searcher_thread] = {
+                        "agent": "searcher",
+                        "status": "running",
+                        "thread_id": searcher_thread,
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "auto_triggered_by": "veri",
+                    }
+                    searcher_req = SearcherRunRequest(
+                        companies=companies_str,
+                        auto_approve=True,
+                        auto_trigger_veri=True,
+                    )
+                    _active_tasks[searcher_thread] = asyncio.create_task(
+                        _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
+                    )
+                    await _emit_log(thread_id, "info",
+                                    f"Auto-triggering Searcher gap-fill for {len(_companies_in_run)} companies")
+                    logger.info("veri_auto_trigger_searcher",
+                                companies=len(_companies_in_run), searcher_thread=searcher_thread)
+            except Exception as e:
+                logger.warning("veri_auto_searcher_error", error=str(e))
+
     except asyncio.CancelledError:
         logger.info("veri_task_cancelled", thread_id=thread_id)
         _active_runs[thread_id]["status"] = "cancelled"
@@ -915,7 +1376,7 @@ async def _prospect_chat(query: str, company: str, history: list[dict]) -> dict:
 
 
 async def _scout_commit(candidate: dict) -> dict:
-    """Write enriched scout candidate to Final Filtered List (cols A–U)."""
+    """Write enriched scout candidate to First Clean List (cols A–U)."""
     from backend.agents.scout import commit_to_sheet
     ctx = {
         "domain": candidate.get("company_domain", ""),

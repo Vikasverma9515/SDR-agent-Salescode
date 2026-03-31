@@ -1,7 +1,7 @@
 """
 Searcher - Contact Gap-Fill Agent (Agent 3)
 
-Runs AFTER Veri. Reads Final Filtered List, identifies companies that are
+Runs AFTER Veri. Reads First Clean List, identifies companies that are
 missing Decision Maker contacts, then discovers and appends new DM contacts
 in the same A-U format.
 
@@ -22,7 +22,7 @@ from langgraph.graph import StateGraph, END
 
 from backend.config import get_settings
 from backend.state import Contact, SearcherState
-from backend.tools import sheets, zerobounce as zb
+from backend.tools import sheets
 from backend.tools.domain_discovery import construct_email
 from backend.tools.search import search, search_with_fallback
 from backend.tools import theorg, wikidata
@@ -34,55 +34,93 @@ logger = get_logger("searcher")
 # Role bucket keyword lookup table — deterministic, no LLM
 # ---------------------------------------------------------------------------
 
-_DM_KEYWORDS = {
-    # English
+# ---------------------------------------------------------------------------
+# 5-tier role classification matching Gopal's mapping requirements:
+#   Tier 1: CEO/MD         — must have per company
+#   Tier 2: CTO/CIO        — must have per company
+#   Tier 3: CSO/Head of Sales — must have per company
+#   Tier 4: P1 Influencer  — directors, VPs, senior managers
+#   Tier 5: Gatekeeper     — assistants, coordinators
+# ---------------------------------------------------------------------------
+
+_CEO_MD_KEYWORDS = {
     "chief executive", "ceo", "managing director", "md", "president",
-    "chief operating", "coo", "chief commercial", "chief revenue",
-    "vp sales", "vice president sales", "head of sales", "sales director",
-    "vp marketing", "vice president marketing", "head of marketing", "marketing director",
-    "chief marketing", "cmo",
-    "chief digital", "cdo", "chief technology", "cto", "chief information", "cio",
-    "vp digital", "head of digital", "digital director", "ecommerce director",
-    "director of ecommerce", "head of ecommerce",
-    "general manager", "gm", "country manager", "regional director",
-    "vp operations", "operations director", "supply chain director",
-    "head of supply chain", "procurement director", "vp procurement",
+    "founder", "co-founder", "owner", "general manager", "gm",
+    "country manager", "country head", "country director",
+    "chief operating", "coo", "chief commercial", "cco",
     # Spanish
-    "director general", "director ejecutivo", "director de marketing",
-    "director de ventas", "director comercial", "director digital",
-    "director de ecommerce", "director de comercio", "gerente general",
-    "gerente comercial", "gerente de marketing", "gerente de ventas",
-    "responsable de marketing", "responsable de ecommerce", "responsable de ventas",
-    "responsable digital", "director de operaciones", "director de tecnologia",
-    "director de sistemas", "jefe de ecommerce", "jefe de marketing",
-    "jefe de ventas", "jefe comercial",
-    # Portuguese (Brazil / LATAM)
-    "diretor geral", "diretor executivo", "diretor de marketing",
-    "diretor comercial", "diretor de vendas", "diretor digital",
-    "gerente geral", "gerente comercial", "gerente de marketing",
+    "director general", "director ejecutivo", "gerente general",
+    "consejero delegado",
+    # Portuguese
+    "diretor geral", "diretor executivo",
     # French
-    "directeur général", "directeur marketing", "directeur commercial",
-    "directeur digital", "directeur des ventes", "responsable marketing",
-    "responsable ecommerce", "responsable digital", "responsable commercial",
-    "directeur des operations",
-    # Italian
-    "direttore generale", "direttore commerciale", "direttore marketing",
-    "direttore digitale", "responsabile marketing", "responsabile commerciale",
+    "directeur général", "président directeur",
     # German
-    "geschäftsführer", "leiter marketing", "leiter vertrieb", "leiter digital",
-    # Senior manager tiers that qualify as DM (national/zonal/cluster scope)
-    "national sales manager", "national manager", "national head",
-    "zonal sales manager", "zonal manager", "zonal head",
-    "cluster manager", "regional head", "area director",
-    "key account director", "trade marketing director", "trade marketing manager",
-    "category director", "category head", "commercial head",
-    "business head", "business director", "business development director",
+    "geschäftsführer",
+    # Italian
+    "direttore generale", "amministratore delegato",
 }
 
-_INFLUENCER_KEYWORDS = {
+_CTO_CIO_KEYWORDS = {
+    "chief technology", "cto", "chief information", "cio",
+    "chief digital", "cdo", "chief data", "chief product", "cpo",
+    "vp technology", "vp engineering", "vp it", "vp digital",
+    "head of technology", "head of engineering", "head of it", "head of digital",
+    "director of technology", "director of engineering", "it director",
+    "digital director", "technology director",
+    # Spanish
+    "director de tecnologia", "director de sistemas", "director digital",
+    "responsable digital", "responsable de tecnologia",
+    # Portuguese
+    "diretor de tecnologia", "diretor digital",
+    # French
+    "directeur digital", "directeur des systèmes", "directeur technique",
+    # German
+    "leiter digital", "leiter it",
+}
+
+_CSO_SALES_KEYWORDS = {
+    "chief sales", "cso", "chief revenue", "cro",
+    "vp sales", "vice president sales", "head of sales", "sales director",
+    "director of sales", "commercial director", "chief commercial",
+    "vp marketing", "vice president marketing", "head of marketing",
+    "marketing director", "chief marketing", "cmo",
+    "vp ecommerce", "head of ecommerce", "ecommerce director",
+    "director of ecommerce", "director of marketing",
+    "national sales manager", "national head", "business director",
+    "business head", "business development director",
+    "key account director", "trade marketing director",
+    "category director", "commercial head",
+    # Spanish
+    "director de ventas", "director comercial", "director de marketing",
+    "director de ecommerce", "gerente comercial", "gerente de ventas",
+    "gerente de marketing", "jefe comercial", "jefe de ventas",
+    "jefe de marketing", "responsable de ventas", "responsable de marketing",
+    "responsable de ecommerce", "responsable comercial",
+    # Portuguese
+    "diretor comercial", "diretor de vendas", "diretor de marketing",
+    # French
+    "directeur commercial", "directeur marketing", "directeur des ventes",
+    "responsable marketing", "responsable commercial", "responsable ecommerce",
+    # German
+    "leiter marketing", "leiter vertrieb",
+    # Italian
+    "direttore commerciale", "direttore marketing", "responsabile commerciale",
+    "responsabile marketing",
+}
+
+_P1_INFLUENCER_KEYWORDS = {
     "director", "vp", "vice president", "head of", "senior manager",
     "sr manager", "group manager", "principal", "lead", "manager",
     "senior director", "associate director",
+    "regional director", "area director", "regional head",
+    "zonal sales manager", "zonal manager", "cluster manager",
+    "trade marketing manager", "category head",
+    "vp operations", "operations director", "supply chain director",
+    "head of supply chain", "procurement director", "vp procurement",
+    "chief financial", "cfo", "finance director",
+    # Spanish
+    "director de operaciones", "jefe de ecommerce",
 }
 
 _GATEKEEPER_KEYWORDS = {
@@ -91,27 +129,50 @@ _GATEKEEPER_KEYWORDS = {
     "executive coordinator",
 }
 
+# Must-have roles — Searcher will specifically web-search for these if missing
+MUST_HAVE_TIERS = [
+    {"tier": "CEO/MD", "keywords": _CEO_MD_KEYWORDS, "search_queries": [
+        "CEO", "Managing Director", "General Manager", "Country Manager",
+    ]},
+    {"tier": "CTO/CIO", "keywords": _CTO_CIO_KEYWORDS, "search_queries": [
+        "CTO", "CIO", "Head of Technology", "VP Engineering",
+    ]},
+    {"tier": "CSO/Head of Sales", "keywords": _CSO_SALES_KEYWORDS, "search_queries": [
+        "Head of Sales", "Sales Director", "CMO", "Head of Marketing", "Commercial Director",
+    ]},
+]
 
-def _classify_role(role_title: str) -> Literal["DM", "Influencer", "GateKeeper", "Unknown"]:
+
+def _classify_role(role_title: str) -> str:
     """
-    Classify a role title into a bucket using keyword lookup.
-    Priority: DM > GateKeeper > Influencer > Unknown
+    Classify a role title into Gopal's 5-tier system.
+    Returns: "CEO/MD" | "CTO/CIO" | "CSO/Head of Sales" | "P1 Influencer" | "Gatekeeper" | "Unknown"
     """
     if not role_title:
         return "Unknown"
     t = role_title.lower()
 
-    for kw in _DM_KEYWORDS:
+    for kw in _CEO_MD_KEYWORDS:
         if kw in t:
-            return "DM"
+            return "CEO/MD"
+
+    for kw in _CTO_CIO_KEYWORDS:
+        if kw in t:
+            return "CTO/CIO"
+
+    for kw in _CSO_SALES_KEYWORDS:
+        if kw in t:
+            return "CSO/Head of Sales"
 
     for kw in _GATEKEEPER_KEYWORDS:
         if kw in t:
-            return "GateKeeper"
+            return "Gatekeeper"
 
-    for kw in _INFLUENCER_KEYWORDS:
+    for kw in _P1_INFLUENCER_KEYWORDS:
         if kw in t:
-            return "Influencer"
+            return "P1 Influencer"
+
+    return "Unknown"
 
     return "Unknown"
 
@@ -123,7 +184,7 @@ def _classify_role(role_title: str) -> Literal["DM", "Influencer", "GateKeeper",
 async def load_gap_analysis(state: SearcherState) -> SearcherState:
     """
     1. Read Target Accounts to get org_id, domain, email_format that Fini already discovered.
-    2. Build a set of existing person names from both First Clean List AND Final Filtered List.
+    2. Build a set of existing person names from both First Clean List AND First Clean List.
     3. Determine which DM roles from input are not yet covered.
     """
     from backend.utils.progress import emit as _emit_progress, emit_log as _emit_log
@@ -203,13 +264,13 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
     except Exception as e:
         logger.warning("searcher_target_accounts_read_error", error=str(e))
 
-    # --- Step 2: read existing contacts from Final Filtered List + Searcher Output ---
+    # --- Step 2: read existing contacts from First Clean List + Searcher Output ---
     # Find which roles are already covered so we only search for the gaps.
     existing_names: list[str] = []
     existing_role_titles: list[str] = []
     _match_name = normalized_company_name.lower()
     try:
-        for tab in (sheets.FINAL_FILTERED_LIST, sheets.FIRST_CLEAN_LIST):
+        for tab in (sheets.FIRST_CLEAN_LIST,):
             records = await sheets.read_all_records(tab)
             for row in records:
                 company_col = str(row.get("Company Name", "")).lower()
@@ -226,51 +287,40 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
     except Exception as e:
         logger.warning("searcher_existing_names_read_error", error=str(e))
 
-    # --- Step 3: determine which requested roles are not yet covered ---
-    requested_roles = list(state.dm_roles) if state.dm_roles else [
-        "CEO", "MD", "Managing Director", "CMO", "VP Marketing", "Head of Marketing",
-        "CDO", "CTO", "VP Digital", "Head of Digital", "VP Ecommerce", "Head of Ecommerce",
-        "VP Sales", "Head of Sales", "Sales Director", "General Manager", "Country Manager",
-        "Director of Sales", "Director of Marketing", "Director of Digital",
-        "Director of Ecommerce", "Director of Operations", "Director of Strategy",
-        "Chief Commercial Officer", "CCO", "COO", "CFO",
-        "Commercial Director", "Business Director", "National Sales Manager",
-        "Regional Director", "Area Manager", "Key Account Director",
-    ]
-
-    # Check each requested role against existing role titles using LOOSE fuzzy match
-    # We want to match broadly: "VP Marketing" should match "Director of Marketing",
-    # "Head of Sales" should match "Sales Director", etc.
-    from rapidfuzz import fuzz as _role_fuzz
-    missing_roles = []
-
-    # Extract core function keywords for broad matching
-    _ROLE_KEYWORDS = {
-        "marketing", "sales", "digital", "ecommerce", "e-commerce", "commercial",
-        "operations", "strategy", "technology", "finance", "hr", "supply chain",
+    # --- Step 3: check must-have tiers against existing contacts ---
+    # Gopal's rule: Searcher MUST confirm CEO, CTO, CSO exist for each company.
+    # Classify existing contacts into tiers, then find gaps.
+    existing_tiers: dict[str, list[str]] = {
+        "CEO/MD": [], "CTO/CIO": [], "CSO/Head of Sales": [],
+        "P1 Influencer": [], "Gatekeeper": [], "Unknown": [],
     }
+    for title in existing_role_titles:
+        tier = _classify_role(title)
+        existing_tiers[tier].append(title)
 
-    for role in requested_roles:
-        role_lower = role.lower()
-        # Check if any existing title is a close match OR shares the same function keyword
-        already_covered = False
-        for existing in existing_role_titles:
-            existing_lower = existing.lower()
-            # Fuzzy match (lowered threshold from 80 to 60 for broader matching)
-            if _role_fuzz.partial_ratio(role_lower, existing_lower) >= 60:
-                already_covered = True
-                break
-            # Keyword overlap: if both mention "marketing" or "sales", consider covered
-            role_keywords = {kw for kw in _ROLE_KEYWORDS if kw in role_lower}
-            existing_keywords = {kw for kw in _ROLE_KEYWORDS if kw in existing_lower}
-            if role_keywords and role_keywords & existing_keywords:
-                # Same function — check if existing is also senior level
-                senior_words = {"vp", "director", "head", "chief", "manager", "lead", "president"}
-                if any(sw in existing_lower for sw in senior_words):
-                    already_covered = True
-                    break
-        if not already_covered:
-            missing_roles.append(role)
+    # Determine which must-have tiers are missing
+    missing_tiers: list[dict] = []
+    for tier_def in MUST_HAVE_TIERS:
+        tier_name = tier_def["tier"]
+        if not existing_tiers.get(tier_name):
+            missing_tiers.append(tier_def)
+
+    # Build the missing_roles list from must-have tiers
+    missing_roles = []
+    for tier_def in missing_tiers:
+        missing_roles.extend(tier_def["search_queries"])
+
+    # Also add any explicitly requested roles from input
+    if state.dm_roles:
+        for role in state.dm_roles:
+            if role not in missing_roles:
+                missing_roles.append(role)
+
+    await _emit_log(state.thread_id,
+        f"[{state.target_company}] Existing mapping: "
+        + ", ".join(f"{k}: {len(v)}" for k, v in existing_tiers.items() if v)
+        + (f" | Missing tiers: {', '.join(t['tier'] for t in missing_tiers)}" if missing_tiers else " | All must-have tiers covered"),
+        level="info" if missing_tiers else "success")
 
     if not missing_roles:
         logger.info("searcher_gap_analysis_all_covered",
@@ -289,11 +339,12 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
             "phase": "done",
         })
 
+    covered_tiers = [t["tier"] for t in MUST_HAVE_TIERS if t not in missing_tiers]
     logger.info("searcher_gap_analysis_roles",
                 company=state.target_company,
-                requested=requested_roles,
-                already_covered=[r for r in requested_roles if r not in missing_roles],
-                missing=missing_roles)
+                covered_tiers=covered_tiers,
+                missing_tiers=[t["tier"] for t in missing_tiers],
+                missing_roles=missing_roles)
     await _emit_log(state.thread_id,
         f"[{state.target_company}] Gap analysis done — {len(missing_roles)} missing role(s): {', '.join(missing_roles[:5])}{'…' if len(missing_roles) > 5 else ''}",
         level="info")
@@ -1068,6 +1119,82 @@ async def await_full_selection(state: SearcherState) -> SearcherState:
 
 
 # ---------------------------------------------------------------------------
+# Helper: web search for must-have roles (CEO, CTO, CSO)
+# ---------------------------------------------------------------------------
+
+async def _web_search_must_have_people(
+    company_name: str,
+    missing_tiers: list[dict],
+    thread_id: str | None = None,
+) -> list[dict]:
+    """
+    Use web search to find specific must-have people.
+    e.g. "Who is the CEO of Zomato?" → "Deepinder Goyal"
+    Returns list of {"name": str, "title": str, "tier": str}
+    """
+    from backend.tools.llm import llm_web_search
+    from backend.utils.progress import emit_log as _ws_log
+
+    found_people: list[dict] = []
+
+    for tier_def in missing_tiers:
+        tier_name = tier_def["tier"]
+        # Search for the top role in this tier
+        search_title = tier_def["search_queries"][0]  # e.g. "CEO", "CTO", "Head of Sales"
+
+        try:
+            await _ws_log(thread_id,
+                          f"[{company_name}] searching web: who is the {search_title}?")
+
+            prompt = (
+                f"Who is the {search_title} of {company_name}? "
+                f"If the exact title doesn't exist, find the closest equivalent "
+                f"(e.g. Managing Director instead of CEO, VP Engineering instead of CTO). "
+                f"Return ONLY: Full Name — Exact Title. Nothing else. "
+                f"If unknown, return: unknown"
+            )
+            raw = await llm_web_search(prompt)
+            content = (raw or "").strip()
+
+            if not content or content.lower() == "unknown":
+                await _ws_log(thread_id,
+                              f"[{company_name}] {tier_name}: not found via web search")
+                continue
+
+            # Parse "Name — Title" or "Name - Title"
+            import re as _re
+            parts = _re.split(r'\s*[—–\-]\s*', content, maxsplit=1)
+            if len(parts) >= 2:
+                name = parts[0].strip()
+                title = parts[1].strip()
+            else:
+                name = content.strip()
+                title = search_title
+
+            # Basic validation
+            if len(name) < 3 or len(name) > 60:
+                continue
+            # Skip if it looks like a sentence, not a name
+            if any(w in name.lower() for w in ["the", "is", "was", "company", "unknown"]):
+                continue
+
+            found_people.append({
+                "name": name,
+                "title": title,
+                "tier": tier_name,
+            })
+            await _ws_log(thread_id,
+                          f"[{company_name}] {tier_name}: found {name} — {title}",
+                          "success")
+
+        except Exception as e:
+            logger.warning("web_search_must_have_error",
+                           company=company_name, tier=tier_name, error=str(e))
+
+    return found_people
+
+
+# ---------------------------------------------------------------------------
 # Node: unipile_search  (primary LinkedIn discovery)
 # ---------------------------------------------------------------------------
 
@@ -1089,6 +1216,29 @@ async def unipile_search(state: SearcherState) -> SearcherState:
     await _uni_log(state.thread_id,
         f"[{state.target_company}] Starting LinkedIn search — building role queries…",
         level="info")
+
+    # --- Web search for must-have roles (CEO, CTO, CSO) ---
+    # Identify which tiers are missing from existing contacts and search the web.
+    _existing_tiers_covered: set[str] = set()
+    for _et in (state.missing_dm_roles or []):
+        _et_tier = _classify_role(_et)
+        if _et_tier != "Unknown":
+            _existing_tiers_covered.add(_et_tier)
+    # Actually check what tiers are MISSING (not covered in gap analysis)
+    _missing_tier_defs = [
+        t for t in MUST_HAVE_TIERS
+        if any(q in (state.missing_dm_roles or []) for q in t["search_queries"])
+    ]
+    _web_found: list[dict] = []
+    if _missing_tier_defs:
+        company_name_for_search = state.target_normalized_name or state.target_company
+        _web_found = await _web_search_must_have_people(
+            company_name_for_search, _missing_tier_defs, state.thread_id
+        )
+        if _web_found:
+            await _uni_log(state.thread_id,
+                f"[{state.target_company}] Web search found {len(_web_found)} must-have people — will verify on LinkedIn",
+                level="success")
 
     # Build function-level search queries from expanded roles.
     # Strategy: one query PER BUSINESS FUNCTION (marketing, digital, sales, ops, …)
@@ -1228,8 +1378,56 @@ async def unipile_search(state: SearcherState) -> SearcherState:
                     msg="will rely on web/filings search")
 
     logger.info("searcher_unipile_done", company=state.target_company, found=len(new_contacts))
+
+    # --- Add web-found must-have people (verify on LinkedIn first) ---
+    if _web_found:
+        from backend.tools.unipile import search_person_by_name
+        _existing_names_lower = {c.full_name.lower() for c in new_contacts}
+        for wf in _web_found:
+            wf_name = wf["name"]
+            if wf_name.lower() in _existing_names_lower:
+                await _uni_log(state.thread_id,
+                    f"[{state.target_company}] {wf_name} ({wf['tier']}) already found via LinkedIn — skipping")
+                continue
+            # Try to find this person on LinkedIn
+            try:
+                matches = await search_person_by_name(wf_name, org_id=org_id, limit=3)
+                if matches:
+                    best = matches[0]
+                    contact = Contact(
+                        full_name=best.get("full_name") or wf_name,
+                        company=company_name,
+                        domain=state.target_domain or "",
+                        role_title=wf["title"],
+                        role_bucket=_classify_role(wf["title"]),
+                        linkedin_url=best.get("linkedin_url", ""),
+                        linkedin_verified=True,
+                        provenance=["web_search_must_have"],
+                    )
+                    new_contacts.append(contact)
+                    _existing_names_lower.add(contact.full_name.lower())
+                    await _uni_log(state.thread_id,
+                        f"[{state.target_company}] {wf['tier']}: {contact.full_name} — {wf['title']} (verified on LinkedIn)",
+                        level="success")
+                else:
+                    # Add without LinkedIn URL — Veri will try to find them
+                    contact = Contact(
+                        full_name=wf_name,
+                        company=company_name,
+                        domain=state.target_domain or "",
+                        role_title=wf["title"],
+                        role_bucket=_classify_role(wf["title"]),
+                        provenance=["web_search_must_have"],
+                    )
+                    new_contacts.append(contact)
+                    await _uni_log(state.thread_id,
+                        f"[{state.target_company}] {wf['tier']}: {wf_name} — {wf['title']} (from web, needs LinkedIn verification)",
+                        level="info")
+            except Exception as e:
+                logger.warning("web_found_verify_error", name=wf_name, error=str(e))
+
     await _uni_log(state.thread_id,
-        f"[{state.target_company}] LinkedIn done — {len(new_contacts)} verified contact(s) found",
+        f"[{state.target_company}] Search done — {len(new_contacts)} contact(s) found",
         level="success" if new_contacts else "info")
     existing = list(state.discovered_contacts)
     return state.model_copy(update={
@@ -2191,7 +2389,7 @@ async def deduplicate(state: SearcherState) -> SearcherState:
     """
     Deduplicate discovered contacts using rapidfuzz fuzzy matching.
     Merges records where name similarity >= 90% AND company similarity >= 85%.
-    Also removes contacts already present in Final Filtered List for this company.
+    Also removes contacts already present in First Clean List for this company.
     """
     logger.info("searcher_deduplicate", company=state.target_company, raw_count=len(state.discovered_contacts))
     from backend.utils.progress import emit_log as _dedup_log
@@ -2205,13 +2403,13 @@ async def deduplicate(state: SearcherState) -> SearcherState:
     try:
         from rapidfuzz import fuzz
 
-        # Collect names already in First Clean List + Final Filtered List for this company.
+        # Collect names already in First Clean List + First Clean List for this company.
         # Match on normalized name (from Target Accounts) to avoid wrong substring hits.
         existing_names: list[str] = []
         _norm = (state.target_normalized_name or state.target_company).lower()
         _raw = state.target_company.lower()
         try:
-            for tab in (sheets.FIRST_CLEAN_LIST, sheets.FINAL_FILTERED_LIST):
+            for tab in (sheets.FIRST_CLEAN_LIST,):
                 records = await sheets.read_all_records(tab)
                 for row in records:
                     company_col = str(row.get("Company Name", "")).lower()
@@ -2224,7 +2422,7 @@ async def deduplicate(state: SearcherState) -> SearcherState:
         except Exception as e:
             logger.warning("searcher_dedup_existing_read_error", error=str(e))
 
-        # Filter out contacts already in Final Filtered List
+        # Filter out contacts already in First Clean List
         contacts = state.discovered_contacts
         if existing_names:
             def _already_exists(c: Contact) -> bool:
@@ -2412,38 +2610,65 @@ async def _detect_email_format_llm(domain: str, company: str) -> str | None:
     return None
 
 
-async def _try_patterns_zerobounce(full_name: str, domain: str) -> tuple[str | None, str | None, float | None]:
+def _learn_email_format_from_existing(emails: list[str], names: list[str], domain: str) -> str | None:
     """
-    Try all email patterns in parallel batches with ZeroBounce.
-    Returns the first valid/catch-all hit, or (None, 'invalid', None).
+    Reverse-engineer email format from existing n8n-provided emails for the same company.
+
+    Given real emails like 'john.smith@acme.com' and names like 'John Smith',
+    deduces the pattern (e.g. '{first}.{last}@acme.com') so we can construct
+    emails for gap-fill contacts without calling ZeroBounce.
     """
     from backend.tools.domain_discovery import _EMAIL_PATTERNS
 
-    emails = [(pattern, construct_email(full_name, f"{pattern}@{domain}", domain))
-              for pattern in _EMAIL_PATTERNS]
-    emails = [(pat, em) for pat, em in emails if em]
+    if not emails or not names or not domain:
+        return None
 
-    sem = asyncio.Semaphore(6)
+    # Build pairs of (email_local_part, first_name, last_name)
+    pairs: list[tuple[str, str, str]] = []
+    for email, name in zip(emails, names):
+        if not email or "@" not in email:
+            continue
+        local = email.split("@")[0].lower()
+        parts = name.strip().split()
+        if len(parts) < 2:
+            continue
+        first = parts[0].lower()
+        last = parts[-1].lower()
+        pairs.append((local, first, last))
 
-    async def _check(pattern: str, email: str) -> tuple[str, str, str, float | None] | None:
-        async with sem:
-            try:
-                result = await zb.validate_email(email)
-                status = result.get("status", "unknown")
-                if status in ("valid", "catch-all"):
-                    return pattern, email, status, result.get("score")
-            except Exception:
-                pass
-            return None
+    if not pairs:
+        return None
 
-    results = await asyncio.gather(*[_check(pat, em) for pat, em in emails])
-    for hit in results:
-        if hit:
-            pattern, email, status, score = hit
-            logger.info("searcher_pattern_hit", email=email, status=status, pattern=pattern)
-            return email, status, score
+    # Try each pattern against known email/name pairs, score by match count
+    best_pattern: str | None = None
+    best_count = 0
 
-    return None, "invalid", None
+    for pattern in _EMAIL_PATTERNS:
+        match_count = 0
+        for local, first, last in pairs:
+            expected = (
+                pattern
+                .replace("{first}", first)
+                .replace("{last}", last)
+                .replace("{first_initial}", first[0])
+                .replace("{last_initial}", last[0])
+                .replace("{first_name}", first)
+                .replace("{last_name}", last)
+            )
+            if expected == local:
+                match_count += 1
+        if match_count > best_count:
+            best_count = match_count
+            best_pattern = pattern
+
+    # Need at least 1 match to be confident
+    if best_pattern and best_count >= 1:
+        fmt = f"{best_pattern}@{domain}"
+        logger.info("searcher_learned_email_format",
+                    pattern=best_pattern, matches=best_count, total_pairs=len(pairs), domain=domain)
+        return fmt
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2452,13 +2677,13 @@ async def _try_patterns_zerobounce(full_name: str, domain: str) -> tuple[str | N
 
 async def enrich_contacts(state: SearcherState) -> SearcherState:
     """
-    Role classification (keyword table), email construction, ZeroBounce.
+    Role classification (keyword table), email construction.
 
-    Email priority:
-    1. Fini's email_format (from Target Accounts) → ZeroBounce
-    2. If no hit → try all 18 patterns → ZeroBounce
-    3. If no Fini format → try all 18 patterns via ZeroBounce
-    4. If no hit → try all 18 patterns → ZeroBounce
+    Email is constructed from known format — no ZeroBounce validation.
+    The email format is already known from:
+    1. Fini's email_format (stored in Target Accounts)
+    2. Existing n8n-provided emails in First Clean List (reverse-engineered)
+    3. Fallback: {first}.{last}@domain (most common B2B pattern)
     """
     logger.info("searcher_enrich",
                 company=state.target_company,
@@ -2466,18 +2691,53 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                 email_format=state.target_email_format or "(empty)",
                 domain=state.target_domain or "(empty)")
     from backend.utils.progress import emit_log as _enrich_log
-    await _enrich_log(state.thread_id,
-        f"[{state.target_company}] Enriching {len(state.discovered_contacts)} contact(s) — validating emails…",
-        level="info")
 
     domain = state.target_domain
     fini_format = state.target_email_format or ""  # e.g. "{first}.{last}@domain.com"
 
-    # Use Fini's format from Target Accounts — no LLM call needed
-    gpt_format: str | None = None
+    # If Fini didn't provide a format, learn it from existing n8n emails in FFL
+    learned_format: str | None = None
     if domain and not fini_format:
-        logger.info("searcher_enrich_no_fini_format", domain=domain,
-                    msg="Fini did not discover email format, will try 18-pattern ZeroBounce probe")
+        try:
+            ffl_records = await sheets.read_all_records(sheets.FIRST_CLEAN_LIST)
+            _match_lower = state.target_company.lower()
+            _norm_lower = (state.target_normalized_name or "").lower()
+            existing_emails: list[str] = []
+            existing_names: list[str] = []
+            for row in ffl_records:
+                co = str(row.get("Company Name", "") or "").strip().lower()
+                if _match_lower not in co and _norm_lower not in co:
+                    continue
+                email = str(row.get("Email", "") or "").strip()
+                first = str(row.get("First Name", "") or "").strip()
+                last = str(row.get("Last Name", "") or "").strip()
+                if email and "@" in email and first and last:
+                    # Only use emails from the same domain
+                    email_domain = email.split("@")[1].lower()
+                    if email_domain == domain.lower():
+                        existing_emails.append(email)
+                        existing_names.append(f"{first} {last}")
+            if existing_emails:
+                learned_format = _learn_email_format_from_existing(existing_emails, existing_names, domain)
+                if learned_format:
+                    await _enrich_log(state.thread_id,
+                        f"[{state.target_company}] Learned email format from {len(existing_emails)} existing contact(s): {learned_format}",
+                        level="info")
+                else:
+                    logger.info("searcher_enrich_no_learned_format", domain=domain,
+                                emails=len(existing_emails),
+                                msg="Could not deduce format from existing emails")
+        except Exception as e:
+            logger.warning("searcher_learn_format_error", error=str(e))
+
+    # Priority: fini_format > learned_format > {first}.{last}@domain (most common B2B default)
+    email_format = fini_format or learned_format or (f"{{first}}.{{last}}@{domain}" if domain else "")
+    format_source = "fini" if fini_format else ("learned_from_ffl" if learned_format else "default_first.last")
+    logger.info("searcher_email_format_resolved",
+                format=email_format or "(none)", source=format_source, domain=domain or "(none)")
+    await _enrich_log(state.thread_id,
+        f"[{state.target_company}] Enriching {len(state.discovered_contacts)} contact(s) — constructing emails from {format_source}",
+        level="info")
 
     # Shared mutable state — protected by write_lock
     write_lock = asyncio.Lock()
@@ -2486,14 +2746,18 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
     fcl_end_box:   list[int | None] = [None]
 
     bucket_label_map = {
+        "CEO/MD": "CEO/MD", "CTO/CIO": "CTO/CIO",
+        "CSO/Head of Sales": "CSO/Head of Sales",
+        "P1 Influencer": "P1 Influencer", "Gatekeeper": "Gatekeeper",
+        # Legacy compat
         "DM": "Decision Maker", "Champion": "Champion",
-        "Influencer": "Influencer", "GateKeeper": "Gate Keeper", "Unknown": "",
+        "Influencer": "P1 Influencer", "GateKeeper": "Gatekeeper", "Unknown": "",
     }
 
     enrich_sem = asyncio.Semaphore(8)
 
     async def _enrich_and_write(contact: Contact) -> None:
-        """Enrich one contact (parallel ZeroBounce), then immediately write to sheet."""
+        """Enrich one contact — construct email from known format, no ZeroBounce."""
         async with enrich_sem:
             bucket = _classify_role(contact.role_title or "")
             contact = contact.model_copy(update={"role_bucket": bucket})
@@ -2504,67 +2768,20 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                 return
 
             await _enrich_log(state.thread_id,
-                f"[{contact.company}] Enriching {contact.full_name} ({contact.role_title or 'unknown role'}) — validating email…",
+                f"[{contact.company}] Enriching {contact.full_name} ({contact.role_title or 'unknown role'}) — constructing email…",
                 level="info")
 
-            if not contact.email and domain:
-                primary_format = fini_format or gpt_format
-
-                if primary_format:
-                    candidate = construct_email(contact.full_name, primary_format, domain)
-                    hit_email, hit_status, hit_score = None, None, None
-
-                    if candidate:
-                        try:
-                            result = await zb.validate_email(candidate)
-                            hit_status = result.get("status", "unknown")
-                            hit_score = result.get("score")
-                            if hit_status in ("valid", "catch-all"):
-                                hit_email = candidate
-                                logger.info("searcher_primary_format_hit",
-                                            email=candidate, status=hit_status,
-                                            source="fini" if fini_format else "llm")
-                        except Exception as e:
-                            logger.warning("searcher_zerobounce_error", email=candidate, error=str(e))
-
-                    if hit_email:
-                        contact = contact.model_copy(update={
-                            "email": hit_email, "email_status": hit_status,
-                            "zerobounce_score": hit_score,
-                        })
-                    else:
-                        logger.info("searcher_primary_format_miss",
-                                    email=candidate, status=hit_status, fallback="18_patterns")
-                        pat_email, pat_status, pat_score = await _try_patterns_zerobounce(
-                            contact.full_name, domain)
-                        if pat_email:
-                            contact = contact.model_copy(update={
-                                "email": pat_email, "email_status": pat_status,
-                                "zerobounce_score": pat_score,
-                            })
-                        else:
-                            contact = contact.model_copy(update={
-                                "email": candidate or "", "email_status": "invalid",
-                            })
-                else:
-                    pat_email, pat_status, pat_score = await _try_patterns_zerobounce(
-                        contact.full_name, domain)
-                    if pat_email:
-                        contact = contact.model_copy(update={
-                            "email": pat_email, "email_status": pat_status,
-                            "zerobounce_score": pat_score,
-                        })
-
-            elif contact.email and contact.email_status == "pending":
-                try:
-                    result = await zb.validate_email(contact.email)
-                    status = result.get("status", "unknown")
+            # Construct email from known format (no ZeroBounce validation)
+            if not contact.email and domain and email_format:
+                constructed = construct_email(contact.full_name, email_format, domain)
+                if constructed:
                     contact = contact.model_copy(update={
-                        "email_status": status, "zerobounce_score": result.get("score"),
+                        "email": constructed,
+                        "email_status": "constructed",
                     })
-                except Exception as e:
-                    logger.warning("searcher_zerobounce_error", email=contact.email, error=str(e))
-                    contact = contact.model_copy(update={"email_status": "unknown"})
+                    logger.info("searcher_email_constructed",
+                                contact=contact.full_name, email=constructed,
+                                format_source=format_source)
 
             if not contact.domain:
                 contact = contact.model_copy(update={"domain": domain})
@@ -2585,25 +2802,27 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                 ]
                 await sheets.append_row(sheets.SEARCHER_OUTPUT, so_row)
 
-                await sheets.ensure_headers(sheets.FINAL_FILTERED_LIST, sheets.FINAL_FILTERED_LIST_HEADERS)
+                await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
                 name_parts = contact.full_name.strip().split(None, 1)
                 first_name = name_parts[0] if name_parts else ""
                 last_name  = name_parts[1] if len(name_parts) > 1 else ""
                 fcl_row = [
-                    contact.company,
-                    state.target_normalized_name or contact.company,
-                    contact.domain or state.target_domain or "",
-                    state.target_region or "",
-                    state.target_account_size or "",
-                    state.target_region or "",
-                    first_name, last_name,
-                    contact.role_title or "",
-                    bucket_label_map.get(contact.role_bucket, ""),
-                    contact.linkedin_url or "",
-                    contact.email or "",
-                    "", "",  # Phone-1, Phone-2
+                    contact.company,                                    # A
+                    state.target_normalized_name or contact.company,    # B
+                    contact.domain or state.target_domain or "",        # C
+                    state.target_region or "",                          # D
+                    state.target_account_size or "",                    # E
+                    state.target_region or "",                          # F
+                    first_name, last_name,                              # G, H
+                    contact.role_title or "",                           # I
+                    bucket_label_map.get(contact.role_bucket, ""),      # J
+                    contact.linkedin_url or "",                         # K
+                    contact.email or "",                                # L
+                    "", "",                                             # M, N (Phone-1, Phone-2)
+                    "searcher",                                         # O (Source)
+                    "",                                                 # P (Pipeline Status — empty, Veri will fill)
                 ]
-                written_fcl_row = await sheets.append_row(sheets.FINAL_FILTERED_LIST, fcl_row)
+                written_fcl_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, fcl_row)
                 data_row = written_fcl_row - 1
                 if fcl_start_box[0] is None:
                     fcl_start_box[0] = data_row

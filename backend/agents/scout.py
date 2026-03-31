@@ -321,9 +321,7 @@ async def prepare(state: ScoutState) -> dict:
                 timeout=8, default=[], label=f"dup_read_{tab}",
             )
 
-        fcl_records, ffl_records = await asyncio.gather(
-            _read(sheets.FIRST_CLEAN_LIST), _read(sheets.FINAL_FILTERED_LIST)
-        )
+        fcl_records = await _read(sheets.FIRST_CLEAN_LIST)
 
         def _scan(records: list[dict], sheet_name: str) -> None:
             for i, row in enumerate(records, start=2):
@@ -349,7 +347,6 @@ async def prepare(state: ScoutState) -> dict:
                 })
 
         _scan(fcl_records, "First Clean List")
-        _scan(ffl_records, "Final Filtered List")
 
     async def _company_lookup() -> None:
         if not company_name:
@@ -909,32 +906,30 @@ async def run_scout(query: str, company: str, history: list[dict]) -> dict:
 
 async def commit_to_sheet(candidate: dict, company_context: dict | None = None) -> dict:
     """
-    Write a fully enriched Scout candidate to Final Filtered List (cols A–U).
+    Write a fully enriched Scout candidate to First Clean List (cols A–P).
     Pre-checks for duplicates. Returns {"status": "ok"|"duplicate", "row": int, "sheet": str}.
     """
     full_name = candidate.get("full_name", "")
     company   = candidate.get("company", "")
     first, last = _parse_name(full_name)
 
-    # Pre-write duplicate check
+    # Pre-write duplicate check (single source: First Clean List)
     try:
-        fcl, ffl = await asyncio.gather(
-            _safe(sheets.read_all_records(sheets.FIRST_CLEAN_LIST), timeout=8, default=[], label="commit_dup_fcl"),
-            _safe(sheets.read_all_records(sheets.FINAL_FILTERED_LIST), timeout=8, default=[], label="commit_dup_ffl"),
+        fcl = await _safe(
+            sheets.read_all_records(sheets.FIRST_CLEAN_LIST), timeout=8, default=[], label="commit_dup_fcl",
         )
-        for records, sheet_name in [(fcl, "First Clean List"), (ffl, "Final Filtered List")]:
-            for i, row in enumerate(records, start=2):
-                rc = row.get("Company Name", "")
-                rf = row.get("First Name", "")
-                rl = row.get("Last Name", "")
-                rn = f"{rf} {rl}".strip()
-                if _companies_match(rc, company) and _names_match(rn, full_name):
-                    return {
-                        "status": "duplicate",
-                        "row": i,
-                        "sheet": sheet_name,
-                        "detail": f"{full_name} already exists in {sheet_name} at row {i}",
-                    }
+        for i, row in enumerate(fcl, start=2):
+            rc = row.get("Company Name", "")
+            rf = row.get("First Name", "")
+            rl = row.get("Last Name", "")
+            rn = f"{rf} {rl}".strip()
+            if _companies_match(rc, company) and _names_match(rn, full_name):
+                return {
+                    "status": "duplicate",
+                    "row": i,
+                    "sheet": "First Clean List",
+                    "detail": f"{full_name} already exists in First Clean List at row {i}",
+                }
     except Exception as e:
         logger.warning("scout_commit_dup_check_error", error=str(e))
 
@@ -954,7 +949,7 @@ async def commit_to_sheet(candidate: dict, company_context: dict | None = None) 
             email = f"{f}.{l}@{domain}"
             logger.info("scout_commit_email_fallback", name=full_name, email=email)
 
-    # Write cols A–N to Final Filtered List so Veri picks it up for full verification
+    # Write cols A–P to First Clean List so Veri picks it up for full verification
     row = [
         company,                    # A  Company Name
         company,                    # B  Normalized Company Name
@@ -970,9 +965,11 @@ async def commit_to_sheet(candidate: dict, company_context: dict | None = None) 
         email,                      # L  Email
         "",                         # M  Phone-1
         "",                         # N  Phone-2
+        "scout",                    # O  Source
+        "",                         # P  Pipeline Status
     ]
 
-    await sheets.ensure_headers(sheets.FINAL_FILTERED_LIST, sheets.FINAL_FILTERED_LIST_HEADERS)
-    written_row = await sheets.append_row(sheets.FINAL_FILTERED_LIST, row)
-    logger.info("scout_committed_to_ffl", name=full_name, row=written_row)
-    return {"status": "ok", "row": written_row, "sheet": sheets.FINAL_FILTERED_LIST}
+    await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
+    written_row = await sheets.append_row(sheets.FIRST_CLEAN_LIST, row)
+    logger.info("scout_committed_to_fcl", name=full_name, row=written_row)
+    return {"status": "ok", "row": written_row, "sheet": sheets.FIRST_CLEAN_LIST}

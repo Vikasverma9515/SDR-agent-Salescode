@@ -14,7 +14,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SCAI ProspectOps | Enterprise",
+  title: "Salescode ProspectOps | Enterprise",
   description: "Next-generation B2B prospecting pipeline",
   icons: {
     icon: "/favicon.svg",

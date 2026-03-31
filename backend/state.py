@@ -61,8 +61,7 @@ class Contact(BaseModel):
     linkedin_url: str | None = None
     linkedin_verified: bool = False
     email: str | None = None
-    email_status: Literal["valid", "invalid", "catch-all", "unknown", "pending"] = "pending"
-    zerobounce_score: float | None = None
+    email_status: Literal["valid", "invalid", "catch-all", "unknown", "pending", "constructed"] = "pending"
     phones: list[str] = Field(default_factory=list)
     provenance: list[str] = Field(default_factory=list)  # which sources found this person
     verification_status: Literal["VERIFIED", "REVIEW", "REJECT", "PENDING"] = "PENDING"
@@ -139,12 +138,15 @@ class VeriState(BaseModel):
     rejected_count: int = 0
     errors: Annotated[list[str], operator.add] = Field(default_factory=list)
     status: Literal["running", "completed", "failed"] = "running"
-    row_start: int | None = None  # 1-based data row (not header), inclusive
-    row_end: int | None = None    # 1-based data row, inclusive
+    row_start: int | None = None  # 1-based data row (not header), inclusive — optional override
+    row_end: int | None = None    # 1-based data row, inclusive — optional override
+    company_filter: str | None = None  # only verify contacts for this company (auto-detect mode)
     thread_id: str | None = None   # injected by API so emit calls work
-    # Raw A-N values keyed by contact index (copied to Rejected Profiles for REJECT contacts)
+    # Raw A-P values keyed by contact index (copied to Rejected Profiles for REJECT contacts)
     raw_rows: dict[int, list] = Field(default_factory=dict)
-    # Actual 1-based sheet row number keyed by contact index (for in-place update of cols O-U)
+    # Source column value per contact index ("n8n" or "searcher")
+    source_values: dict[int, str] = Field(default_factory=dict)
+    # Actual 1-based sheet row number keyed by contact index (for in-place update of cols Q-W)
     sheet_row_nums: dict[int, int] = Field(default_factory=dict)
 
 

@@ -31,7 +31,7 @@ interface ContactCard {
   status: ContactStatus;
   rejectReason?: string;
   reviewFlags?: string[];   // specific issues that caused REVIEW
-  sheetRow?: number;        // row in Final Filtered List (VERIFIED/REVIEW)
+  sheetRow?: number;        // row in First Clean List (VERIFIED/REVIEW)
   rejectSheetRow?: number;  // row in Reject profiles (REJECT)
   emailValidated?: boolean; // false when ZeroBounce was unavailable
   signals?: ContactSignals; // per-check signal for coloured blocks
@@ -326,7 +326,7 @@ function ContactTile({ card }: { card: ContactCard }) {
         <div className="text-[8px] font-mono text-red-400/50 border-t border-red-400/10 pt-1.5 mt-0.5">
           {card.rejectSheetRow
             ? `→ Reject profiles · row ${card.rejectSheetRow} · removed from Filtered List`
-            : 'Removed from Final Filtered List'}
+            : 'Removed from First Clean List'}
         </div>
       )}
 
@@ -334,8 +334,8 @@ function ContactTile({ card }: { card: ContactCard }) {
       {isReview && (
         <div className="text-[8px] font-mono text-amber-400/45 border-t border-amber-400/10 pt-1.5 mt-0.5">
           {card.sheetRow
-            ? `Final Filtered List · row ${card.sheetRow} · awaiting review`
-            : 'Final Filtered List · awaiting review'}
+            ? `First Clean List · row ${card.sheetRow} · awaiting review`
+            : 'First Clean List · awaiting review'}
         </div>
       )}
 
@@ -343,8 +343,8 @@ function ContactTile({ card }: { card: ContactCard }) {
       {isVerified && (
         <div className="text-[8px] font-mono text-emerald-400/50 border-t border-emerald-400/10 pt-1.5 mt-0.5">
           {card.sheetRow
-            ? `Final Filtered List · row ${card.sheetRow} · confirmed`
-            : 'Final Filtered List · confirmed'}
+            ? `First Clean List · row ${card.sheetRow} · confirmed`
+            : 'First Clean List · confirmed'}
         </div>
       )}
     </div>
@@ -377,7 +377,7 @@ function HowItWorksModal({ onClose }: { onClose: () => void }) {
 
           {/* Intro */}
           <p className="text-white/50">
-            Veri runs a <span className="text-white/80 font-semibold">4-phase verification pipeline</span> for every contact in the Final Filtered List.
+            Veri runs a <span className="text-white/80 font-semibold">4-phase verification pipeline</span> for every contact in the First Clean List.
             Up to <span className="text-white/80 font-semibold">6 contacts are processed in parallel</span> (Semaphore(6)).
             All sheet writes are serialised via a lock to avoid row conflicts.
           </p>
@@ -390,7 +390,7 @@ function HowItWorksModal({ onClose }: { onClose: () => void }) {
                 { phase: '1', label: 'Web Intelligence', desc: 'DDG ×3 + TheOrg + Perplexity + Tavily fallback — all parallel' },
                 { phase: '2', label: 'Deep Verify', desc: 'Unipile LinkedIn audit + ZeroBounce email check — both parallel' },
                 { phase: '3', label: 'Scoring', desc: 'LLM title compare + LLM cross-reasoning (only when uncertain)' },
-                { phase: '4', label: 'Write', desc: 'Update Final Filtered List cols O–U · REJECT → Reject profiles + delete row' },
+                { phase: '4', label: 'Write', desc: 'Update First Clean List cols Q–W · REJECT → Reject profiles + delete row' },
               ].map(r => (
                 <div key={r.phase} className="flex items-start gap-3">
                   <span className="shrink-0 w-5 h-5 flex items-center justify-center rounded-md bg-white/[0.06] text-[9px] font-bold text-white/40">{r.phase}</span>
@@ -507,15 +507,15 @@ function HowItWorksModal({ onClose }: { onClose: () => void }) {
             <div className="grid grid-cols-3 gap-2">
               <div className="border border-emerald-400/15 rounded-xl p-3 bg-emerald-400/[0.03]">
                 <div className="text-[9px] font-bold text-emerald-400 uppercase tracking-widest mb-1.5">VERIFIED</div>
-                <p className="text-white/40">Cols O–U written in-place to <span className="text-white/60">Final Filtered List</span>. Row stays. Status = VERIFIED.</p>
+                <p className="text-white/40">Cols Q–W written in-place to <span className="text-white/60">First Clean List</span>. Row stays. Status = VERIFIED.</p>
               </div>
               <div className="border border-amber-400/15 rounded-xl p-3 bg-amber-400/[0.03]">
                 <div className="text-[9px] font-bold text-amber-400 uppercase tracking-widest mb-1.5">REVIEW</div>
-                <p className="text-white/40">Cols O–U written in-place to <span className="text-white/60">Final Filtered List</span>. Row stays. Status = REVIEW. SDR decides.</p>
+                <p className="text-white/40">Cols Q–W written in-place to <span className="text-white/60">First Clean List</span>. Row stays. Status = REVIEW. SDR decides.</p>
               </div>
               <div className="border border-red-400/15 rounded-xl p-3 bg-red-400/[0.03]">
                 <div className="text-[9px] font-bold text-red-400 uppercase tracking-widest mb-1.5">REJECT</div>
-                <p className="text-white/40">Full row A–U copied to <span className="text-white/60">Reject profiles</span> tab. Then <span className="text-red-400/70">row deleted</span> from Final Filtered List.</p>
+                <p className="text-white/40">Full row A–W copied to <span className="text-white/60">Reject profiles</span> tab. Then <span className="text-red-400/70">row deleted</span> from First Clean List.</p>
               </div>
             </div>
             <div className="mt-2 border border-white/[0.05] rounded-xl p-3">
@@ -534,7 +534,7 @@ function HowItWorksModal({ onClose }: { onClose: () => void }) {
               ② ZeroBounce validates email and returns correct status ·
               ③ LLM cross-reasoning only fires for UNCERTAIN/UNCONFIRMED cases ·
               ④ REJECT rows copied to Reject profiles tab with reason ·
-              ⑤ REJECT rows deleted from Final Filtered List ·
+              ⑤ REJECT rows deleted from First Clean List ·
               ⑥ Row numbers in sheet match what's shown in activity feed ·
               ⑦ Row range selector (start/end) maps to exact sheet rows ·
               ⑧ All 6 parallel contacts show individual steps in Activity Feed
@@ -672,7 +672,7 @@ function WorkflowDiagram({ activePhase }: { activePhase: ContactPhase | null }) 
               { name: 'LLM Title', note: 'GPT semantic compare' },
               { name: 'LLM Reason', note: 'cross-signal synthesis' },
               { name: 'Verdict', note: 'VERIFIED / REVIEW / REJECT' },
-              { name: 'Sheet', note: 'Final Filtered / Rejected Profiles' },
+              { name: 'Sheet', note: 'First Clean List / Rejected Profiles' },
             ]}
             colorClass="text-amber-400" borderActive="border-amber-400/30"
             borderIdle="border-white/[0.05]" textActive="text-amber-400" />
@@ -686,8 +686,8 @@ function WorkflowDiagram({ activePhase }: { activePhase: ContactPhase | null }) 
         <div className="text-[9px] font-bold text-white/30 uppercase tracking-[0.3em] mb-2">Sheet Routing</div>
         <div className="flex flex-col gap-1.5">
           {[
-            { s: 'VERIFIED', c: 'text-emerald-400', r: 'Final Filtered List · LinkedIn confirmed + email deliverable' },
-            { s: 'REVIEW',   c: 'text-amber-400',   r: 'Final Filtered List · uncertain employment or email' },
+            { s: 'VERIFIED', c: 'text-emerald-400', r: 'First Clean List · LinkedIn confirmed + email deliverable' },
+            { s: 'REVIEW',   c: 'text-amber-400',   r: 'First Clean List · uncertain employment or email' },
             { s: 'REJECT',   c: 'text-red-400',     r: 'Rejected Profiles · title mismatch, left company, or no identity' },
           ].map(v => (
             <div key={v.s} className="flex items-start gap-2">
@@ -1072,7 +1072,7 @@ function VeriContent() {
                   <span className="text-[10px] font-bold text-emerald-400/80 uppercase tracking-[0.25em]">Batch Complete</span>
                 </div>
                 <span className="text-[9px] font-mono text-white/25 uppercase tracking-tighter">
-                  Final Filtered + Rejected Profiles updated
+                  First Clean List + Rejected Profiles updated
                 </span>
               </div>
               <div className="p-4 grid grid-cols-3 gap-3">

@@ -105,7 +105,7 @@ async def emit_veri_contact(
     phase: str,           # "queued" | "web" | "linkedin_zb" | "scoring" | "done"
     status: str = "",     # "VERIFIED" | "REVIEW" | "REJECT" (for done phase)
     reject_reason: str = "",   # short rejection reason for REJECT
-    sheet_row: int | None = None,         # row in Final Filtered List (VERIFIED/REVIEW)
+    sheet_row: int | None = None,         # row in First Clean List (VERIFIED/REVIEW)
     reject_sheet_row: int | None = None,  # row written to Reject profiles (REJECT)
     review_flags: list[str] | None = None,  # specific issues for REVIEW contacts
     email_validated: bool = True,         # False when ZeroBounce was unavailable

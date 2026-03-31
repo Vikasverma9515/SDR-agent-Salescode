@@ -208,7 +208,7 @@ def searcher(
     """
     Run Searcher (Contact Discovery Agent).
     Reads org_id + domain + email_format from Target Accounts (Fini output),
-    finds new contacts not already in First Clean List or Final Filtered List,
+    finds new contacts not already in First Clean List or First Clean List,
     and writes them to Searcher Output for Veri to process.
     """
     _setup()
@@ -287,7 +287,7 @@ async def _run_searcher(companies_str: str, dm_roles_str: str, thread_id: str | 
 def veri(
     thread_id: Optional[str] = typer.Option(None, help="Resume from existing thread ID"),
 ):
-    """Run Veri (Contact QC) on all pending contacts in Final Filtered List."""
+    """Run Veri (Contact QC) on all pending contacts in First Clean List."""
     _setup()
     asyncio.run(_run_veri(thread_id))
 

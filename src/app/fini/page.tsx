@@ -733,16 +733,18 @@ export default function FiniPage() {
     elapsedRef.current = setInterval(() => setElapsedSecs(s => s + 1), 1000);
 
     try {
-      const resp = await fetch(apiUrl('/api/fini/run'), {
+      // When both n8n relay + auto mode are ON, use the full auto-pipeline
+      // (Fini → n8n → poll → Veri → Searcher → Veri round 2)
+      const useAutoPipeline = submitN8n && autoMode;
+      const endpoint = useAutoPipeline ? '/api/pipeline/auto' : '/api/fini/run';
+      const payload = useAutoPipeline
+        ? { companies: companies.trim(), sdr: sdr.trim(), region: region.trim() }
+        : { companies: companies.trim(), sdr: sdr.trim(), region: region.trim(), submit_n8n: submitN8n, auto_mode: autoMode };
+
+      const resp = await fetch(apiUrl(endpoint), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          companies: companies.trim(),
-          sdr: sdr.trim(),
-          region: region.trim(),
-          submit_n8n: submitN8n,
-          auto_mode: autoMode,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await resp.json();
       setThreadId(data.thread_id);

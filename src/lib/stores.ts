@@ -279,3 +279,83 @@ export const useVeriStore = create<VeriState>((set) => ({
   set: (patch) => set((s) => ({ ...s, ...patch })),
   reset: () => set((s) => ({ ...s, ...veriDefaults })),
 }));
+
+// ---------------------------------------------------------------------------
+// Command Center Store
+// ---------------------------------------------------------------------------
+
+interface CompanyStatus {
+  company_name: string;
+  normalized_name: string;
+  domain: string;
+  sales_nav_url: string;
+  email_format: string;
+  sdr_name: string;
+  account_type: string;
+  account_size: string;
+  stage: string;
+  total_contacts: number;
+  verified_count: number;
+  review_count: number;
+  pending_count: number;
+  rejected_count: number;
+  role_coverage: Record<string, { filled: boolean; contact_name: string | null; title: string | null; status: string | null; label: string }>;
+  role_coverage_pct: number;
+  contacts: { full_name: string; title: string; buying_role: string; email: string; overall_status: string }[];
+}
+
+interface AiSuggestion {
+  company: string;
+  action: string;
+  reason: string;
+  priority: 'high' | 'medium' | 'low';
+  auto_executable: boolean;
+  params?: Record<string, any>;
+}
+
+interface PipelineSummary {
+  total_companies: number;
+  fully_enriched: number;
+  contacts_found: number;
+  fully_verified: number;
+  needs_attention: number;
+  rejected_count: number;
+}
+
+interface CommandCenterState {
+  loading: boolean;
+  error: string | null;
+  summary: PipelineSummary | null;
+  companies: CompanyStatus[];
+  aiAnalysis: { generated_at: string; summary: string; suggestions: AiSuggestion[] } | null;
+  aiLoading: boolean;
+  autoMode: { enabled: boolean; pollIntervalSecs: number; dryRun: boolean };
+  autoModeStatus: { enabled: boolean; last_check: string | null; actions_taken: { ts: string; action: string }[] } | null;
+  expandedCompany: string | null;
+  stageFilter: string | null;
+  startRow: number;
+  triggerLoading: Record<string, boolean>;
+  set: (patch: Partial<Omit<CommandCenterState, 'set' | 'reset'>>) => void;
+  reset: () => void;
+}
+
+const commandCenterDefaults = {
+  loading: false,
+  error: null as string | null,
+  summary: null as PipelineSummary | null,
+  companies: [] as CompanyStatus[],
+  aiAnalysis: null as CommandCenterState['aiAnalysis'],
+  aiLoading: false,
+  autoMode: { enabled: false, pollIntervalSecs: 60, dryRun: false },
+  autoModeStatus: null as CommandCenterState['autoModeStatus'],
+  expandedCompany: null as string | null,
+  stageFilter: null as string | null,
+  startRow: 1,
+  triggerLoading: {} as Record<string, boolean>,
+};
+
+export const useCommandCenterStore = create<CommandCenterState>((set) => ({
+  ...commandCenterDefaults,
+  set: (patch) => set((s) => ({ ...s, ...patch })),
+  reset: () => set((s) => ({ ...s, ...commandCenterDefaults })),
+}));

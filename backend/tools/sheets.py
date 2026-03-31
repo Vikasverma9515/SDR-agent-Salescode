@@ -5,7 +5,7 @@ Rules:
 - Service account auth only. Creds path from .env.
 - Every read/write wrapped in retry with exponential backoff.
 - NEVER overwrite data. Append-only for new rows.
-- update_row_cells for specific column updates (Veri writes to cols O-U).
+- update_row_cells for specific column updates (Veri writes to cols Q-W on First Clean List).
 - Every write logs row number and timestamp.
 """
 from __future__ import annotations
@@ -25,10 +25,9 @@ logger = get_logger("sheets")
 
 # Sheet tab name constants — exact names as they appear in Google Sheets
 TARGET_ACCOUNTS = "Target Accounts"
-FIRST_CLEAN_LIST = "First Clean List"
-SEARCHER_OUTPUT = "Searcher Output"
-FINAL_FILTERED_LIST = "Final Filtered List"
-REJECTED_PROFILES = "Reject profiles"
+FIRST_CLEAN_LIST = "First Clean List"       # Main working sheet: n8n writes A-N, Veri writes Q-W, Searcher appends rows
+SEARCHER_OUTPUT = "Searcher Output"         # Searcher's log tab
+REJECTED_PROFILES = "Reject profiles"       # Veri moves rejected contacts here
 
 _SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -146,7 +145,7 @@ async def update_row_cells(tab_name: str, row: int, col_start: int, values: list
     """
     Update a range of cells in a specific row.
     col_start is 1-based column index.
-    Used by Veri to write verification results to cols O-U (15-21).
+    Used by Veri to write verification results to cols Q-W (17-23).
     """
     col_end = col_start + len(values) - 1
     range_notation = f"{_col_letter(col_start)}{row}:{_col_letter(col_end)}{row}"
@@ -240,7 +239,7 @@ TARGET_ACCOUNTS_HEADERS = [
     "Account Size",          # H
 ]
 
-# Columns A-N (written by n8n after Fini submits)
+# Columns A-W (n8n writes A-N, system uses O-P, Veri writes Q-W)
 FIRST_CLEAN_LIST_HEADERS = [
     "Company Name",                               # A
     "Normalized Company Name (Parent Group)",     # B
@@ -252,35 +251,19 @@ FIRST_CLEAN_LIST_HEADERS = [
     "Last Name",                                  # H
     "Job titles (English)",                       # I
     "Buying Role",                                # J
-    "Linekdin Url",                               # K  (typo preserved)
+    "Linekdin Url",                               # K  (typo preserved — matches n8n output)
     "Email",                                      # L
     "Phone-1",                                    # M
     "Phone-2",                                    # N
-]
-
-# Columns A-U (Veri writes cols O-U)
-FINAL_FILTERED_LIST_HEADERS = [
-    "Company Name",                               # A
-    "Normalized Company Name (Parent Group)",     # B
-    "Company Domain Name",                        # C
-    "Account Type",                               # D
-    "Account Size",                               # E
-    "Country",                                    # F
-    "First Name",                                 # G
-    "Last Name",                                  # H
-    "Job Title (English)",                        # I
-    "Buying Role",                                # J
-    "LinkedIn URL",                               # K
-    "Email",                                      # L
-    "Phone-1",                                    # M
-    "Phone-2",                                    # N
-    "LinkedIn Status",                            # O  ← Veri writes from here
-    "Employment Verified",                        # P
-    "Title Match",                                # Q
-    "Actual Title Found",                         # R
-    "Overall Status",                             # S
-    "Verification Notes",                         # T
-    "Verified On",                                # U
+    "Source",                                     # O  (system: "n8n" or "searcher")
+    "Pipeline Status",                            # P  (system: tracking field)
+    "LinkedIn Status",                            # Q  ← Veri writes from here
+    "Employment Verified",                        # R
+    "Title Match",                                # S
+    "Actual Title Found",                         # T
+    "Overall Status",                             # U  (VERIFIED / REVIEW / REJECT)
+    "Verification Notes",                         # V
+    "Verified On",                                # W
 ]
 
 # Columns A-H
@@ -310,13 +293,15 @@ REJECTED_PROFILES_HEADERS = [
     "Email",                                      # L
     "Phone-1",                                    # M
     "Phone-2",                                    # N
-    "LinkedIn Status",                            # O
-    "Employment Verified",                        # P
-    "Title Match",                                # Q
-    "Actual Title Found",                         # R
-    "Reject Reason",                              # S
-    "Verification Notes",                         # T
-    "Verified On",                                # U
+    "Source",                                     # O
+    "Pipeline Status",                            # P
+    "LinkedIn Status",                            # Q
+    "Employment Verified",                        # R
+    "Title Match",                                # S
+    "Actual Title Found",                         # T
+    "Reject Reason",                              # U
+    "Verification Notes",                         # V
+    "Verified On",                                # W
 ]
 
 async def delete_rows_batch(tab_name: str, row_nums: list[int]) -> None:
@@ -343,5 +328,8 @@ async def delete_rows_batch(tab_name: str, row_nums: list[int]) -> None:
             await asyncio.sleep(wait)
 
 
-# Column index constants for Veri write-back (1-based)
-FINAL_FILTERED_LIST_VERI_COL_START = 15  # column O
+# Column index constants for First Clean List (1-based)
+FCL_SOURCE_COL = 15          # column O — "n8n" or "searcher"
+FCL_PIPELINE_STATUS_COL = 16 # column P — pipeline tracking
+FCL_VERI_COL_START = 17      # column Q — Veri writes Q-W (7 columns)
+FCL_OVERALL_STATUS_COL = 21  # column U — "VERIFIED" / "REVIEW" / "REJECT"
