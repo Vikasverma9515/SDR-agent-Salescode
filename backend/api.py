@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -46,26 +46,61 @@ class N8nCompleteRequest(BaseModel):
     row_start: Optional[int] = None  # 1-based data row range that n8n populated
     row_end: Optional[int] = None
 
-class N8nContactItem(BaseModel):
-    """Single contact from n8n."""
-    company_name: str
-    normalized_name: str = ""
-    domain: str = ""
-    account_type: str = ""
-    account_size: str = ""
-    country: str = ""
-    first_name: str
-    last_name: str
-    job_title: str = ""
-    buying_role: str = ""
-    linkedin_url: str = ""
-    email: str = ""
-    phone_1: str = ""
-    phone_2: str = ""
+def _extract_field(item: dict, *keys: str, default: str = "") -> str:
+    """Extract a field from a dict by trying multiple possible key names (case-insensitive)."""
+    item_lower = {k.lower().replace(" ", "_").replace("-", "_"): v for k, v in item.items()}
+    for key in keys:
+        k = key.lower().replace(" ", "_").replace("-", "_")
+        if k in item_lower and item_lower[k] is not None:
+            val = str(item_lower[k]).strip()
+            if val:
+                return val
+    return default
 
-class N8nContactsRequest(BaseModel):
-    """n8n sends enriched contacts as JSON → triggers full Veri + Searcher chain."""
-    contacts: list[N8nContactItem]
+
+def _normalize_contact(raw: dict) -> dict:
+    """
+    Accept ANY JSON shape from n8n and map it to our standard fields.
+    Tries multiple common field name variants for each field.
+    """
+    email = _extract_field(raw,
+        "email", "address", "email_address", "work_email", "e_mail", "mail")
+    domain = _extract_field(raw, "domain", "company_domain", "company_domain_name")
+    company = _extract_field(raw,
+        "company_name", "company", "account", "organization", "org", "account_name")
+
+    # If no domain but have email, extract domain from email
+    if not domain and email and "@" in email:
+        domain = email.split("@")[1]
+
+    # If no company but have account field from ZeroBounce-style data, try domain
+    if not company and domain:
+        company = domain.split(".")[0].capitalize()
+
+    return {
+        "company_name": company,
+        "normalized_name": _extract_field(raw,
+            "normalized_name", "parent_company", "normalized_company_name", "parent_company_name") or company,
+        "domain": domain,
+        "account_type": _extract_field(raw, "account_type", "type", "region"),
+        "account_size": _extract_field(raw, "account_size", "size", "company_size"),
+        "country": _extract_field(raw, "country", "location", "geo", "region"),
+        "first_name": _extract_field(raw,
+            "first_name", "firstname", "first", "given_name", "fname"),
+        "last_name": _extract_field(raw,
+            "last_name", "lastname", "last", "family_name", "surname", "lname"),
+        "job_title": _extract_field(raw,
+            "job_title", "title", "job_titles", "job_titles_(english)", "job_title_(english)",
+            "role", "position", "designation"),
+        "buying_role": _extract_field(raw,
+            "buying_role", "role_type", "buyer_role", "contact_type"),
+        "linkedin_url": _extract_field(raw,
+            "linkedin_url", "linkedin", "linekdin_url", "linkedin_profile",
+            "li_url", "linkedin_link", "profile_url"),
+        "email": email,
+        "phone_1": _extract_field(raw, "phone_1", "phone", "phone1", "mobile", "telephone"),
+        "phone_2": _extract_field(raw, "phone_2", "phone2", "secondary_phone"),
+    }
 
 class OperatorConfirmRequest(BaseModel):
     thread_id: str
@@ -455,49 +490,86 @@ def create_app() -> FastAPI:
     # ---------------------------------------------------------------------------
 
     @app.post("/api/n8n/contacts", response_model=RunResponse)
-    async def n8n_contacts(req: N8nContactsRequest):
+    async def n8n_contacts(request: Request):
         """
-        n8n sends enriched contacts as JSON.
+        n8n sends enriched contacts as JSON — accepts ANY format.
+        Auto-detects field names (email/address, first_name/firstname, etc.)
+
+        Accepted formats:
+        - {"contacts": [{...}, {...}]}          — array of contacts
+        - [{...}, {...}]                        — bare array
+        - {"contact": {...}}                    — single contact
+        - {...}                                 — single contact object
+
         1. Writes them to First Clean List (cols A–P)
         2. Immediately triggers Veri → Searcher → Veri round 2
-
-        This is the MAIN endpoint for n8n to call at the end of its workflow.
-        No polling needed — the chain starts instantly.
         """
-        if not req.contacts:
-            raise HTTPException(status_code=400, detail="No contacts provided")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+        # Normalize to a list of contact dicts
+        raw_contacts: list[dict] = []
+        if isinstance(body, dict):
+            if "contacts" in body:
+                raw_contacts = body["contacts"] if isinstance(body["contacts"], list) else [body["contacts"]]
+            elif "contact" in body:
+                raw_contacts = [body["contact"]] if isinstance(body["contact"], dict) else body["contact"]
+            else:
+                # Single contact object
+                raw_contacts = [body]
+        elif isinstance(body, list):
+            raw_contacts = body
+        else:
+            raise HTTPException(status_code=400, detail="Could not parse contacts from request body")
+
+        if not raw_contacts:
+            raise HTTPException(status_code=400, detail="No contacts found in request")
 
         from backend.tools import sheets
 
-        # Step 1: Write contacts to First Clean List
+        # Step 1: Normalize and write contacts to First Clean List
         companies_seen: set[str] = set()
         rows_written = 0
+        skipped = 0
         try:
             await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
-            for c in req.contacts:
+            for raw in raw_contacts:
+                if not isinstance(raw, dict):
+                    skipped += 1
+                    continue
+                c = _normalize_contact(raw)
+
+                # Skip contacts with no name
+                if not c["first_name"] and not c["last_name"]:
+                    skipped += 1
+                    continue
+
                 row = [
-                    c.company_name,                    # A
-                    c.normalized_name or c.company_name,  # B
-                    c.domain,                          # C
-                    c.account_type,                    # D
-                    c.account_size,                    # E
-                    c.country,                         # F
-                    c.first_name,                      # G
-                    c.last_name,                       # H
-                    c.job_title,                       # I
-                    c.buying_role,                     # J
-                    c.linkedin_url,                    # K
-                    c.email,                           # L
-                    c.phone_1,                         # M
-                    c.phone_2,                         # N
-                    "n8n",                             # O (Source)
-                    "",                                # P (Pipeline Status)
+                    c["company_name"],                    # A
+                    c["normalized_name"],                 # B
+                    c["domain"],                          # C
+                    c["account_type"],                    # D
+                    c["account_size"],                    # E
+                    c["country"],                         # F
+                    c["first_name"],                      # G
+                    c["last_name"],                       # H
+                    c["job_title"],                       # I
+                    c["buying_role"],                     # J
+                    c["linkedin_url"],                    # K
+                    c["email"],                           # L
+                    c["phone_1"],                         # M
+                    c["phone_2"],                         # N
+                    "n8n",                                # O (Source)
+                    "",                                   # P (Pipeline Status)
                 ]
                 await sheets.append_row(sheets.FIRST_CLEAN_LIST, row)
                 rows_written += 1
-                if c.company_name:
-                    companies_seen.add(c.company_name)
-            logger.info("n8n_contacts_written", count=rows_written, companies=list(companies_seen))
+                if c["company_name"]:
+                    companies_seen.add(c["company_name"])
+            logger.info("n8n_contacts_written", count=rows_written, skipped=skipped,
+                        companies=list(companies_seen))
         except Exception as e:
             logger.error("n8n_contacts_write_error", error=str(e))
             raise HTTPException(status_code=500, detail=f"Failed to write contacts to sheet: {e}")
