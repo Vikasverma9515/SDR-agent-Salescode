@@ -2819,9 +2819,10 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
             bucket = _classify_role(contact.role_title or "")
             contact = contact.model_copy(update={"role_bucket": bucket})
 
-            if bucket not in ("DM", "Influencer"):
+            # Keep all senior roles — drop only Gatekeeper and Unknown
+            if bucket in ("Gatekeeper", "Unknown"):
                 logger.info("searcher_enrich_skip", contact=contact.full_name,
-                            bucket=bucket, reason="not DM or Influencer")
+                            bucket=bucket, reason="not a senior/decision-maker role")
                 return
 
             await _enrich_log(state.thread_id,
