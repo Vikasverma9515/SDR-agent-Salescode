@@ -1322,13 +1322,24 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
         # to prevent infinite loops: Veri → Searcher → Veri(round2) → STOP.
         run_info = _active_runs.get(thread_id, {})
         triggered_by = run_info.get("auto_triggered_by", "")
-        if triggered_by in ("n8n", "fini", "auto_pipeline") and state.verified_count > 0:
+        total_processed = state.verified_count + state.review_count + state.rejected_count
+        logger.info("veri_chain_check",
+                    triggered_by=triggered_by, verified=state.verified_count,
+                    review=state.review_count, rejected=state.rejected_count,
+                    total_contacts=len(state.contacts),
+                    company_filter=company_filter)
+
+        if triggered_by in ("n8n", "fini", "auto_pipeline"):
             try:
-                # Get unique companies from the contacts we just verified
+                # Get company names from contacts processed OR from the company_filter
                 _companies_in_run: set[str] = set()
                 for c in state.contacts:
                     if c.company:
                         _companies_in_run.add(c.company)
+
+                # Fallback: if contacts list is empty, use company_filter
+                if not _companies_in_run and company_filter:
+                    _companies_in_run = {c.strip() for c in company_filter.split(",") if c.strip()}
 
                 if _companies_in_run:
                     companies_str = ",".join(_companies_in_run)
@@ -1350,11 +1361,16 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
                         _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
                     )
                     await _emit_log(thread_id, "info",
-                                    f"Auto-triggering Searcher gap-fill for {len(_companies_in_run)} companies")
+                                    f"Auto-triggering Searcher gap-fill for {len(_companies_in_run)} companies: {companies_str}")
                     logger.info("veri_auto_trigger_searcher",
                                 companies=len(_companies_in_run), searcher_thread=searcher_thread)
+                else:
+                    logger.warning("veri_no_companies_for_searcher",
+                                   total_processed=total_processed, company_filter=company_filter)
             except Exception as e:
                 logger.warning("veri_auto_searcher_error", error=str(e))
+                import traceback
+                logger.warning("veri_auto_searcher_traceback", tb=traceback.format_exc())
 
     except asyncio.CancelledError:
         logger.info("veri_task_cancelled", thread_id=thread_id)

@@ -107,10 +107,12 @@ async def read_contacts(state: VeriState) -> VeriState:
             if not full_name:
                 continue
 
-            # Company filter: if set, only process contacts for this company
+            # Company filter: if set, only process contacts matching any of the given companies
             company_name = str(row.get("Company Name", "") or "").strip()
             if state.company_filter:
-                if state.company_filter.lower() not in company_name.lower():
+                filter_companies = [c.strip().lower() for c in state.company_filter.split(",") if c.strip()]
+                company_lower = company_name.lower()
+                if not any(fc in company_lower or company_lower in fc for fc in filter_companies):
                     continue
 
             phone1 = str(row.get("Phone-1", "") or "").strip()
