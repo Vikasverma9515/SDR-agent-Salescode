@@ -176,6 +176,7 @@ class ScoutCommitRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 _active_runs: dict[str, dict] = {}
+_n8n_last_received: dict = {}  # Debug: stores last n8n payload for /api/n8n/debug
 _active_tasks: dict[str, asyncio.Task] = {}  # task handles for cancellation
 _pending_confirmations: dict[str, asyncio.Event] = {}
 _confirmation_data: dict[str, dict] = {}
@@ -589,12 +590,29 @@ def create_app() -> FastAPI:
 
         logger.info("n8n_contacts_chain_started",
                     contacts=rows_written, companies=list(companies_seen), thread_id=thread_id)
+        # Store last received data for debugging
+        _n8n_last_received.clear()
+        _n8n_last_received.update({
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "raw_contacts_count": len(raw_contacts),
+            "rows_written": rows_written,
+            "skipped": skipped,
+            "companies": list(companies_seen),
+            "sample_raw": raw_contacts[0] if raw_contacts else {},
+            "sample_normalized": _normalize_contact(raw_contacts[0]) if raw_contacts else {},
+        })
+
         return RunResponse(
             thread_id=thread_id,
             status="started",
             message=f"Received {rows_written} contacts for {len(companies_seen)} companies. "
                     f"Veri → Searcher → Veri chain started.",
         )
+
+    @app.get("/api/n8n/debug")
+    async def n8n_debug():
+        """Check the last data received from n8n — for debugging field mapping."""
+        return _n8n_last_received if _n8n_last_received else {"message": "No data received yet"}
 
     # ---------------------------------------------------------------------------
     # Auto-pipeline: Fini → n8n → Veri → Searcher → Veri (fully automatic)
