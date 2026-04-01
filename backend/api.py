@@ -263,7 +263,7 @@ _last_pause_event: dict[str, dict] = {}  # cache last role/contact pause event f
 #     4. Veri R2 (verify searcher contacts)
 #     → DONE, next company
 
-_N8N_BUFFER_TIMEOUT = 300  # 5 minutes of silence before flush
+_N8N_BUFFER_TIMEOUT = 180  # 3 minutes of silence before flush
 
 # Buffer: company_name → list of (sheet_row, raw_dict, normalized_dict)
 _n8n_buffer_contacts: dict[str, list[tuple[list, dict, dict]]] = {}
@@ -278,8 +278,10 @@ async def _n8n_buffer_flush():
     """Flush: for each company, write to sheet → Veri → Searcher → Veri R2."""
     global _n8n_buffer_contacts, _n8n_buffer_timer, _n8n_chain_running, _n8n_chain_current_company
 
-    # Snapshot and reset buffer
-    buffered = dict(_n8n_buffer_contacts)
+    # Deep-copy snapshot and clear buffer atomically
+    buffered: dict[str, list] = {}
+    for company, rows in _n8n_buffer_contacts.items():
+        buffered[company] = list(rows)  # copy each list
     _n8n_buffer_contacts.clear()
     _n8n_buffer_timer = None
 
@@ -290,7 +292,7 @@ async def _n8n_buffer_flush():
     total_contacts = sum(len(rows) for rows in buffered.values())
     company_list = sorted(buffered.keys())
 
-    # Wait for any running chain to finish
+    # Wait for any running chain to finish — prevents concurrent chains
     async with _n8n_chain_lock:
         _n8n_chain_running = True
         logger.info("n8n_buffer_flush_start",
@@ -807,12 +809,13 @@ def create_app() -> FastAPI:
             # Log to webhook log (fire-and-forget)
             asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "buffered", ""))
 
-        # Reset the 5-min timer
+        # Reset the 5-min timer — all buffer reads inside lock to prevent races
         if buffered_count > 0:
             async with _n8n_buffer_lock:
                 await _n8n_buffer_reset_timer()
-            total_buffered = sum(len(rows) for rows in _n8n_buffer_contacts.values())
-            buffer_companies = sorted(_n8n_buffer_contacts.keys())
+                total_buffered = sum(len(rows) for rows in _n8n_buffer_contacts.values())
+                buffer_companies = sorted(_n8n_buffer_contacts.keys())
+                buffer_per_company = {k: len(v) for k, v in _n8n_buffer_contacts.items()}
             buffer_status = (
                 f"Buffered. {len(buffer_companies)} companies, "
                 f"{total_buffered} contacts total. "
@@ -822,11 +825,13 @@ def create_app() -> FastAPI:
                         new=buffered_count, companies=list(companies_seen),
                         buffer_companies=buffer_companies, buffer_total=total_buffered)
         else:
+            total_buffered = 0
+            buffer_companies = []
+            buffer_per_company = {}
             buffer_status = "No contacts buffered"
             logger.info("n8n_contacts_no_buffer", skipped=skipped)
 
-        # Store debug data
-        total_buffered = sum(len(rows) for rows in _n8n_buffer_contacts.values())
+        # Store debug data (using snapshot taken inside lock)
         _n8n_last_received.clear()
         _n8n_last_received.update({
             "received_at": timestamp,
@@ -835,9 +840,9 @@ def create_app() -> FastAPI:
             "skipped": skipped,
             "skip_reasons": skip_reasons,
             "companies": list(companies_seen),
-            "buffer_companies": sorted(_n8n_buffer_contacts.keys()),
+            "buffer_companies": buffer_companies,
             "buffer_total_contacts": total_buffered,
-            "buffer_per_company": {k: len(v) for k, v in _n8n_buffer_contacts.items()},
+            "buffer_per_company": buffer_per_company,
             "buffer_timeout_secs": _N8N_BUFFER_TIMEOUT,
             "sample_raw": raw_contacts[0] if raw_contacts else {},
             "sample_normalized": _normalize_contact(raw_contacts[0]) if raw_contacts else {},
@@ -854,18 +859,25 @@ def create_app() -> FastAPI:
 
     @app.post("/api/n8n/flush")
     async def n8n_flush():
-        """Manually flush the n8n buffer — triggers the chain immediately."""
+        """Manually flush the n8n buffer — triggers the chain immediately (background)."""
         async with _n8n_buffer_lock:
+            # Snapshot BEFORE flush clears the buffer
             companies = sorted(_n8n_buffer_contacts.keys())
             contacts = sum(len(v) for v in _n8n_buffer_contacts.values())
             if not companies:
                 return {"status": "empty", "message": "Buffer is empty — nothing to flush"}
             if _n8n_buffer_timer and not _n8n_buffer_timer.done():
                 _n8n_buffer_timer.cancel()
-            await _n8n_buffer_flush()
+
+        # Run flush in background — chain can take hours for many companies
+        async def _manual_flush():
+            async with _n8n_buffer_lock:
+                await _n8n_buffer_flush()
+        asyncio.create_task(_manual_flush())
+
         return {
-            "status": "flushed",
-            "message": f"Flushed {contacts} contacts for {len(companies)} companies: {', '.join(companies)}",
+            "status": "flushing",
+            "message": f"Flushing {contacts} contacts for {len(companies)} companies: {', '.join(companies)}. Check /api/n8n/buffer for progress.",
         }
 
     @app.get("/api/n8n/buffer")
