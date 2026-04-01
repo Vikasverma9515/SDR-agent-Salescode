@@ -512,139 +512,133 @@ type PipelineStep = {
   time: string;
 };
 
+type PipelineData = {
+  running: boolean;
+  current_company: string;
+  current_step: string;
+  companies: string[];
+  results: Array<{
+    company: string;
+    contacts: number;
+    status: string;
+    steps: Record<string, string>;
+  }>;
+  buffer: {
+    companies: string[];
+    total_contacts: number;
+    timer_active: boolean;
+  };
+};
+
+const STEP_LABELS: Record<string, string> = {
+  sheet_write: 'Write to Sheet',
+  veri_r1: 'Verify (R1)',
+  searcher: 'Searcher',
+  veri_r2: 'Verify (R2)',
+};
+
+const STEP_KEYS = ['sheet_write', 'veri_r1', 'searcher', 'veri_r2'];
+
 function PipelineTracker() {
-  const [steps, setSteps] = useState<PipelineStep[]>([
-    { label: 'Fini', agent: 'fini', status: 'pending', detail: 'Target enrichment', time: '' },
-    { label: 'n8n', agent: 'n8n', status: 'pending', detail: 'Contact discovery', time: '' },
-    { label: 'Veri', agent: 'veri', status: 'pending', detail: 'Contact verification', time: '' },
-    { label: 'Searcher', agent: 'searcher', status: 'pending', detail: 'Gap-fill discovery', time: '' },
-    { label: 'Veri R2', agent: 'veri_r2', status: 'pending', detail: 'Verify new contacts', time: '' },
-  ]);
+  const [data, setData] = useState<PipelineData | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       while (!cancelled) {
         try {
-          const resp = await fetch(apiUrl('/api/runs'));
-          const runs: AgentRun[] = await resp.json();
-
-          const newSteps: PipelineStep[] = [
-            { label: 'Fini', agent: 'fini', status: 'pending', detail: 'Target enrichment', time: '' },
-            { label: 'n8n', agent: 'n8n', status: 'pending', detail: 'Contact discovery', time: '' },
-            { label: 'Veri', agent: 'veri', status: 'pending', detail: 'Contact verification', time: '' },
-            { label: 'Searcher', agent: 'searcher', status: 'pending', detail: 'Gap-fill discovery', time: '' },
-            { label: 'Veri R2', agent: 'veri_r2', status: 'pending', detail: 'Verify new contacts', time: '' },
-          ];
-
-          // Map runs to pipeline steps
-          for (const run of runs) {
-            const time = run.started_at ? new Date(run.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-            const status = run.status === 'running' ? 'running' : run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : 'pending';
-
-            if (run.agent === 'fini') {
-              newSteps[0] = { ...newSteps[0], status, time };
-              if (status === 'completed') {
-                newSteps[1] = { ...newSteps[1], status: 'running', detail: 'Waiting for n8n...' };
-              }
-            }
-
-            if (run.agent === 'veri' && run.auto_triggered_by === 'n8n') {
-              // n8n delivered data (since Veri was triggered)
-              newSteps[1] = { ...newSteps[1], status: 'completed', detail: 'Contacts delivered', time };
-              const v = run as any;
-              const vDetail = status === 'completed'
-                ? `${v.verified || 0} verified, ${v.review || 0} review, ${v.rejected || 0} rejected`
-                : 'Verifying contacts...';
-              newSteps[2] = { ...newSteps[2], status, detail: vDetail, time };
-            }
-
-            if (run.agent === 'searcher' && run.auto_triggered_by === 'veri') {
-              const sDetail = status === 'completed'
-                ? `Found ${run.contacts_discovered || 0}, wrote ${run.contacts_appended || 0}`
-                : run.missing_roles?.length
-                  ? `Searching for ${run.missing_roles.slice(0, 3).join(', ')}...`
-                  : 'Analyzing gaps...';
-              newSteps[3] = { ...newSteps[3], status, detail: sDetail, time };
-              if (run.error) {
-                newSteps[3] = { ...newSteps[3], status: 'failed', detail: run.error.slice(0, 60) };
-              }
-            }
-
-            if (run.agent === 'veri' && run.auto_triggered_by === 'searcher') {
-              const v2Detail = status === 'completed'
-                ? 'Searcher contacts verified'
-                : 'Verifying searcher contacts...';
-              newSteps[4] = { ...newSteps[4], status, detail: v2Detail, time };
-            }
-          }
-
-          // If Veri (n8n) completed but no searcher run exists yet, mark searcher as pending
-          if (newSteps[2].status === 'completed' && newSteps[3].status === 'pending') {
-            newSteps[3] = { ...newSteps[3], status: 'running', detail: 'Starting...' };
-          }
-
-          setSteps(newSteps);
+          const resp = await fetch(apiUrl('/api/n8n/pipeline'));
+          const d: PipelineData = await resp.json();
+          setData(d);
         } catch { /* ignore */ }
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise(r => setTimeout(r, 3000));
       }
     };
     poll();
     return () => { cancelled = true; };
   }, []);
 
-  const statusIcon = (s: string) => {
-    switch (s) {
-      case 'completed': return '✓';
-      case 'running': return '◌';
-      case 'failed': return '✕';
-      default: return '○';
-    }
+  if (!data) return null;
+
+  const hasActivity = data.running || data.results.length > 0 || data.buffer.companies.length > 0;
+  if (!hasActivity) return null;
+
+  const stepIcon = (s: string) => {
+    if (s === 'running') return '◌';
+    if (s?.startsWith('✅') || s === 'done') return '✓';
+    if (s?.startsWith('❌') || s?.startsWith('crashed') || s?.startsWith('failed')) return '✕';
+    if (s === 'pending') return '○';
+    return '○';
   };
 
-  const statusColor = (s: string) => {
-    switch (s) {
-      case 'completed': return 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10';
-      case 'running': return 'text-blue-400 border-blue-500/30 bg-blue-500/10 animate-pulse';
-      case 'failed': return 'text-red-400 border-red-500/30 bg-red-500/10';
-      default: return 'text-white/30 border-white/10 bg-white/[0.02]';
-    }
+  const stepColor = (s: string) => {
+    if (s === 'running') return 'text-blue-400 bg-blue-500/10 border-blue-500/30 animate-pulse';
+    if (s?.startsWith('✅') || s === 'done') return 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30';
+    if (s?.startsWith('❌') || s?.startsWith('crashed') || s?.startsWith('failed')) return 'text-red-400 bg-red-500/10 border-red-500/30';
+    return 'text-white/20 bg-white/[0.02] border-white/10';
   };
 
-  const lineColor = (s: string) => {
-    switch (s) {
-      case 'completed': return 'bg-emerald-500/40';
-      case 'running': return 'bg-blue-500/40 animate-pulse';
-      case 'failed': return 'bg-red-500/40';
-      default: return 'bg-white/10';
-    }
+  const companyStatus = (r: PipelineData['results'][0]) => {
+    if (r.status === 'done') return 'text-emerald-400';
+    if (r.status === 'running') return 'text-blue-400';
+    if (r.status.startsWith('crashed') || r.status.startsWith('failed')) return 'text-red-400';
+    return 'text-white/30';
   };
 
   return (
     <div className="border border-white/[0.06] rounded-2xl bg-black/20 p-4 mt-3">
-      <div className="flex items-center gap-2 mb-4">
-        <span className="text-[9px] font-bold text-white/50 uppercase tracking-[0.35em]">Pipeline Status</span>
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[9px] font-bold text-white/50 uppercase tracking-[0.35em]">Pipeline Tracker</span>
+        {data.running && <span className="text-[8px] text-blue-400 animate-pulse font-mono">RUNNING</span>}
+        {!data.running && data.results.length > 0 && <span className="text-[8px] text-emerald-400 font-mono">DONE</span>}
         <div className="flex-1 h-[1px] bg-white/[0.06]" />
+        {data.buffer.companies.length > 0 && (
+          <span className="text-[8px] text-amber-400 font-mono">
+            BUFFER: {data.buffer.total_contacts} contacts, {data.buffer.companies.length} companies
+            {data.buffer.timer_active && ' (waiting...)'}
+          </span>
+        )}
       </div>
-      <div className="flex items-start gap-0">
-        {steps.map((step, i) => (
-          <React.Fragment key={step.agent}>
-            <div className="flex flex-col items-center min-w-[100px] flex-1">
-              <div className={`w-8 h-8 rounded-full border-2 flex items-center justify-center text-xs font-bold ${statusColor(step.status)}`}>
-                {statusIcon(step.status)}
-              </div>
-              <div className="mt-2 text-center">
-                <div className="text-[11px] font-bold text-white/80">{step.label}</div>
-                <div className="text-[9px] text-white/40 mt-0.5 max-w-[120px] leading-tight">{step.detail}</div>
-                {step.time && <div className="text-[8px] text-white/25 mt-0.5 font-mono">{step.time}</div>}
-              </div>
-            </div>
-            {i < steps.length - 1 && (
-              <div className={`h-[2px] flex-1 mt-4 rounded-full ${lineColor(steps[i + 1].status === 'pending' ? step.status : steps[i + 1].status)}`} />
-            )}
-          </React.Fragment>
+
+      {/* Column headers */}
+      <div className="grid grid-cols-[200px_repeat(4,1fr)] gap-1 mb-1">
+        <div className="text-[8px] font-bold text-white/30 uppercase tracking-wider pl-2">Company</div>
+        {STEP_KEYS.map(k => (
+          <div key={k} className="text-[8px] font-bold text-white/30 uppercase tracking-wider text-center">{STEP_LABELS[k]}</div>
         ))}
       </div>
+
+      {/* Per-company rows */}
+      {data.results.map((r, i) => (
+        <div key={i} className={`grid grid-cols-[200px_repeat(4,1fr)] gap-1 py-1.5 border-t border-white/[0.04] ${r.status === 'running' ? 'bg-blue-500/[0.03]' : ''}`}>
+          <div className="flex items-center gap-2 pl-2">
+            <span className={`text-[11px] font-bold truncate ${companyStatus(r)}`}>{r.company}</span>
+            <span className="text-[8px] text-white/20 font-mono">{r.contacts}</span>
+          </div>
+          {STEP_KEYS.map(k => {
+            const val = r.steps[k] || 'pending';
+            return (
+              <div key={k} className="flex items-center justify-center">
+                <div className={`w-6 h-6 rounded-full border flex items-center justify-center text-[10px] font-bold ${stepColor(val)}`}>
+                  {stepIcon(val)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+
+      {/* Pending companies (in buffer, not yet started) */}
+      {data.buffer.companies.filter(c => !data.results.find(r => r.company === c)).map(c => (
+        <div key={c} className="grid grid-cols-[200px_repeat(4,1fr)] gap-1 py-1.5 border-t border-white/[0.04] opacity-40">
+          <div className="pl-2 text-[11px] text-white/30 truncate">{c}</div>
+          {STEP_KEYS.map(k => (
+            <div key={k} className="flex items-center justify-center">
+              <div className="w-6 h-6 rounded-full border border-white/10 flex items-center justify-center text-[10px] text-white/20">○</div>
+            </div>
+          ))}
+        </div>
+      ))}
     </div>
   );
 }
