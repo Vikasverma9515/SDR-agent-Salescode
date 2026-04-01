@@ -218,6 +218,83 @@ _log_queues: dict[str, asyncio.Queue] = {}
 _fini_results: dict[str, dict] = {}  # cache completed enrichment data for WS replay
 _last_pause_event: dict[str, dict] = {}  # cache last role/contact pause event for WS reconnect replay
 
+# ---------------------------------------------------------------------------
+# n8n Intake Buffer — collects contacts, flushes after 60s silence
+# ---------------------------------------------------------------------------
+# n8n sends contacts in drip-feed batches (not all at once).
+# Instead of triggering a chain per POST, we buffer everything and
+# flush once n8n goes quiet for 60 seconds.
+
+_N8N_BUFFER_TIMEOUT = 60  # seconds of silence before flush
+
+_n8n_buffer_companies: set[str] = set()     # companies seen in current buffer window
+_n8n_buffer_contact_count: int = 0          # total contacts written in current buffer
+_n8n_buffer_timer: asyncio.Task | None = None  # the countdown timer task
+_n8n_buffer_lock = None                     # initialized in create_app (needs event loop)
+
+
+async def _n8n_buffer_flush():
+    """Called after 60s of silence — triggers ONE sequential chain for all buffered companies."""
+    global _n8n_buffer_companies, _n8n_buffer_contact_count, _n8n_buffer_timer
+
+    companies = set(_n8n_buffer_companies)  # snapshot
+    contact_count = _n8n_buffer_contact_count
+
+    # Reset buffer
+    _n8n_buffer_companies.clear()
+    _n8n_buffer_contact_count = 0
+    _n8n_buffer_timer = None
+
+    if not companies:
+        logger.info("n8n_buffer_flush_empty", msg="No companies to process")
+        return
+
+    logger.info("n8n_buffer_flush",
+                companies=sorted(companies), contacts=contact_count,
+                msg=f"Flushing {len(companies)} companies after {_N8N_BUFFER_TIMEOUT}s silence")
+
+    # Trigger ONE Veri → Searcher → Veri chain for all buffered companies
+    thread_id = str(uuid.uuid4())
+    _log_queues[thread_id] = _PipelineQueue(thread_id)
+    _active_runs[thread_id] = {
+        "agent": "veri",
+        "status": "running",
+        "thread_id": thread_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "auto_triggered_by": "n8n_buffer",
+        "buffered_companies": sorted(companies),
+        "buffered_contacts": contact_count,
+    }
+
+    company_filter = ",".join(sorted(companies))
+
+    async def _run_chain():
+        try:
+            await _veri_task(thread_id, company_filter=company_filter)
+        except Exception as e:
+            logger.error("n8n_buffer_chain_error", error=str(e))
+
+    _active_tasks[thread_id] = asyncio.create_task(_run_chain())
+    logger.info("n8n_buffer_chain_started",
+                thread_id=thread_id, companies=sorted(companies))
+
+
+async def _n8n_buffer_reset_timer():
+    """Reset the 60s countdown. Called on every new n8n POST."""
+    global _n8n_buffer_timer
+
+    # Cancel existing timer
+    if _n8n_buffer_timer and not _n8n_buffer_timer.done():
+        _n8n_buffer_timer.cancel()
+
+    # Start new 60s countdown
+    async def _countdown():
+        await asyncio.sleep(_N8N_BUFFER_TIMEOUT)
+        async with _n8n_buffer_lock:
+            await _n8n_buffer_flush()
+
+    _n8n_buffer_timer = asyncio.create_task(_countdown())
+
 
 _PAUSE_EVENT_TYPES = {"role_selection_required", "contact_selection_required"}
 
@@ -264,8 +341,12 @@ async def _emit_event(thread_id: str, event_type: str, data: dict):
 # ---------------------------------------------------------------------------
 
 def create_app() -> FastAPI:
+    global _n8n_buffer_lock
     settings = get_settings()
     configure_logging(settings.log_dir_abs)
+
+    # Initialize buffer lock (needs event loop context)
+    _n8n_buffer_lock = asyncio.Lock()
 
     app = FastAPI(
         title="SalesCode Mapping Pipeline",
@@ -628,23 +709,27 @@ def create_app() -> FastAPI:
             logger.error("n8n_contacts_write_error", error=str(e))
             raise HTTPException(status_code=500, detail=f"Failed to write contacts to sheet: {e}")
 
-        # Step 2: Trigger Veri → Searcher → Veri chain
-        thread_id = str(uuid.uuid4())
+        # Step 2: Buffer companies — DON'T trigger chain yet.
+        # n8n sends contacts in drip-feed batches. We collect everything and
+        # flush after 60s of silence → ONE clean sequential pipeline run.
+        global _n8n_buffer_contact_count
         if rows_written > 0:
-            _log_queues[thread_id] = _PipelineQueue(thread_id)
-            _active_runs[thread_id] = {
-                "agent": "veri",
-                "status": "running",
-                "thread_id": thread_id,
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "auto_triggered_by": "n8n",
-            }
-            company_filter = ",".join(companies_seen) if companies_seen else None
-            asyncio.create_task(_veri_task(thread_id, company_filter=company_filter))
-            logger.info("n8n_contacts_chain_started",
-                        contacts=rows_written, companies=list(companies_seen), thread_id=thread_id)
+            async with _n8n_buffer_lock:
+                _n8n_buffer_companies.update(companies_seen)
+                _n8n_buffer_contact_count += rows_written
+                await _n8n_buffer_reset_timer()
+                buffer_status = (
+                    f"Buffered. {len(_n8n_buffer_companies)} companies, "
+                    f"{_n8n_buffer_contact_count} contacts total. "
+                    f"Chain starts after {_N8N_BUFFER_TIMEOUT}s silence."
+                )
+            logger.info("n8n_contacts_buffered",
+                        new_contacts=rows_written, new_companies=list(companies_seen),
+                        buffer_companies=sorted(_n8n_buffer_companies),
+                        buffer_total=_n8n_buffer_contact_count)
         else:
-            logger.info("n8n_contacts_no_chain", reason="0 rows written", skipped=skipped)
+            buffer_status = "No contacts written — nothing buffered"
+            logger.info("n8n_contacts_no_buffer", reason="0 rows written", skipped=skipped)
 
         # Store last received data for debugging
         _n8n_last_received.clear()
@@ -655,19 +740,48 @@ def create_app() -> FastAPI:
             "skipped": skipped,
             "skip_reasons": skip_reasons,
             "companies": list(companies_seen),
+            "buffer_companies": sorted(_n8n_buffer_companies),
+            "buffer_total_contacts": _n8n_buffer_contact_count,
+            "buffer_timeout_secs": _N8N_BUFFER_TIMEOUT,
             "sample_raw": raw_contacts[0] if raw_contacts else {},
             "sample_normalized": _normalize_contact(raw_contacts[0]) if raw_contacts else {},
         })
 
-        chain_msg = "Veri → Searcher → Veri chain started" if rows_written > 0 else "No chain — 0 contacts written"
         skip_msg = f" Skipped {skipped}: {'; '.join(skip_reasons[:3])}" if skipped else ""
 
         return RunResponse(
-            thread_id=thread_id,
-            status="started" if rows_written > 0 else "empty",
+            thread_id="buffered",
+            status="buffered" if rows_written > 0 else "empty",
             message=f"Received {rows_written} contacts for {len(companies_seen)} companies. "
-                    f"{chain_msg}.{skip_msg}",
+                    f"{buffer_status}{skip_msg}",
         )
+
+    @app.post("/api/n8n/flush")
+    async def n8n_flush():
+        """Manually flush the n8n buffer — triggers the chain immediately."""
+        async with _n8n_buffer_lock:
+            companies = sorted(_n8n_buffer_companies)
+            contacts = _n8n_buffer_contact_count
+            if not companies:
+                return {"status": "empty", "message": "Buffer is empty — nothing to flush"}
+            # Cancel the timer and flush now
+            if _n8n_buffer_timer and not _n8n_buffer_timer.done():
+                _n8n_buffer_timer.cancel()
+            await _n8n_buffer_flush()
+        return {
+            "status": "flushed",
+            "message": f"Flushed {contacts} contacts for {len(companies)} companies: {', '.join(companies)}",
+        }
+
+    @app.get("/api/n8n/buffer")
+    async def n8n_buffer_status():
+        """Check the current buffer state — what's waiting to be processed."""
+        return {
+            "companies": sorted(_n8n_buffer_companies),
+            "total_contacts": _n8n_buffer_contact_count,
+            "timeout_secs": _N8N_BUFFER_TIMEOUT,
+            "timer_active": _n8n_buffer_timer is not None and not _n8n_buffer_timer.done(),
+        }
 
     @app.get("/api/n8n/debug")
     async def n8n_debug():
