@@ -486,6 +486,172 @@ function ReviewCardItem({
 // ---------------------------------------------------------------------------
 // Main Page
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Pipeline Tracker — shows Fini → n8n → Veri → Searcher → Veri chain status
+// ---------------------------------------------------------------------------
+type AgentRun = {
+  agent: string;
+  status: string;
+  thread_id: string;
+  started_at: string;
+  auto_triggered_by?: string;
+  contacts_appended?: number;
+  contacts_discovered?: number;
+  missing_roles?: string[];
+  error?: string;
+  verified?: number;
+  review?: number;
+  rejected?: number;
+};
+
+type PipelineStep = {
+  label: string;
+  agent: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  detail: string;
+  time: string;
+};
+
+function PipelineTracker() {
+  const [steps, setSteps] = useState<PipelineStep[]>([
+    { label: 'Fini', agent: 'fini', status: 'pending', detail: 'Target enrichment', time: '' },
+    { label: 'n8n', agent: 'n8n', status: 'pending', detail: 'Contact discovery', time: '' },
+    { label: 'Veri', agent: 'veri', status: 'pending', detail: 'Contact verification', time: '' },
+    { label: 'Searcher', agent: 'searcher', status: 'pending', detail: 'Gap-fill discovery', time: '' },
+    { label: 'Veri R2', agent: 'veri_r2', status: 'pending', detail: 'Verify new contacts', time: '' },
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      while (!cancelled) {
+        try {
+          const resp = await fetch(apiUrl('/api/runs'));
+          const runs: AgentRun[] = await resp.json();
+
+          const newSteps: PipelineStep[] = [
+            { label: 'Fini', agent: 'fini', status: 'pending', detail: 'Target enrichment', time: '' },
+            { label: 'n8n', agent: 'n8n', status: 'pending', detail: 'Contact discovery', time: '' },
+            { label: 'Veri', agent: 'veri', status: 'pending', detail: 'Contact verification', time: '' },
+            { label: 'Searcher', agent: 'searcher', status: 'pending', detail: 'Gap-fill discovery', time: '' },
+            { label: 'Veri R2', agent: 'veri_r2', status: 'pending', detail: 'Verify new contacts', time: '' },
+          ];
+
+          // Map runs to pipeline steps
+          for (const run of runs) {
+            const time = run.started_at ? new Date(run.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+            const status = run.status === 'running' ? 'running' : run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : 'pending';
+
+            if (run.agent === 'fini') {
+              newSteps[0] = { ...newSteps[0], status, time };
+              if (status === 'completed') {
+                newSteps[1] = { ...newSteps[1], status: 'running', detail: 'Waiting for n8n...' };
+              }
+            }
+
+            if (run.agent === 'veri' && run.auto_triggered_by === 'n8n') {
+              // n8n delivered data (since Veri was triggered)
+              newSteps[1] = { ...newSteps[1], status: 'completed', detail: 'Contacts delivered', time };
+              const v = run as any;
+              const vDetail = status === 'completed'
+                ? `${v.verified || 0} verified, ${v.review || 0} review, ${v.rejected || 0} rejected`
+                : 'Verifying contacts...';
+              newSteps[2] = { ...newSteps[2], status, detail: vDetail, time };
+            }
+
+            if (run.agent === 'searcher' && run.auto_triggered_by === 'veri') {
+              const sDetail = status === 'completed'
+                ? `Found ${run.contacts_discovered || 0}, wrote ${run.contacts_appended || 0}`
+                : run.missing_roles?.length
+                  ? `Searching for ${run.missing_roles.slice(0, 3).join(', ')}...`
+                  : 'Analyzing gaps...';
+              newSteps[3] = { ...newSteps[3], status, detail: sDetail, time };
+              if (run.error) {
+                newSteps[3] = { ...newSteps[3], status: 'failed', detail: run.error.slice(0, 60) };
+              }
+            }
+
+            if (run.agent === 'veri' && run.auto_triggered_by === 'searcher') {
+              const v2Detail = status === 'completed'
+                ? 'Searcher contacts verified'
+                : 'Verifying searcher contacts...';
+              newSteps[4] = { ...newSteps[4], status, detail: v2Detail, time };
+            }
+          }
+
+          // If Veri (n8n) completed but no searcher run exists yet, mark searcher as pending
+          if (newSteps[2].status === 'completed' && newSteps[3].status === 'pending') {
+            newSteps[3] = { ...newSteps[3], status: 'running', detail: 'Starting...' };
+          }
+
+          setSteps(newSteps);
+        } catch { /* ignore */ }
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  const statusIcon = (s: string) => {
+    switch (s) {
+      case 'completed': return '✓';
+      case 'running': return '◌';
+      case 'failed': return '✕';
+      default: return '○';
+    }
+  };
+
+  const statusColor = (s: string) => {
+    switch (s) {
+      case 'completed': return 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10';
+      case 'running': return 'text-blue-400 border-blue-500/30 bg-blue-500/10 animate-pulse';
+      case 'failed': return 'text-red-400 border-red-500/30 bg-red-500/10';
+      default: return 'text-white/30 border-white/10 bg-white/[0.02]';
+    }
+  };
+
+  const lineColor = (s: string) => {
+    switch (s) {
+      case 'completed': return 'bg-emerald-500/40';
+      case 'running': return 'bg-blue-500/40 animate-pulse';
+      case 'failed': return 'bg-red-500/40';
+      default: return 'bg-white/10';
+    }
+  };
+
+  return (
+    <div className="border border-white/[0.06] rounded-2xl bg-black/20 p-4 mt-3">
+      <div className="flex items-center gap-2 mb-4">
+        <span className="text-[9px] font-bold text-white/50 uppercase tracking-[0.35em]">Pipeline Status</span>
+        <div className="flex-1 h-[1px] bg-white/[0.06]" />
+      </div>
+      <div className="flex items-start gap-0">
+        {steps.map((step, i) => (
+          <React.Fragment key={step.agent}>
+            <div className="flex flex-col items-center min-w-[100px] flex-1">
+              <div className={`w-8 h-8 rounded-full border-2 flex items-center justify-center text-xs font-bold ${statusColor(step.status)}`}>
+                {statusIcon(step.status)}
+              </div>
+              <div className="mt-2 text-center">
+                <div className="text-[11px] font-bold text-white/80">{step.label}</div>
+                <div className="text-[9px] text-white/40 mt-0.5 max-w-[120px] leading-tight">{step.detail}</div>
+                {step.time && <div className="text-[8px] text-white/25 mt-0.5 font-mono">{step.time}</div>}
+              </div>
+            </div>
+            {i < steps.length - 1 && (
+              <div className={`h-[2px] flex-1 mt-4 rounded-full ${lineColor(steps[i + 1].status === 'pending' ? step.status : steps[i + 1].status)}`} />
+            )}
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main Fini Page
+// ---------------------------------------------------------------------------
 export default function FiniPage() {
   const {
     companies, sdr, region, submitN8n, autoMode,
@@ -1008,6 +1174,9 @@ export default function FiniPage() {
               )}
             </div>
           )}
+
+          {/* Pipeline Tracker — shows full agent chain status */}
+          {(running || enrichmentDone) && <PipelineTracker />}
         </div>
 
         {/* Right: Queue Panel */}
