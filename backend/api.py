@@ -695,8 +695,8 @@ def create_app() -> FastAPI:
                 if not isinstance(raw, dict):
                     skipped += 1
                     skip_reasons.append(f"Not a dict: {str(raw)[:80]}")
-                    await _log_n8n_contact(sheets, timestamp, {"_raw": str(raw)[:200]},
-                                           {}, "skipped", "Not a valid contact object")
+                    asyncio.create_task(_log_n8n_contact(sheets, timestamp, {"_raw": str(raw)[:200]},
+                                           {}, "skipped", "Not a valid contact object"))
                     continue
                 c = _normalize_contact(raw)
 
@@ -706,7 +706,7 @@ def create_app() -> FastAPI:
                     company_hint = c["company_name"] or "(no company)"
                     reason = f"No first/last name — keys: {list(raw.keys())[:6]}"
                     skip_reasons.append(f"{company_hint}: {reason}")
-                    await _log_n8n_contact(sheets, timestamp, raw, c, "skipped", reason)
+                    asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "skipped", reason))
                     continue
 
                 row = [
@@ -731,8 +731,8 @@ def create_app() -> FastAPI:
                 rows_written += 1
                 if c["company_name"]:
                     companies_seen.add(c["company_name"])
-                # Log the written contact too
-                await _log_n8n_contact(sheets, timestamp, raw, c, "written", "")
+                # Log the written contact (fire-and-forget — don't slow down response)
+                asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "written", ""))
             logger.info("n8n_contacts_written", count=rows_written, skipped=skipped,
                         companies=list(companies_seen))
         except Exception as e:
