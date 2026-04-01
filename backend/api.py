@@ -5,6 +5,7 @@ Provides REST endpoints + WebSocket for real-time log streaming.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -111,6 +112,39 @@ def _normalize_contact(raw: dict) -> dict:
     if not company and domain:
         company = domain.split(".")[0].capitalize()
 
+    first_name = _extract_field(raw,
+        "first_name", "firstname", "first", "given_name", "fname")
+    last_name = _extract_field(raw,
+        "last_name", "lastname", "last", "family_name", "surname", "lname")
+
+    # If no first/last name, try to extract from email (rajneet.kohli@x.com → Rajneet Kohli)
+    if not first_name and not last_name and email and "@" in email:
+        local = email.split("@")[0]
+        # Common patterns: first.last, first_last, firstlast, first-last
+        parts = re.split(r'[._\-]', local)
+        if len(parts) >= 2:
+            first_name = parts[0].capitalize()
+            last_name = " ".join(p.capitalize() for p in parts[1:])
+        elif len(parts) == 1 and len(local) > 2:
+            # Single word email (e.g. abhishekjajoo@) — can't split reliably
+            # but store as first_name so we don't skip the contact
+            first_name = local.capitalize()
+
+    # If still no name, try to extract from LinkedIn URL (/in/rajneet-kohli-a04a2294)
+    linkedin_url = _extract_field(raw,
+        "linkedin_url", "linkedin", "linekdin_url", "linkedin_profile",
+        "li_url", "linkedin_link", "profile_url")
+    if not first_name and not last_name and linkedin_url:
+        li_match = re.search(r'linkedin\.com/in/([^/?&#]+)', linkedin_url)
+        if li_match:
+            slug = li_match.group(1).rstrip('/')
+            # Strip trailing hex IDs (rajneet-kohli-a04a2294 → rajneet-kohli)
+            slug = re.sub(r'-[a-f0-9]{6,}$', '', slug)
+            parts = slug.split('-')
+            if len(parts) >= 2:
+                first_name = parts[0].capitalize()
+                last_name = " ".join(p.capitalize() for p in parts[1:])
+
     return {
         "company_name": company,
         "normalized_name": _extract_field(raw,
@@ -119,18 +153,14 @@ def _normalize_contact(raw: dict) -> dict:
         "account_type": _extract_field(raw, "account_type", "type", "region"),
         "account_size": _extract_field(raw, "account_size", "size", "company_size"),
         "country": _extract_field(raw, "country", "location", "geo", "region"),
-        "first_name": _extract_field(raw,
-            "first_name", "firstname", "first", "given_name", "fname"),
-        "last_name": _extract_field(raw,
-            "last_name", "lastname", "last", "family_name", "surname", "lname"),
+        "first_name": first_name,
+        "last_name": last_name,
         "job_title": _extract_field(raw,
             "job_title", "title", "job_titles", "job_titles_(english)", "job_title_(english)",
             "role", "position", "designation"),
         "buying_role": _extract_field(raw,
             "buying_role", "role_type", "buyer_role", "contact_type"),
-        "linkedin_url": _extract_field(raw,
-            "linkedin_url", "linkedin", "linekdin_url", "linkedin_profile",
-            "li_url", "linkedin_link", "profile_url"),
+        "linkedin_url": linkedin_url,
         "email": email,
         "phone_1": _extract_field(raw, "phone_1", "phone", "phone1", "mobile", "telephone"),
         "phone_2": _extract_field(raw, "phone_2", "phone2", "secondary_phone"),
