@@ -956,7 +956,7 @@ async def _smart_company_lookup(raw_name: str, region: str = "") -> dict:
             f"Return ONLY valid JSON, no markdown, no explanation."
         )
 
-        raw_response = await llm_web_search(prompt, model="gpt-4o-search-preview")
+        raw_response = await llm_web_search(prompt, model="gpt-5-search-api")
         logger.info("smart_lookup_gpt_response", company=raw_name,
                     content=(raw_response or "")[:300])
 
