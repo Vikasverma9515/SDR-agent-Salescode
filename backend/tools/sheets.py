@@ -196,7 +196,9 @@ async def ensure_headers(tab_name: str, headers: list[str]) -> None:
         _headers_verified.add(tab_name)
     except gspread.exceptions.WorksheetNotFound:
         spreadsheet = _get_spreadsheet()
-        await _run_sync(spreadsheet.add_worksheet, tab_name, rows=1000, cols=26)
+        # Use minimal size — only as many columns as headers, 100 rows to start.
+        # Google Sheets has a 10M cell limit; creating 1000×26 tabs wastes quota.
+        await _run_sync(spreadsheet.add_worksheet, tab_name, rows=100, cols=max(len(headers), 10))
         sheet = _get_sheet(tab_name)
         await _run_sync(sheet.append_row, headers, value_input_option="USER_ENTERED")
         logger.info("sheet_tab_created", tab=tab_name, headers=headers)
