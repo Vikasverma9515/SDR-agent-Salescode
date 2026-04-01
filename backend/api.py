@@ -58,6 +58,8 @@ def _extract_field(item: dict, *keys: str, default: str = "") -> str:
     return default
 
 
+_n8n_log_last_error: dict = {}  # surfaces sheet-write errors via /api/n8n/debug
+
 async def _log_n8n_webhook(
     sheets_mod, timestamp: str, status: str,
     received: int, written: int, skipped: int,
@@ -70,17 +72,21 @@ async def _log_n8n_webhook(
         await sheets_mod.append_row(sheets_mod.N8N_WEBHOOK_LOG, [
             timestamp,          # A
             status,             # B
-            received,           # C
-            written,            # D
-            skipped,            # E
+            str(received),      # C
+            str(written),       # D
+            str(skipped),       # E
             companies,          # F
             skip_reasons,       # G
             chain,              # H
             thread_id,          # I
             sample_raw,         # J
         ])
+        _n8n_log_last_error.clear()
     except Exception as e:
         logger.warning("n8n_webhook_log_write_error", error=str(e))
+        _n8n_log_last_error.clear()
+        _n8n_log_last_error["error"] = str(e)
+        _n8n_log_last_error["traceback"] = __import__("traceback").format_exc()
 
 
 def _normalize_contact(raw: dict) -> dict:
@@ -682,7 +688,10 @@ def create_app() -> FastAPI:
     @app.get("/api/n8n/debug")
     async def n8n_debug():
         """Check the last data received from n8n — for debugging field mapping."""
-        return _n8n_last_received if _n8n_last_received else {"message": "No data received yet"}
+        result = dict(_n8n_last_received) if _n8n_last_received else {"message": "No data received yet"}
+        if _n8n_log_last_error:
+            result["_webhook_log_error"] = _n8n_log_last_error
+        return result
 
     # ---------------------------------------------------------------------------
     # Auto-pipeline: Fini → n8n → Veri → Searcher → Veri (fully automatic)
