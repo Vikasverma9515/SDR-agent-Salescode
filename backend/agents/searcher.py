@@ -2072,7 +2072,7 @@ async def search_filings(state: SearcherState) -> SearcherState:
     role_str = ", ".join(state.missing_dm_roles) if state.missing_dm_roles else "VP Director CEO"
 
     queries = [
-        f"{state.target_company} annual report key management {role_str} 2023 2024",
+        f"{state.target_company} annual report key management {role_str} 2025 2026",
         f"{state.target_company} board directors management team filetype:pdf",
         f'"{state.target_company}" {role_str} leadership team',
     ]

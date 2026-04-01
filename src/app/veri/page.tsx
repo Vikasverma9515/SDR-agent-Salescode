@@ -409,7 +409,7 @@ function HowItWorksModal({ onClose }: { onClose: () => void }) {
               {[
                 { tool: 'DDG ×3', color: 'text-violet-400', desc: '3 parallel queries: name+company, name+role+company, name+LinkedIn+company. Looks for positive presence or stale signals (ex-, former, moved to, left…)' },
                 { tool: 'TheOrg', color: 'text-violet-400', desc: 'Org-chart lookup. If found: strong identity + title confirmation. Not found = no penalty.' },
-                { tool: 'Perplexity', color: 'text-violet-400', desc: 'Structured question: "Is {name} currently at {company} in 2025?" Returns presence confirmation + 2024/25 recency tag.' },
+                { tool: 'Perplexity', color: 'text-violet-400', desc: 'Structured question: "Is {name} currently at {company} in 2026?" Returns presence confirmation + 2025/26 recency tag.' },
                 { tool: 'Tavily', color: 'text-violet-400', desc: 'Deep search fallback. Only fires when DDG returns NEITHER positive NOR stale signal. Skipped otherwise.' },
               ].map(s => (
                 <div key={s.tool} className="border border-white/[0.06] rounded-xl p-3">
@@ -651,7 +651,7 @@ function WorkflowDiagram({ activePhase }: { activePhase: ContactPhase | null }) 
               { name: 'LI Search', note: 'find URL by name' },
               { name: 'DDG ×3', note: '3 concurrent queries' },
               { name: 'TheOrg', note: 'org chart lookup' },
-              { name: 'Perplexity', note: 'role extraction, 2025' },
+              { name: 'Perplexity', note: 'role extraction, 2026' },
               { name: 'Tavily ↩', note: 'if DDG inconclusive' },
             ]}
             colorClass="text-violet-400" borderActive="border-violet-400/30"

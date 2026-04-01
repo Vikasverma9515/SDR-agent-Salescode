@@ -335,7 +335,7 @@ async def _verify_one(
     async def _perplexity_search():
         # Structured query to extract current role — much more targeted than generic search
         role_query = (
-            f'What is {contact.full_name}\'s current job title and employer as of 2025? '
+            f'What is {contact.full_name}\'s current job title and employer as of 2026? '
             f'Are they currently working at {contact.company}? '
             f'What department do they work in?'
         )
@@ -395,10 +395,10 @@ async def _verify_one(
     evidence["perplexity"] = combined_perplexity[:800]
     evidence["perplexity_stale"] = _has_stale_signal(combined_perplexity, contact.full_name, contact.company)
     evidence["perplexity_positive"] = _has_positive_signal(combined_perplexity, contact.full_name, contact.company)
-    evidence["perplexity_recent"] = bool(re.search(r'\b(2024|2025)\b', combined_perplexity))
+    evidence["perplexity_recent"] = bool(re.search(r'\b(2025|2026)\b', combined_perplexity))
 
     if evidence["perplexity_positive"]:
-        recent_tag = " · 2024/25 mention" if evidence["perplexity_recent"] else ""
+        recent_tag = " · 2025/26 mention" if evidence["perplexity_recent"] else ""
         await emit_veri_step(state.thread_id, contact.full_name, contact.company,
             "web", "perplexity", f"confirms presence at {contact.company}{recent_tag}", "success")
     elif evidence["perplexity_stale"]:
@@ -867,7 +867,7 @@ async def _llm_cross_reason(
     if evidence.get("perplexity_stale"):
         web_summary.append("Perplexity shows stale signals")
     if evidence.get("perplexity_recent"):
-        web_summary.append("Perplexity mentions 2024/2025")
+        web_summary.append("Perplexity mentions 2025/2026")
     if evidence.get("theorg_found"):
         web_summary.append(f"TheOrg: {evidence.get('theorg_title','?')} at {contact.company}")
 
