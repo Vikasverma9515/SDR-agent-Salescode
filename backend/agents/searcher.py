@@ -132,7 +132,7 @@ _GATEKEEPER_KEYWORDS = {
 # Must-have roles — Searcher will specifically web-search for these if missing
 MUST_HAVE_TIERS = [
     {"tier": "CEO/MD", "keywords": _CEO_MD_KEYWORDS, "search_queries": [
-        "CEO", "Managing Director", "General Manager", "Country Manager",
+        "CEO", "Co-Founder", "Founder", "Managing Director", "General Manager", "Country Manager",
     ]},
     {"tier": "CTO/CIO", "keywords": _CTO_CIO_KEYWORDS, "search_queries": [
         "CTO", "CIO", "Head of Technology", "VP Engineering",
@@ -2961,6 +2961,23 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
         f"[{state.target_company}] Enriching {len(state.discovered_contacts)} contact(s) — constructing emails from {format_source}",
         level="info")
 
+    # ── Sheet-level dedup: read existing emails + LinkedIn URLs to avoid duplicates ──
+    _existing_emails: set[str] = set()
+    _existing_linkedin: set[str] = set()
+    try:
+        _fcl_records = await sheets.read_all_records(sheets.FIRST_CLEAN_LIST)
+        for _row in _fcl_records:
+            _e = str(_row.get("Email", "") or "").strip().lower()
+            if _e and "@" in _e:
+                _existing_emails.add(_e)
+            _li = str(_row.get("LinkedIn URL", _row.get("LinkedIn Url", _row.get("Linekdin Url", ""))) or "").strip().lower().rstrip("/")
+            if _li and "linkedin.com" in _li:
+                _existing_linkedin.add(_li)
+        logger.info("searcher_sheet_dedup_loaded",
+                    emails=len(_existing_emails), linkedin=len(_existing_linkedin))
+    except Exception as e:
+        logger.warning("searcher_sheet_dedup_load_error", error=str(e))
+
     # Shared mutable state — protected by write_lock
     write_lock = asyncio.Lock()
     enriched: list[Contact] = []
@@ -2999,6 +3016,18 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                             bucket=bucket, reason="not a decision-maker or influencer role")
                 return
 
+            # ── Sheet-level dedup: skip if this person already exists in the sheet ──
+            _li_check = (contact.linkedin_url or "").strip().lower().rstrip("/")
+            if _li_check and "linkedin.com" in _li_check and _li_check in _existing_linkedin:
+                logger.info("searcher_sheet_dedup_skip", contact=contact.full_name,
+                            reason="LinkedIn URL already in sheet", linkedin=_li_check)
+                return
+            # Also check by email (constructed later, but check existing email if set)
+            if contact.email and contact.email.lower() in _existing_emails:
+                logger.info("searcher_sheet_dedup_skip", contact=contact.full_name,
+                            reason="email already in sheet", email=contact.email)
+                return
+
             await _enrich_log(state.thread_id,
                 f"[{contact.company}] Enriching {contact.full_name} ({contact.role_title or 'unknown role'}) — constructing email…",
                 level="info")
@@ -3007,6 +3036,11 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
             if not contact.email and domain and email_format:
                 constructed = construct_email(contact.full_name, email_format, domain)
                 if constructed:
+                    # Dedup check on constructed email too
+                    if constructed.lower() in _existing_emails:
+                        logger.info("searcher_sheet_dedup_skip", contact=contact.full_name,
+                                    reason="constructed email already in sheet", email=constructed)
+                        return
                     contact = contact.model_copy(update={
                         "email": constructed,
                         "email_status": "constructed",
@@ -3061,6 +3095,12 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
                 fcl_end_box[0] = data_row
 
                 enriched.append(contact)
+                # Add to dedup sets so subsequent contacts in this batch are also caught
+                if contact.email:
+                    _existing_emails.add(contact.email.lower())
+                _li = (contact.linkedin_url or "").strip().lower().rstrip("/")
+                if _li and "linkedin.com" in _li:
+                    _existing_linkedin.add(_li)
                 logger.info("searcher_contact_written",
                             contact=contact.full_name, company=contact.company,
                             email=contact.email or "(none)")

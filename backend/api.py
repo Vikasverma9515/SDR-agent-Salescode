@@ -1524,32 +1524,62 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
             print("[VERI CHAIN] Veri round 2 done — chain complete, NOT triggering Searcher", flush=True)
             await _emit_log(thread_id, "info", "Veri round 2 complete — chain finished")
         elif _companies_in_run:
-            companies_str = ",".join(_companies_in_run)
-            searcher_thread = str(uuid.uuid4())
-            _log_queues[searcher_thread] = _PipelineQueue(searcher_thread)
-            _active_runs[searcher_thread] = {
-                "agent": "searcher",
-                "status": "running",
-                "thread_id": searcher_thread,
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "auto_triggered_by": "veri",
-            }
-            searcher_req = SearcherRunRequest(
-                companies=companies_str,
-                auto_approve=True,
-                auto_trigger_veri=True,
-            )
-            print(f"[VERI CHAIN] TRIGGERING SEARCHER for: {companies_str}", flush=True)
-            await _emit_log(thread_id, "info", f"Triggering Searcher gap-fill for: {companies_str}")
-            try:
-                _active_tasks[searcher_thread] = asyncio.create_task(
-                    _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=True)
+            # ── SEQUENTIAL COMPANY PROCESSING ──
+            # Process ONE company at a time: Searcher(A) → Veri(A) → Searcher(B) → Veri(B) → ...
+            # This prevents interleaving (Zepto/Nike/Red Bull rows mixed together)
+            # and ensures each company's data is a clean block in the sheet.
+            company_list = sorted(_companies_in_run)
+            print(f"[VERI CHAIN] SEQUENTIAL mode: {len(company_list)} companies: {company_list}", flush=True)
+            await _emit_log(thread_id, "info",
+                f"Starting sequential Searcher→Veri for {len(company_list)} companies: {', '.join(company_list)}")
+
+            for i, company in enumerate(company_list):
+                company_num = f"[{i+1}/{len(company_list)}]"
+                print(f"[VERI CHAIN] {company_num} Starting Searcher for: {company}", flush=True)
+                await _emit_log(thread_id, "info", f"{company_num} Searcher starting for: {company}")
+
+                # Run Searcher for this ONE company
+                searcher_thread = str(uuid.uuid4())
+                _log_queues[searcher_thread] = _PipelineQueue(searcher_thread)
+                _active_runs[searcher_thread] = {
+                    "agent": "searcher", "status": "running",
+                    "thread_id": searcher_thread,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "auto_triggered_by": "veri",
+                }
+                searcher_req = SearcherRunRequest(
+                    companies=company,  # ONE company at a time
+                    auto_approve=True,
+                    auto_trigger_veri=False,  # We handle Veri ourselves below
                 )
-                await _emit_log(thread_id, "info", f"Searcher started (thread: {searcher_thread})")
-            except Exception as e:
-                print(f"[VERI CHAIN] ERROR creating Searcher task: {e}", flush=True)
-                import traceback
-                print(f"[VERI CHAIN] TRACEBACK: {traceback.format_exc()}", flush=True)
+                try:
+                    await _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=False)
+                    await _emit_log(thread_id, "info", f"{company_num} Searcher done for: {company}")
+                except Exception as e:
+                    print(f"[VERI CHAIN] {company_num} Searcher error for {company}: {e}", flush=True)
+                    await _emit_log(thread_id, "error", f"{company_num} Searcher failed for {company}: {e}")
+
+                # Run Veri round 2 for this company's searcher contacts
+                veri2_thread = str(uuid.uuid4())
+                _log_queues[veri2_thread] = _PipelineQueue(veri2_thread)
+                _active_runs[veri2_thread] = {
+                    "agent": "veri", "status": "running",
+                    "thread_id": veri2_thread,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "auto_triggered_by": "searcher",
+                }
+                try:
+                    from backend.utils import pause as _p2
+                    _p2.register(veri2_thread)
+                    await _emit_log(thread_id, "info", f"{company_num} Veri R2 starting for: {company}")
+                    await _veri_task(veri2_thread, company_filter=company)
+                    await _emit_log(thread_id, "info", f"{company_num} Veri R2 done for: {company}")
+                except Exception as e:
+                    print(f"[VERI CHAIN] {company_num} Veri R2 error for {company}: {e}", flush=True)
+                    await _emit_log(thread_id, "error", f"{company_num} Veri R2 failed for {company}: {e}")
+
+            await _emit_log(thread_id, "info",
+                f"Sequential pipeline complete — {len(company_list)} companies processed")
         else:
             print("[VERI CHAIN] No companies found — cannot trigger Searcher", flush=True)
             await _emit_log(thread_id, "warning", "No companies found to trigger Searcher")
