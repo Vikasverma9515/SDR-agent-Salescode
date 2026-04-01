@@ -1687,11 +1687,11 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
             _use_org_name = cand_name
             _use_region = effective_region or ""
 
-            # For regional branches / distributors, use the PARENT company's org_id
-            # since the branch page often has 0 employees in Sales Navigator.
+            # For regional branches / distributors / brands, use the PARENT company's org_id
+            # since the branch/brand page often has 0 employees in Sales Navigator.
             _ctype = smart.get("company_type", "")
             _parent = smart.get("parent_brand", "")
-            if _ctype in ("regional_branch", "distributor", "subsidiary") and _parent and cand_org_id:
+            if _ctype in ("regional_branch", "distributor", "subsidiary", "brand") and _parent and cand_org_id:
                 try:
                     parent_org = await unipile.get_company_org_id(_parent)
                     if parent_org.get("org_id"):
@@ -1805,6 +1805,32 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
                 cand_enriched["email_format"] = None
                 cand_enriched["domain_confidence"] = "low"
                 cand_enriched["email_confidence"] = "low"
+
+            # ── Domain cross-validation of Sales Nav org_id ──
+            # Now that we know the correct domain, re-validate the org_id.
+            # If the LinkedIn company's website doesn't match, re-search with domain validation.
+            _cand_domain = cand_enriched.get("domain") or ""
+            if _cand_domain and _use_org_id:
+                try:
+                    _org_website = await unipile.get_company_domain(str(_use_org_id))
+                    if _org_website and not unipile._domain_matches(_org_website, _cand_domain):
+                        await _log(f"[{company.raw_name}] Sales Nav org website '{_org_website}' ≠ domain '{_cand_domain}' — re-searching with domain validation")
+                        # Re-search parent or company with domain validation
+                        _search_name = _parent or cand_name
+                        _revalidated = await unipile.get_company_org_id(_search_name, expected_domain=_cand_domain)
+                        if _revalidated.get("org_id") and _revalidated["org_id"] != _use_org_id:
+                            _use_org_id = _revalidated["org_id"]
+                            _use_org_name = _revalidated.get("name") or _search_name
+                            await _log(f"[{company.raw_name}] re-validated Sales Nav org: {_use_org_name} (domain-matched)")
+                        elif _parent:
+                            # Try parent directly with domain validation
+                            _parent_retry = await unipile.get_company_org_id(_parent, expected_domain=_cand_domain)
+                            if _parent_retry.get("org_id"):
+                                _use_org_id = _parent_retry["org_id"]
+                                _use_org_name = _parent_retry.get("name") or _parent
+                                await _log(f"[{company.raw_name}] using parent org ({_parent}) after domain validation")
+                except Exception as _dv_err:
+                    logger.warning("domain_crossval_error", company=company.raw_name, error=str(_dv_err))
 
             # Account size
             try:

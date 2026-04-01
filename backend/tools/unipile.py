@@ -221,7 +221,27 @@ async def _ask_gpt_for_linkedin_slug(company_name: str) -> list[str]:
 # Company lookup — used by Fini to get org ID for Sales Nav URL
 # ---------------------------------------------------------------------------
 
-async def get_company_org_id(company_name: str) -> OrgInfo:
+def _domain_matches(website: str, expected_domain: str) -> bool:
+    """Check if a LinkedIn company's website matches the expected domain."""
+    if not website or not expected_domain:
+        return True  # can't validate — allow it
+    # Normalize both to bare domain
+    w = re.sub(r'^https?://(?:www\.)?', '', website.lower()).split('/')[0].strip()
+    e = expected_domain.lower().strip()
+    if w == e:
+        return True
+    # Allow parent domain match: "dominos.de" matches "dominos.com" (same brand)
+    w_base = w.rsplit('.', 1)[0] if '.' in w else w
+    e_base = e.rsplit('.', 1)[0] if '.' in e else e
+    if w_base == e_base:
+        return True
+    # Allow substring: "mondelezinternational.com" matches partial "mondelez"
+    if w_base in e_base or e_base in w_base:
+        return True
+    return False
+
+
+async def get_company_org_id(company_name: str, expected_domain: str = "") -> OrgInfo:
     """
     Look up a LinkedIn company and return its numeric org ID.
 
@@ -229,6 +249,9 @@ async def get_company_org_id(company_name: str) -> OrgInfo:
     1. Build a slug from the company name (e.g. "Nestle" → "nestle")
     2. GET /api/v1/linkedin/company/{slug}
     3. If not found, try DDG to find the LinkedIn slug first, then retry
+
+    If expected_domain is provided, candidates whose LinkedIn website doesn't
+    match are deprioritized (tried last) rather than accepted immediately.
     """
     result: OrgInfo = {"org_id": None, "name": None, "public_identifier": None, "error": None}
 
@@ -240,8 +263,15 @@ async def get_company_org_id(company_name: str) -> OrgInfo:
     await _init_pool()
     account_id = _next_account_id()
 
+    # Fallback: candidate that name-matched but FAILED domain validation.
+    # Only used at the very end if nothing domain-validated was found.
+    _domain_fallback: OrgInfo | None = None
+
     async def _fetch_by_slug(client: httpx.AsyncClient, slug: str) -> OrgInfo | None:
-        """Fetch company by slug; return OrgInfo if name matches, else None."""
+        """Fetch company by slug; return OrgInfo if name matches, else None.
+        If expected_domain is set, rejects candidates whose website doesn't match
+        (saves them as fallback instead)."""
+        nonlocal _domain_fallback
         try:
             resp = await client.get(
                 f"{_base_url()}/linkedin/company/{slug}",
@@ -257,14 +287,30 @@ async def get_company_org_id(company_name: str) -> OrgInfo:
                         data.get("website") or data.get("website_url")
                         or data.get("domain") or data.get("company_url") or ""
                     ).strip()
-                    logger.info("unipile_company_found", company=company_name, org_id=org_id, name=name, slug=slug, website=website or "(none)")
-                    return {
+
+                    info: OrgInfo = {
                         "org_id": str(org_id),
                         "name": name,
                         "public_identifier": data.get("public_identifier"),
                         "website": website,
                         "error": None,
                     }
+
+                    # Domain cross-validation: if we know the expected domain,
+                    # reject candidates whose LinkedIn website doesn't match.
+                    # This catches "Domino" (Italian tech) vs "Domino's Pizza" (dominos.de).
+                    if expected_domain and website and not _domain_matches(website, expected_domain):
+                        logger.warning("unipile_company_domain_mismatch",
+                                       company=company_name, slug=slug, name=name,
+                                       linkedin_website=website, expected=expected_domain)
+                        if not _domain_fallback:
+                            _domain_fallback = info  # save as last resort
+                        return None  # skip — try next candidate
+
+                    logger.info("unipile_company_found", company=company_name, org_id=org_id,
+                                name=name, slug=slug, website=website or "(none)",
+                                domain_validated=bool(expected_domain and website))
+                    return info
                 else:
                     logger.warning("unipile_company_mismatch", slug=slug, found=name, wanted=company_name)
         except Exception as e:
@@ -362,6 +408,19 @@ async def get_company_org_id(company_name: str) -> OrgInfo:
         # Much more reliable than slug guessing for companies with unusual slugs.
         kw_results = await _search_company_keyword(company_name, account_id)
         for kr in kw_results:
+            kr_website = kr.get("website", "")
+            # Domain cross-validation for keyword results too
+            if expected_domain and kr_website and not _domain_matches(kr_website, expected_domain):
+                logger.warning("unipile_kw_domain_mismatch",
+                               company=company_name, found=kr["name"],
+                               linkedin_website=kr_website, expected=expected_domain)
+                if not _domain_fallback:
+                    _domain_fallback = {
+                        "org_id": kr["org_id"], "name": kr["name"],
+                        "public_identifier": kr.get("public_identifier"),
+                        "website": kr_website, "error": None,
+                    }
+                continue  # try next keyword result
             logger.info("unipile_company_found_via_keyword_search",
                         company=company_name, found=kr["name"], org_id=kr["org_id"])
             return {
@@ -371,6 +430,14 @@ async def get_company_org_id(company_name: str) -> OrgInfo:
                 "public_identifier": kr.get("public_identifier"),
                 "error": None,
             }
+
+    # If all candidates failed domain validation but we have a name-matched fallback,
+    # return it as last resort (better than nothing — Fini's LLM validation will re-check)
+    if _domain_fallback:
+        logger.warning("unipile_using_domain_fallback",
+                       company=company_name, fallback=_domain_fallback.get("name"),
+                       website=_domain_fallback.get("website"), expected=expected_domain)
+        return {**result, **_domain_fallback}
 
     result["error"] = f"Could not find LinkedIn org ID for: {company_name}"
     return result
