@@ -225,7 +225,7 @@ _last_pause_event: dict[str, dict] = {}  # cache last role/contact pause event f
 # Instead of triggering a chain per POST, we buffer everything and
 # flush once n8n goes quiet for 60 seconds.
 
-_N8N_BUFFER_TIMEOUT = 60  # seconds of silence before flush
+_N8N_BUFFER_TIMEOUT = 180  # 3 minutes of silence before flush
 
 _n8n_buffer_companies: set[str] = set()     # companies seen in current buffer window
 _n8n_buffer_contact_count: int = 0          # total contacts written in current buffer
