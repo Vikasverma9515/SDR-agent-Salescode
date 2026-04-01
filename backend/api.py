@@ -264,11 +264,14 @@ _n8n_buffer_companies: set[str] = set()     # companies seen in current buffer w
 _n8n_buffer_contact_count: int = 0          # total contacts written in current buffer
 _n8n_buffer_timer: asyncio.Task | None = None  # the countdown timer task
 _n8n_buffer_lock = None                     # initialized in create_app (needs event loop)
+_n8n_chain_lock = None                      # prevents concurrent chains
+_n8n_chain_running: bool = False            # flag for status endpoint
 
 
 async def _n8n_buffer_flush():
-    """Called after 60s of silence — triggers ONE sequential chain for all buffered companies."""
-    global _n8n_buffer_companies, _n8n_buffer_contact_count, _n8n_buffer_timer
+    """Called after 5min of silence — triggers ONE sequential chain for all buffered companies.
+    If a chain is already running, waits for it to finish first."""
+    global _n8n_buffer_companies, _n8n_buffer_contact_count, _n8n_buffer_timer, _n8n_chain_running
 
     companies = set(_n8n_buffer_companies)  # snapshot
     contact_count = _n8n_buffer_contact_count
@@ -282,34 +285,35 @@ async def _n8n_buffer_flush():
         logger.info("n8n_buffer_flush_empty", msg="No companies to process")
         return
 
-    logger.info("n8n_buffer_flush",
-                companies=sorted(companies), contacts=contact_count,
-                msg=f"Flushing {len(companies)} companies after {_N8N_BUFFER_TIMEOUT}s silence")
+    # Wait for any running chain to finish — prevents concurrent chains
+    async with _n8n_chain_lock:
+        logger.info("n8n_buffer_flush",
+                    companies=sorted(companies), contacts=contact_count,
+                    msg=f"Flushing {len(companies)} companies after {_N8N_BUFFER_TIMEOUT}s silence")
 
-    # Trigger ONE Veri → Searcher → Veri chain for all buffered companies
-    thread_id = str(uuid.uuid4())
-    _log_queues[thread_id] = _PipelineQueue(thread_id)
-    _active_runs[thread_id] = {
-        "agent": "veri",
-        "status": "running",
-        "thread_id": thread_id,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "auto_triggered_by": "n8n_buffer",
-        "buffered_companies": sorted(companies),
-        "buffered_contacts": contact_count,
-    }
+        _n8n_chain_running = True
+        thread_id = str(uuid.uuid4())
+        _log_queues[thread_id] = _PipelineQueue(thread_id)
+        _active_runs[thread_id] = {
+            "agent": "veri",
+            "status": "running",
+            "thread_id": thread_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "auto_triggered_by": "n8n_buffer",
+            "buffered_companies": sorted(companies),
+            "buffered_contacts": contact_count,
+        }
 
-    company_filter = ",".join(sorted(companies))
+        company_filter = ",".join(sorted(companies))
 
-    async def _run_chain():
         try:
             await _veri_task(thread_id, company_filter=company_filter)
         except Exception as e:
             logger.error("n8n_buffer_chain_error", error=str(e))
-
-    _active_tasks[thread_id] = asyncio.create_task(_run_chain())
-    logger.info("n8n_buffer_chain_started",
-                thread_id=thread_id, companies=sorted(companies))
+        finally:
+            _n8n_chain_running = False
+            logger.info("n8n_buffer_chain_done",
+                        thread_id=thread_id, companies=sorted(companies))
 
 
 async def _n8n_buffer_reset_timer():
@@ -374,12 +378,13 @@ async def _emit_event(thread_id: str, event_type: str, data: dict):
 # ---------------------------------------------------------------------------
 
 def create_app() -> FastAPI:
-    global _n8n_buffer_lock
+    global _n8n_buffer_lock, _n8n_chain_lock
     settings = get_settings()
     configure_logging(settings.log_dir_abs)
 
-    # Initialize buffer lock (needs event loop context)
+    # Initialize locks (needs event loop context)
     _n8n_buffer_lock = asyncio.Lock()
+    _n8n_chain_lock = asyncio.Lock()  # prevents concurrent chains
 
     app = FastAPI(
         title="SalesCode Mapping Pipeline",
@@ -814,6 +819,7 @@ def create_app() -> FastAPI:
             "total_contacts": _n8n_buffer_contact_count,
             "timeout_secs": _N8N_BUFFER_TIMEOUT,
             "timer_active": _n8n_buffer_timer is not None and not _n8n_buffer_timer.done(),
+            "chain_running": _n8n_chain_running,
         }
 
     @app.get("/api/n8n/debug")
