@@ -28,6 +28,7 @@ TARGET_ACCOUNTS = "Target Accounts"
 FIRST_CLEAN_LIST = "First Clean List"       # Main working sheet: n8n writes A-N, Veri writes Q-W, Searcher appends rows
 SEARCHER_OUTPUT = "Searcher Output"         # Searcher's log tab
 REJECTED_PROFILES = "Reject profiles"       # Veri moves rejected contacts here
+N8N_WEBHOOK_LOG = "N8N Webhook Log"         # Every n8n webhook hit — full visibility for monitoring
 
 _SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -302,6 +303,20 @@ REJECTED_PROFILES_HEADERS = [
     "Reject Reason",                              # U
     "Verification Notes",                         # V
     "Verified On",                                # W
+]
+
+# Columns A-J — every n8n webhook hit logged here for Gopal's visibility
+N8N_WEBHOOK_LOG_HEADERS = [
+    "Timestamp",            # A — when the webhook hit our endpoint
+    "Status",               # B — success / partial / error / empty
+    "Contacts Received",    # C — total contacts in the payload
+    "Written to Sheet",     # D — how many actually written to First Clean List
+    "Skipped",              # E — how many dropped (no name, bad data, etc.)
+    "Companies",            # F — comma-separated company names found
+    "Skip Reasons",         # G — why contacts were skipped
+    "Chain Triggered",      # H — which agent chain was started (Veri→Searcher→Veri)
+    "Thread ID",            # I — thread_id for tracking in the UI
+    "Raw Payload (sample)", # J — first contact's raw JSON for debugging
 ]
 
 async def delete_rows_batch(tab_name: str, row_nums: list[int]) -> None:
