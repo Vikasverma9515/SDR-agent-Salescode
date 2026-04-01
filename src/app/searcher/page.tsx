@@ -1459,7 +1459,7 @@ export default function SearcherPage() {
                               <div className="text-[9px] text-white/35 truncate uppercase tracking-wide">{c.role_title}</div>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
-                              <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tight ${c.role_bucket === 'DM' ? 'bg-teal-400/15 text-teal-400' : 'bg-white/[0.06] text-white/35'
+                              <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tight ${['FDM', 'KDM', 'DM'].includes(c.role_bucket || '') ? 'bg-teal-400/15 text-teal-400' : 'bg-white/[0.06] text-white/35'
                                 }`}>{c.role_bucket}</span>
                               <span className="text-[8px] font-bold text-teal-400/50 uppercase tracking-widest">→ sheet</span>
                             </div>
@@ -1487,7 +1487,7 @@ export default function SearcherPage() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2 flex-shrink-0">
-                        <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tight ${c.role_bucket === 'DM' ? 'bg-teal-400/15 text-teal-400' : 'bg-white/[0.06] text-white/35'
+                        <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded uppercase tracking-tight ${['FDM', 'KDM', 'DM'].includes(c.role_bucket || '') ? 'bg-teal-400/15 text-teal-400' : 'bg-white/[0.06] text-white/35'
                           }`}>{c.role_bucket}</span>
                         {c.linkedin_verified && <span className="text-teal-400/60 text-[10px]">✓</span>}
                         {c.email && <span className="text-[9px] font-mono text-white/30 truncate max-w-[120px]">{c.email}</span>}

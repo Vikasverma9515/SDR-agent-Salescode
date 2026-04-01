@@ -121,12 +121,15 @@ async def read_contacts(state: VeriState) -> VeriState:
 
             buying_role = str(row.get("Buying Role", "") or "").strip() or "Unknown"
             role_bucket_map = {
-                # New 5-tier system
+                # LLM buying-role tags (from Searcher GPT-4.1 classifier)
+                "FDM": "DM", "KDM": "DM",
+                "P1 Influencer": "Influencer", "Influencer": "Influencer",
+                "Irrelevant": "GateKeeper",
+                # Legacy 5-tier system
                 "CEO/MD": "DM", "CTO/CIO": "DM", "CSO/Head of Sales": "DM",
-                "P1 Influencer": "Influencer", "Gatekeeper": "GateKeeper",
+                "Gatekeeper": "GateKeeper",
                 # Legacy labels
                 "Decision Maker": "DM", "DM": "DM", "Champion": "DM",
-                "Influencer": "Influencer",
                 "GateKeeper": "GateKeeper", "Gate Keeper": "GateKeeper", "End User": "GateKeeper",
             }
             role_bucket = role_bucket_map.get(buying_role, "Unknown")
@@ -558,6 +561,32 @@ async def _verify_one(
         identity, employment, role_match, contact, audit, evidence
     )
 
+    # ── Buying-role relevance check ──
+    # If this contact would be VERIFIED or REVIEW, check if the role is actually
+    # relevant for our B2B sales targeting. Use GPT-4.1 to reason about whether
+    # the actual title (from LinkedIn or sheet) is FDM/KDM/P1/Influencer or Irrelevant.
+    # This prevents n8n-sourced contacts with irrelevant roles from passing verification.
+    if status in ("VERIFIED", "REVIEW"):
+        actual_title = audit.get("current_role") or contact.role_title or ""
+        if actual_title:
+            role_relevance = await _check_role_relevance(actual_title, contact.company)
+            if role_relevance.get("tag") == "Irrelevant":
+                reason = role_relevance.get("reason", "Role not relevant for B2B sales targeting")
+                status = "REJECT"
+                reject_reason = f"Role irrelevant: {actual_title} — {reason}"
+                notes = f"REJECT: {reject_reason}. {notes}"
+                review_flags = []
+                logger.info("veri_role_irrelevant_reject",
+                            contact=contact.full_name, role=actual_title,
+                            reason=reason)
+                await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+                    "scoring", "role_check",
+                    f"REJECT — role '{actual_title}' is Irrelevant: {reason}", "error")
+            else:
+                await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+                    "scoring", "role_check",
+                    f"role '{actual_title}' → {role_relevance.get('tag', '?')} ✓", "success")
+
     # Emit verdict
     verdict_level = "success" if status == "VERIFIED" else ("warning" if status == "REVIEW" else "error")
     verdict_detail = reject_reason if reject_reason else f"identity={identity} · employment={employment}"
@@ -772,7 +801,8 @@ async def _verify_one(
 
 async def _llm_compare_titles(sheet_title: str, found_title: str, company: str) -> str:
     """
-    Use GPT-4.1-mini to semantically compare two job titles.
+    Use GPT-4.1 to semantically compare two job titles with reasoning.
+    Handles role equivalences across languages and naming conventions.
     Returns: MATCH | MISMATCH | UNKNOWN
     """
     # Fast path: identical or near-identical titles
@@ -787,15 +817,20 @@ async def _llm_compare_titles(sheet_title: str, found_title: str, company: str) 
         f"Sheet title:    \"{sheet_title}\"\n"
         f"Actual title:   \"{found_title}\"\n\n"
         f"Rules:\n"
-        f"- MATCH if they are the same function/seniority (e.g. VP Marketing ≈ VP of Marketing, "
-        f"Head of Digital ≈ Chief Digital Officer)\n"
-        f"- MISMATCH if they are clearly different departments/functions "
-        f"(e.g. Marketing vs Finance, CEO vs IT Manager)\n"
-        f"- UNKNOWN if you cannot determine clearly\n\n"
+        f"- MATCH if they cover the same FUNCTION and similar SENIORITY, even if wording differs.\n"
+        f"  Examples: 'VP Marketing' ≈ 'VP of Marketing', 'Head of Digital' ≈ 'Chief Digital Officer',\n"
+        f"  'Director Comercial' ≈ 'Sales Director', 'Gerente General' ≈ 'General Manager',\n"
+        f"  'Director de Ventas' ≈ 'Head of Sales', 'Leiter Vertrieb' ≈ 'Sales Director'.\n"
+        f"  Companies use different titles for the SAME responsibility — focus on what they DO.\n"
+        f"- MISMATCH only if they are CLEARLY different departments/functions\n"
+        f"  (e.g. Marketing vs Finance, CEO vs IT Support, HR Director vs Sales Director)\n"
+        f"- UNKNOWN if you cannot determine clearly\n"
+        f"- When in doubt, prefer MATCH over MISMATCH — do NOT reject someone just because\n"
+        f"  the company uses a non-standard title for the role.\n\n"
         f"Reply with exactly one of: MATCH, MISMATCH, UNKNOWN — then a pipe | then one short sentence reason."
     )
     try:
-        raw = await llm_complete(prompt, max_tokens=60, temperature=0)
+        raw = await llm_complete(prompt, model="gpt-4.1", max_tokens=80, temperature=0)
         raw = raw.strip().upper()
         if raw.startswith("MATCH"):
             return "MATCH"
@@ -813,9 +848,14 @@ async def _llm_cross_reason(
     evidence: dict,
 ) -> dict:
     """
-    Ask GPT-4.1-mini to synthesise all collected evidence and return
-    structured identity/employment/role_match verdicts + a brief explanation.
-    Only called for uncertain cases to save API budget.
+    Use GPT-4.1 to reason about all collected evidence and return
+    structured identity/employment/role_match verdicts + explanation.
+
+    Smart handling of:
+    - Company name variants (FamPay vs Fam, brand names vs legal names)
+    - Company name changes (Quintiles → IQVIA, person hasn't updated LinkedIn)
+    - Multiple concurrent positions (employee + freelancer/consultant)
+    - Role equivalences (different title, same responsibility)
     """
     web_summary = []
     if evidence.get("ddg_positive"):
@@ -840,24 +880,39 @@ async def _llm_cross_reason(
     )
 
     prompt = (
-        f"You are a sales intelligence analyst verifying a contact.\n"
-        f"Contact: {contact.full_name} | Target company: {contact.company} | "
-        f"Sheet role: {contact.role_title or 'unknown'}\n\n"
+        f"You are a sales intelligence analyst verifying a B2B contact. REASON carefully.\n\n"
+        f"Contact: {contact.full_name}\n"
+        f"Target company: {contact.company}\n"
+        f"Sheet role: {contact.role_title or 'unknown'}\n"
+        f"Domain: {contact.domain or 'unknown'}\n\n"
         f"LinkedIn audit: {li_summary}\n"
         f"Web signals: {'; '.join(web_summary) or 'none'}\n"
-        f"Perplexity snippet: {evidence.get('perplexity','')[:300]}\n"
-        f"Email: {contact.email or 'none'}\n\n"
+        f"Perplexity snippet: {evidence.get('perplexity','')[:300]}\n\n"
+        f"IMPORTANT REASONING RULES:\n"
+        f"1. COMPANY NAME MATCHING: Companies often have different names on LinkedIn vs their\n"
+        f"   official name. Examples: 'FamPay' may appear as 'Fam' on LinkedIn; 'Red Bull España'\n"
+        f"   may appear as 'Red Bull'. If the LinkedIn company is a shortened/parent/brand variant\n"
+        f"   of the target company, treat it as the SAME company → CONFIRMED.\n"
+        f"2. COMPANY NAME CHANGES: Companies rebrand (Quintiles→IQVIA, Facebook→Meta,\n"
+        f"   Andersen Consulting→Accenture). If the LinkedIn company is a former/current name of\n"
+        f"   the target, the person may simply not have updated their profile → CONFIRMED.\n"
+        f"3. MULTIPLE POSITIONS: People often hold multiple concurrent roles (employee + advisor,\n"
+        f"   freelancer + full-time). If ANY of their current positions is at the target company,\n"
+        f"   employment = CONFIRMED. The target company may not be listed first.\n"
+        f"4. ROLE EQUIVALENCE: Different companies use different titles for the same responsibility.\n"
+        f"   'Head of Digital' ≈ 'Chief Digital Officer' ≈ 'VP Digital'. 'Director Comercial' ≈\n"
+        f"   'Sales Director'. Focus on FUNCTION and SENIORITY, not exact wording.\n\n"
         f"Based on ALL evidence, answer:\n"
         f"1. IDENTITY: CONFIRMED or UNCONFIRMED (is this person real and findable?)\n"
         f"2. EMPLOYMENT: CONFIRMED, UNCERTAIN, or REJECTED (are they currently at {contact.company}?)\n"
         f"3. ROLE_MATCH: MATCH, MISMATCH, or UNKNOWN (does the sheet role match what's found?)\n"
-        f"4. EXPLANATION: one sentence\n\n"
+        f"4. EXPLANATION: one sentence explaining your reasoning\n\n"
         f"Format exactly:\nIDENTITY: X\nEMPLOYMENT: Y\nROLE_MATCH: Z\nEXPLANATION: ..."
     )
 
     out: dict = {}
     try:
-        raw = await llm_complete(prompt, max_tokens=120, temperature=0)
+        raw = await llm_complete(prompt, model="gpt-4.1", max_tokens=200, temperature=0)
         for line in raw.strip().splitlines():
             if line.startswith("IDENTITY:"):
                 val = line.split(":", 1)[1].strip().upper()
@@ -877,6 +932,66 @@ async def _llm_cross_reason(
         logger.warning("veri_llm_cross_reason_error", error=str(e))
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Buying-role relevance check (LLM-based)
+# ---------------------------------------------------------------------------
+
+async def _check_role_relevance(role_title: str, company: str) -> dict:
+    """
+    Use GPT-4.1 to check if a role is relevant for B2B FMCG/CPG sales targeting.
+    Returns {"tag": "FDM|KDM|P1 Influencer|Influencer|Irrelevant", "reason": "..."}.
+
+    Uses reasoning — NOT keyword matching. Handles equivalent roles across companies
+    (different title, same responsibility) and multilingual titles.
+    """
+    prompt = (
+        f"You are a buying-role classifier for B2B FMCG/CPG sales systems.\n"
+        f"Company: {company}\n"
+        f"Role: \"{role_title}\"\n\n"
+        f"Classify this role into ONE of: FDM, KDM, P1 Influencer, Influencer, Irrelevant.\n\n"
+        f"RELEVANT roles (FDM/KDM/P1/Influencer):\n"
+        f"- FDM: CEO, MD, President, COO, CFO, CTO, CIO, Country Manager, VP (enterprise), Director General\n"
+        f"- KDM: Sales Director, VP Sales, Head of Sales, CRO, IT Director, General Manager, Director (generic)\n"
+        f"- P1: Commercial/Sales Excellence Director, CDO, RTM/GTM Director, Strategy Director, BI/Analytics Director\n"
+        f"- Influencer: Trade Marketing Manager, Sales Automation Lead, RTM/GTM Manager, Analytics Manager\n\n"
+        f"IRRELEVANT roles (always exclude):\n"
+        f"- Marketing-only (Brand, CMO, Performance Marketing), Commercial Director\n"
+        f"- HR, Legal, Procurement, Finance (except CFO), Operations, SCM, Logistics, Manufacturing\n"
+        f"- Territory/Area Sales Managers without national/multi-country scope\n"
+        f"- IT Support, Engineer, Admin, Coordinator, Intern\n\n"
+        f"IMPORTANT: Companies use different titles for the same job. Focus on the ACTUAL\n"
+        f"responsibility, not the exact title. 'Director Comercial' in some companies = Sales Director\n"
+        f"(KDM), but the generic 'Commercial Director' without context = Irrelevant per policy.\n\n"
+        f"Reply with exactly: TAG | reason (one sentence)\n"
+        f"Example: FDM | Country Manager has national P&L authority"
+    )
+    try:
+        raw = await llm_complete(prompt, model="gpt-4.1", max_tokens=80, temperature=0)
+        raw = raw.strip()
+        if "|" in raw:
+            tag_part, reason = raw.split("|", 1)
+            tag = tag_part.strip().upper()
+            # Normalize tag
+            tag_map = {
+                "FDM": "FDM", "KDM": "KDM",
+                "P1 INFLUENCER": "P1 Influencer", "P1": "P1 Influencer",
+                "INFLUENCER": "Influencer",
+                "IRRELEVANT": "Irrelevant",
+            }
+            return {"tag": tag_map.get(tag, "Irrelevant"), "reason": reason.strip()}
+        # Fallback: just check first word
+        first_word = raw.split()[0].upper() if raw else ""
+        if first_word in ("FDM", "KDM"):
+            return {"tag": first_word, "reason": raw}
+        if "IRRELEVANT" in raw.upper():
+            return {"tag": "Irrelevant", "reason": raw}
+    except Exception as e:
+        logger.warning("veri_role_relevance_error", role=role_title, error=str(e))
+
+    # On error, don't reject — let the contact through
+    return {"tag": "Unknown", "reason": "role relevance check failed"}
 
 
 # ---------------------------------------------------------------------------
@@ -908,13 +1023,35 @@ def _check_all_fast(contact: Contact, audit: dict, evidence: dict) -> tuple[str,
         identity = "CONFIRMED" if positive_count >= 2 else "UNCONFIRMED"
 
     # ── Employment ──
+    # Smart company matching: if Unipile's strict matcher said at_target=False,
+    # do a soft check — the LinkedIn company might be a shortened name (Fam vs FamPay),
+    # parent brand (Red Bull vs Red Bull España), or a rebranded name (Quintiles vs IQVIA).
+    # If the soft check suggests a possible match, defer to LLM instead of hard-rejecting.
+    _soft_company_match = False
+    if li_valid and li_current_company and not li_at_company:
+        _li_co = li_current_company.lower().strip()
+        _target_co = contact.company.lower().strip()
+        # Check if one name is a prefix/substring of the other (Fam ⊂ FamPay, Red Bull ⊂ Red Bull España)
+        if _li_co in _target_co or _target_co in _li_co:
+            _soft_company_match = True
+        # Check if they share a significant word (Red Bull ∩ Red Bull España)
+        _li_words = set(re.sub(r'[^a-z0-9]', ' ', _li_co).split())
+        _target_words = set(re.sub(r'[^a-z0-9]', ' ', _target_co).split())
+        _common = _li_words & _target_words - {"the", "de", "del", "la", "el", "and", "of", "sa", "sl", "ltd", "inc"}
+        if _common and len(_common) >= 1:
+            _soft_company_match = True
+
     if li_valid:
         if li_at_company and li_still_employed:
             employment = "CONFIRMED"
         elif li_at_company and not li_still_employed:
             employment = "UNCERTAIN"
         elif li_current_company and not li_at_company:
-            employment = "REJECTED"
+            # If soft match detected, don't hard-reject — let LLM decide
+            if _soft_company_match:
+                employment = "UNCERTAIN"  # will trigger LLM cross-reasoning
+            else:
+                employment = "REJECTED"
         else:
             stale_count = sum([
                 bool(evidence.get("ddg_stale")),

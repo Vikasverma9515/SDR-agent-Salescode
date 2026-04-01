@@ -137,8 +137,11 @@ MUST_HAVE_TIERS = [
     {"tier": "CTO/CIO", "keywords": _CTO_CIO_KEYWORDS, "search_queries": [
         "CTO", "CIO", "Head of Technology", "VP Engineering",
     ]},
+    # NOTE: CMO, Head of Marketing, Commercial Director are EXCLUDED from search —
+    # they are classified as "Irrelevant" per the buying-role prompt.
+    # Only Sales leadership roles are searched here.
     {"tier": "CSO/Head of Sales", "keywords": _CSO_SALES_KEYWORDS, "search_queries": [
-        "Head of Sales", "Sales Director", "CMO", "Head of Marketing", "Commercial Director",
+        "Head of Sales", "Sales Director", "CRO", "VP Sales",
     ]},
 ]
 
@@ -522,45 +525,47 @@ async def expand_search_terms(state: SearcherState) -> SearcherState:
 # Each bucket: (bucket_name, list_of_keywords_to_detect_in_role)
 # We pick ONE representative query per bucket from expanded_dm_roles.
 # Each bucket targets a DIFFERENT business function → searches return different people.
+#
+# ALIGNED WITH BUYING-ROLE PROMPT: Only search for roles that can be FDM/KDM/P1/Influencer.
+# REMOVED: marketing (CMO/marketing-only → Irrelevant), operations (→ Irrelevant),
+#          finance (except CFO which is in c_suite).
 _FUNCTION_BUCKETS: list[tuple[str, list[str]]] = [
-    ("c_suite",    ["ceo", "director general", "gerente general", "managing director",
-                    "managing director", "consejero delegado", "président", "président directeur",
+    ("c_suite",    ["ceo", "cfo", "coo", "director general", "gerente general", "managing director",
+                    "consejero delegado", "président", "président directeur",
                     "geschäftsführer", "direttore generale", "directeur général", "president"]),
-    ("marketing",  ["cmo", "chief marketing", "marketing director", "director marketing",
-                    "director de marketing", "gerente marketing", "directeur marketing",
-                    "leiter marketing", "direttore marketing"]),
     ("digital",    ["cdo", "chief digital", "digital director", "director digital",
                     "head of digital", "vp digital", "directeur digital",
-                    "responsable digital", "jefe digital"]),
+                    "responsable digital", "jefe digital",
+                    "digital transformation", "chief data"]),
     ("ecommerce",  ["ecommerce", "e-commerce", "commerce director", "head of ecommerce",
                     "director ecommerce", "jefe ecommerce", "responsable ecommerce"]),
     ("sales",      ["chief revenue", "cro", "sales director", "director ventas",
-                    "director comercial", "vp sales", "head of sales", "commercial director",
-                    "directeur commercial", "directeur des ventes", "direttore commerciale",
-                    "leiter vertrieb"]),
-    ("operations", ["coo", "chief operating", "operations director", "director operaciones",
-                    "supply chain director", "head of operations", "directeur des opérations"]),
+                    "vp sales", "head of sales", "national sales manager",
+                    "directeur des ventes", "direttore commerciale",
+                    "leiter vertrieb", "sales excellence", "commercial excellence"]),
     ("technology", ["cto", "cio", "chief technology", "chief information",
                     "technology director", "director tecnologia", "director de sistemas",
-                    "leiter", "directeur technique"]),
-    ("finance",    ["cfo", "chief financial", "finance director", "director finance",
-                    "director financiero", "directeur financier"]),
+                    "it director", "head of it", "directeur technique"]),
+    ("strategy",   ["chief strategy", "vp strategy", "strategy director",
+                    "head of strategy", "director de estrategia"]),
     ("general_mgmt", ["general manager", "country manager", "regional director",
                       "gerente general", "director regional", "country director",
-                      "area manager", "business director"]),
+                      "business director"]),
+    ("rtm_gtm",   ["route to market", "go to market", "rtm", "gtm",
+                    "channel development", "distribution director",
+                    "head of distribution", "head of retail"]),
 ]
 
 # Fallback English queries per bucket (used when no match found in expanded_roles)
 _BUCKET_FALLBACKS = {
-    "c_suite":     "CEO Managing Director",
-    "marketing":   "CMO Marketing Director",
-    "digital":     "CDO Digital Director",
-    "ecommerce":   "Ecommerce Director",
-    "sales":       "Sales Director",
-    "operations":  "COO Operations Director",
-    "technology":  "CTO Technology Director",
-    "finance":     "CFO Finance Director",
+    "c_suite":     "CEO Managing Director CFO COO",
+    "digital":     "CDO Digital Director Digital Transformation",
+    "ecommerce":   "Ecommerce Director Head of Ecommerce",
+    "sales":       "Sales Director VP Sales Head of Sales CRO",
+    "technology":  "CTO CIO Technology Director IT Director",
+    "strategy":    "VP Strategy Chief Strategy Officer",
     "general_mgmt": "General Manager Country Manager",
+    "rtm_gtm":    "Head of Distribution RTM GTM Director",
 }
 
 
@@ -667,43 +672,210 @@ async def _generate_importance_notes_batch(
 
 
 # ---------------------------------------------------------------------------
-# Relevance scoring helpers
+# LLM-based buying-role classifier (replaces fuzzy scoring)
 # ---------------------------------------------------------------------------
 
-def _score_relevance(role_title: str, target_roles: list[str], expanded_roles: list[str]) -> int:
-    """
-    Score 0-100 how well a role title matches the target DM roles.
+_BUYING_ROLE_PROMPT = """\
+You are a buying-role classifier for B2B FMCG/CPG sales systems. Be conservative and minimize false positives.
 
-    Uses rapidfuzz token_set_ratio against both original and multilingual expanded lists.
-    """
-    if not role_title:
-        return 0
+Your job: for each contact, return the correct tag using ONLY the defined allow-lists and hierarchy rules.
+If uncertain, always default to "Irrelevant".
 
-    try:
-        from rapidfuzz import fuzz
-        title_lower = role_title.lower()
-        all_targets = list(set(target_roles + expanded_roles))
-        best = 0
-        for target in all_targets:
-            score = max(
-                fuzz.token_set_ratio(title_lower, target.lower()),
-                fuzz.partial_ratio(title_lower, target.lower()),
-            )
-            if score > best:
-                best = score
-        return best
-    except ImportError:
-        # Fallback without rapidfuzz — substring matching
-        title_lower = role_title.lower()
-        for target in set(target_roles + expanded_roles):
-            t = target.lower()
-            if t in title_lower or title_lower in t:
-                return 80
-        return 0
+TAG ALLOW-LISTS
+──────────────
+• FDM: Founder, Co-Founder, CEO, CBO, Managing Director, Vice President,
+  President, COO, CFO, Executive Director (if Sales/IT/Digital/ComEx/RTM-GTM/Analytics or generic),
+  Country Manager/Head/Director, Regional Manager (national/multi-country),
+  VP/EVP/SVP (enterprise-wide), GM with explicit P&L/signatory, CIO, CTO.
+  Also: Director General — equivalent to MD/CEO when used as apex executive title.
+
+• KDM: VP/Head/Director of Sales; Sales Director (any qualifier); CIO; IT Director/Head with budget;
+  CRO; CCO; Senior Sales Manager; National Sales Manager; Sales Manager LATAM/EMEA/APAC;
+  Regional Sales Manager (multi-country); Customer Development Director (national);
+  Head of Sales; Head of Retail/Distribution/GTM (national/multi-country); Director (generic);
+  General Manager.
+
+• P1 Influencer: Commercial Excellence Director/Head; Sales Excellence Director/Head; Field Sales
+  Director; Chief Digital Officer; Digital Transformation Director/Head; RTM/GTM Director/Head;
+  Channel Development Director/Head; Sales Operations Director/Head (national);
+  IT Head/Director (non-CIO without explicit budget); BI/Analytics Director/Head;
+  Head of Retail/GTM/Distribution (sub-national); CSO; VP/EVP/SVP Strategy;
+  Strategy Director/Head (enterprise/national).
+
+• Influencer: Trade Marketing Manager/Lead; Sales Effectiveness/Capability Manager;
+  Sales Automation Lead; SFA Manager; RTM/GTM Manager; Customer Development Manager;
+  BI/Analytics Manager.
+
+• Irrelevant: Marketing-only (Brand/Performance/CMO), Commercial Director,
+  Directors of Marketing/Brand/Procurement/Finance/HR/Legal/Plant/Manufacturing/
+  Operations/SCM/Logistics, generic Owner/Founder/Partner (no enterprise mandate),
+  territory/area sales managers (ASM/RSM/ZSM/city/state/zone) without
+  national/multi-country scope, IT Support/Engineer/Admin.
+
+STRICTNESS & PRECEDENCE
+───────────────────────
+• Check thoroughly, think, then default to Irrelevant if not matching the allow-list.
+• Apply exclusions BEFORE promotions.
+• Country Managers are always FDM. CFO is FDM.
+• Strategy titles (VP Strategy, Strategy Director/Head) are P1 Influencer unless also owning Sales/IT/Digital.
+• Exclude Commercial Directors and Directors of Marketing/Brand/Procurement/Finance/HR/Legal/Plant/Ops/SCM/Logistics.
+• Precedence when multiple tags fire: FDM > KDM > P1 Influencer > Influencer.
+• Director General → FDM (apex executive in LATAM, Africa, Middle East, Europe).
+  Exception: scoped to sub-unit → KDM or lower.
+
+DECISION POLICY (STRICT ORDER)
+──────────────────────────────
+A) EXCLUDE first → Irrelevant if title contains:
+   marketing|brand|procurement|legal|hr|human resources|plant|manufacturing|
+   operations|scm|logistics|commercial director|finance
+   *Exception: CFO / Chief Financial Officer are NOT excluded.*
+
+B) DOWNSCOPE GUARD: If title contains manager|lead|supervisor|analyst|specialist|
+   engineer|coordinator and lacks any national/multi-country token →
+   Influencer if role touches sales/rtm/gtm/distribution/retail/commercial excellence/
+   digital/analytics/bi/sfa/crm/it/strategy; otherwise Irrelevant.
+
+C) POSITIVE MATCHES (only if not excluded/downsized):
+   FDM: c-suite/md/president/coo; CIO; Head of Technology; country (manager|head|director);
+        regional with multi-country; enterprise-wide vp/evp/svp; gm with p&l; CFO; director general.
+   KDM: sales director (any qualifier); vp sales; head of sales; director (generic);
+        cio; it director/head with budget; national/multi-country senior sales manager;
+        head of retail/distribution/gtm (national/multi-country).
+   P1:  commercial/sales excellence (director/head); digital/cdo; rtm/gtm/channel development;
+        sales ops (director/head); it head/director (non-CIO); bi/analytics (director/head);
+        head of retail/gtm/distribution (sub-national); CSO/VP Strategy.
+   Influencer: trade marketing manager, sales capability/effectiveness manager,
+        sfa/rtm/gtm manager, analytics manager.
+
+D) Precedence: FDM > KDM > P1 Influencer > Influencer.
+
+NORMALIZATION
+─────────────
+• Lowercase, trim, remove punctuation.
+• Expand: md→managing director; vp/evp/svp→vice president; gm→general manager;
+  cdo→chief digital officer; cio→chief information officer; cro→chief revenue officer;
+  cco→chief commercial officer; dg→director general.
+• Region tokens for multi-country/national scope: national, latam, emea, apac, mena, sea, gcc,
+  europe, americas, global, international, country, multi-country.
+
+CONFIDENCE GUIDANCE
+───────────────────
+≥0.80: Exact allow-list or clear senior role.
+0.65-0.79: Strong inference (Head of Retail/GTM with national scope, Senior Sales Manager).
+0.50-0.64: Ambiguous with evidence.
+<0.50: Ambiguous → Irrelevant.
+
+FEW-SHOT EXAMPLES
+─────────────────
+"Commercial Excellence Director" → P1 Influencer (0.85) — shapes sales process, not final budget.
+"Area Sales Manager – Delhi NCR" → Irrelevant (0.92) — territory-only, no national mandate.
+"Country Manager – Indonesia" → FDM (0.97) — national P&L/signatory authority.
+"Director" (generic) → KDM (0.90) — senior decision authority unless excluded scope evident.
+"Director of Procurement" → Irrelevant (0.96) — procurement directors excluded.
+"Head of Sales – APAC" → KDM (0.93) — multi-country sales head with budget authority.
+"CFO" → FDM (0.94) — C-suite with enterprise-wide financial authority.
+"VP Strategy" → P1 Influencer (0.82) — shapes direction but not direct sales/IT owner.
+"Commercial Director" → Irrelevant (0.95) — excluded by policy.
+"Director General" → FDM (0.90) — apex executive equivalent to MD/CEO.
+"Director General – Northern Region" → KDM (0.78) — scoped to sub-national region.
+"Regional HR Manager" → Irrelevant (0.95) — HR roles are excluded.
+"Brand Marketing Director" → Irrelevant (0.93) — marketing-only directors excluded.
+"Trade Marketing Manager" → Influencer (0.75) — manager-level in trade marketing.
+"IT Support Engineer" → Irrelevant (0.94) — IT Support/Engineer/Admin excluded.
+"""
+
+
+async def _classify_buying_roles_batch(
+    contacts: list,  # list[Contact]
+    company: str,
+    target_roles: list[str],
+) -> list:
+    """
+    Use GPT-4.1 to classify contacts into buying-role tags (FDM/KDM/P1/Influencer/Irrelevant).
+    Also generates importance notes and priority scores in the same call.
+
+    Returns contacts with updated role_bucket, importance_note, priority_score.
+    Falls back gracefully — returns contacts unchanged on any error.
+    """
+    if not contacts:
+        return contacts
+
+    from backend.tools.llm import llm_complete
+    import json as _json
+    import re as _re
+
+    BATCH_SIZE = 15
+    all_results = list(contacts)
+
+    roles_str = ", ".join(target_roles[:8]) if target_roles else "senior decision makers"
+
+    for batch_start in range(0, len(contacts), BATCH_SIZE):
+        batch = contacts[batch_start:batch_start + BATCH_SIZE]
+
+        lines = "\n".join(
+            f'{i}. designation="{c.role_title or "Unknown"}" | '
+            f'linkedin_verified={c.linkedin_verified} | '
+            f'company="{company}"'
+            for i, c in enumerate(batch)
+        )
+
+        prompt = (
+            f"{_BUYING_ROLE_PROMPT}\n"
+            f"COMPANY: {company}\n"
+            f"WE ARE LOOKING FOR: {roles_str}\n\n"
+            f"CONTACTS TO CLASSIFY:\n{lines}\n\n"
+            f"For EACH contact return a JSON object with:\n"
+            f'- "index": (integer, 0-based)\n'
+            f'- "tag": "FDM" | "KDM" | "P1 Influencer" | "Influencer" | "Irrelevant"\n'
+            f'- "confidence": 0.0 to 1.0\n'
+            f'- "reason": 1-2 sentences citing which rule applies\n'
+            f'- "importance_note": max 15 words on why this person matters for B2B sales (empty if Irrelevant)\n'
+            f'- "priority_score": 0-100 (FDM=85-100, KDM=70-89, P1=50-69, Influencer=30-49, Irrelevant=0)\n\n'
+            f"Return ONLY a JSON array. No markdown, no explanation."
+        )
+
+        try:
+            raw = await llm_complete(prompt, model="gpt-4.1", max_tokens=3000, temperature=0)
+            cleaned = _re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
+            match = _re.search(r'\[.*\]', cleaned, _re.DOTALL)
+            if not match:
+                logger.warning("classify_buying_roles_no_json", batch=batch_start,
+                               raw_snippet=raw[:200])
+                continue
+
+            results = _json.loads(match.group(0))
+            _VALID_TAGS = {"FDM", "KDM", "P1 Influencer", "Influencer", "Irrelevant"}
+
+            for item in results:
+                if not isinstance(item, dict) or "index" not in item:
+                    continue
+                idx = item["index"]
+                if not (0 <= idx < len(batch)):
+                    continue
+                global_idx = batch_start + idx
+                tag = item.get("tag", "Irrelevant")
+                if tag not in _VALID_TAGS:
+                    tag = "Irrelevant"
+
+                all_results[global_idx] = all_results[global_idx].model_copy(update={
+                    "role_bucket": tag,
+                    "importance_note": item.get("importance_note", item.get("reason", "")),
+                    "priority_score": item.get("priority_score", 0),
+                })
+
+            logger.info("classify_buying_roles_batch_done",
+                        batch_start=batch_start, batch_size=len(batch),
+                        tags=[all_results[batch_start + i].role_bucket for i in range(len(batch))])
+
+        except Exception as e:
+            logger.warning("classify_buying_roles_error", batch=batch_start, error=str(e))
+            # On error, contacts keep their existing role_bucket from keyword classifier
+
+    return all_results
 
 
 # ---------------------------------------------------------------------------
-# Valid role detection helper (for bonus candidates)
+# Valid role detection helper (for bucket grouping)
 # ---------------------------------------------------------------------------
 
 _ENTRY_LEVEL_PATTERNS = [
@@ -721,18 +893,21 @@ def _is_valid_candidate(role_title: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Node: score_and_rank  — split into matched + bonus, NO count cap
+# Node: score_and_rank  — LLM buying-role classification, no manual thresholds
 # ---------------------------------------------------------------------------
 
 async def score_and_rank(state: SearcherState) -> SearcherState:
     """
-    Score every discovered contact against target DM roles and split into two pools.
-    NO count limiting here — the SDR will choose the final set in await_full_selection.
+    Use GPT-4.1 to classify every discovered contact into buying-role tags.
+    The LLM reasons about each title using the B2B FMCG/CPG allow-lists — no
+    fuzzy matching or numeric thresholds.
 
-    discovered_contacts:   score >= 40 (match target roles)   → shown pre-checked to SDR
-    pending_dm_candidates: senior but score < 40 (bonus pool) → shown unchecked to SDR
-    Contacts that are neither relevant nor senior are dropped.
+    discovered_contacts:   FDM + KDM  → shown pre-checked to SDR
+    pending_dm_candidates: P1 Influencer + Influencer → shown unchecked
+    Irrelevant:            dropped with log
     """
+    from backend.utils.progress import emit_log as _score_log
+
     raw_contacts = state.discovered_contacts
     if not raw_contacts:
         return state
@@ -750,54 +925,48 @@ async def score_and_rank(state: SearcherState) -> SearcherState:
         return state.model_copy(update={"discovered_contacts": [], "pending_dm_candidates": []})
 
     target_roles = state.missing_dm_roles or state.dm_roles or []
-    expanded_roles = state.expanded_dm_roles or []
-    THRESHOLD = 40
 
-    accepted: list[tuple[int, Contact]] = []
+    await _score_log(state.thread_id,
+        f"[{state.target_company}] Classifying {len(contacts)} contacts with LLM buying-role analysis (GPT-4.1)…",
+        level="info")
+
+    # LLM classifies each contact: FDM / KDM / P1 Influencer / Influencer / Irrelevant
+    classified = await _classify_buying_roles_batch(contacts, state.target_company, target_roles)
+
+    # Split by classification — the LLM has already reasoned about each title
+    matched: list[Contact] = []
     bonus_candidates: list[Contact] = []
+    dropped = 0
 
-    for contact in contacts:
-        score = _score_relevance(contact.role_title or "", target_roles, expanded_roles)
-        logger.info("searcher_relevance_score",
-                    name=contact.full_name, role=contact.role_title or "(none)", score=score)
-
-        if score >= THRESHOLD:
-            accepted.append((score, contact))
-        elif _is_valid_candidate(contact.role_title or ""):
-            bonus_candidates.append(contact)
-            logger.info("searcher_bonus_candidate",
-                        name=contact.full_name, role=contact.role_title, score=score)
+    for c in classified:
+        tag = c.role_bucket
+        if tag in ("FDM", "KDM"):
+            matched.append(c)
+            logger.info("searcher_llm_match", name=c.full_name, role=c.role_title,
+                        tag=tag, score=c.priority_score, note=c.importance_note)
+        elif tag in ("P1 Influencer", "Influencer"):
+            bonus_candidates.append(c)
+            logger.info("searcher_llm_bonus", name=c.full_name, role=c.role_title,
+                        tag=tag, score=c.priority_score)
         else:
-            logger.info("searcher_relevance_drop",
-                        name=contact.full_name, role=contact.role_title or "(none)", score=score)
+            dropped += 1
+            logger.info("searcher_llm_drop", name=c.full_name, role=c.role_title,
+                        tag=tag, reason=c.importance_note or "LLM classified as Irrelevant")
 
-    # Sort matched by score descending (best matches first)
-    accepted.sort(key=lambda x: x[0], reverse=True)
-    matched = [c for _, c in accepted]
+    # Sort by priority score (LLM-assigned)
+    matched.sort(key=lambda x: x.priority_score or 0, reverse=True)
+    bonus_candidates.sort(key=lambda x: x.priority_score or 0, reverse=True)
 
     logger.info("searcher_score_rank_done",
                 company=state.target_company,
                 total_input=len(contacts),
                 matched=len(matched),
-                bonus=len(bonus_candidates))
-
-    # Generate importance notes for all candidates (matched + bonus) in one batch LLM call
-    all_for_notes = matched + bonus_candidates
-    if all_for_notes:
-        try:
-            dm_roles = state.missing_dm_roles or state.dm_roles or []
-            all_with_notes = await _generate_importance_notes_batch(
-                all_for_notes, state.target_company, dm_roles
-            )
-            n_matched = len(matched)
-            matched = all_with_notes[:n_matched]
-            bonus_candidates = all_with_notes[n_matched:]
-            
-            # Sort by priority score descending
-            matched.sort(key=lambda x: getattr(x, "priority_score", 0) or 0, reverse=True)
-            bonus_candidates.sort(key=lambda x: getattr(x, "priority_score", 0) or 0, reverse=True)
-        except Exception as e:
-            logger.warning("searcher_importance_notes_failed", error=str(e))
+                bonus=len(bonus_candidates),
+                dropped=dropped)
+    await _score_log(state.thread_id,
+        f"[{state.target_company}] LLM classification: {len(matched)} decision-makers (FDM/KDM), "
+        f"{len(bonus_candidates)} influencers, {dropped} irrelevant dropped",
+        level="success" if matched else "info")
 
     return state.model_copy(update={
         "discovered_contacts": matched,
@@ -1006,15 +1175,24 @@ async def _find_more_agents(
                 seen_new.add(key)
                 new_contacts.append(c)
 
-    # Generate importance notes for the new batch
+    # Classify new contacts with LLM buying-role classifier + importance notes
     if new_contacts:
         try:
             dm_roles = state.missing_dm_roles or state.dm_roles or []
-            new_contacts = await _generate_importance_notes_batch(
+            new_contacts = await _classify_buying_roles_batch(
                 new_contacts, company_name, dm_roles
             )
+            # Filter out Irrelevant contacts from Find More results
+            new_contacts = [c for c in new_contacts if c.role_bucket != "Irrelevant"]
         except Exception:
-            pass
+            # Fallback to simpler importance notes if classifier fails
+            try:
+                dm_roles = state.missing_dm_roles or state.dm_roles or []
+                new_contacts = await _generate_importance_notes_batch(
+                    new_contacts, company_name, dm_roles
+                )
+            except Exception:
+                pass
 
     logger.info("find_more_agents_total", company=company_name, new=len(new_contacts), prompt=prompt)
     return new_contacts
@@ -1315,20 +1493,16 @@ async def unipile_search(state: SearcherState) -> SearcherState:
         ]
 
     # Broad seniority-level queries catch people whose titles don't match any
-    # function bucket keyword — e.g. "Director of Shopper Marketing", "VP Pricing".
-    # Empty string = no title filter → LinkedIn returns top 25 most visible people.
+    # function bucket keyword — e.g. "VP Pricing", "Chief Growth Officer".
+    # REMOVED empty string "" — it returned everyone (HR, Admin, etc.) causing noise.
+    # These queries are targeted at seniority levels that map to FDM/KDM/P1 roles.
     _BROAD_SENIORITY_QUERIES = [
-        "",              # no filter — most connected/prominent at the company
-        "Director",
         "Vice President",
-        "Head of",
         "Chief",
         "Managing Director",
-        "General Manager",
         "Country Manager",
         "Gerente",       # Spanish/Portuguese
         "Directeur",     # French
-        "Diretor",       # Portuguese
         "Geschäftsführer",  # German
     ]
     # Merge: function queries first (they're more targeted), then broad seniority
@@ -2141,67 +2315,58 @@ async def perplexity_executive_search(state: SearcherState) -> SearcherState:
 
 # Ordered list: (bucket_id, display_label, keyword_substrings_to_match_in_title)
 # First matching bucket wins — order matters (C-suite before general management).
+# ALIGNED WITH BUYING-ROLE PROMPT: Only buckets that can produce FDM/KDM/P1/Influencer.
+# REMOVED: marketing_brand, operations, finance, hr_people, product_category
+# (all map to "Irrelevant" per buying-role classification rules).
 _ROLE_BUCKETS_DEF: list[tuple[str, str, list[str]]] = [
     ("c_suite", "C-Suite & Executive", [
-        "ceo", " coo", " cfo", " cmo", " cdo", " cto", " cio", " cro", " cco",
-        "chief executive", "chief operating", "chief financial", "chief marketing",
+        "ceo", " coo", " cfo", " cdo", " cto", " cio", " cro",
+        "chief executive", "chief operating", "chief financial",
         "chief digital", "chief technology", "chief information", "chief revenue",
-        "chief commercial", "consejero delegado", "directeur général",
+        "consejero delegado", "directeur général",
         "geschäftsführer", "direttore generale", "director general",
         "président directeur", "vice chairman", "chairman",
     ]),
     ("digital_ecommerce", "Digital & Ecommerce", [
         "digital", "ecommerce", "e-commerce", "omnichannel", "marketplace",
         "direct to consumer", " d2c", "commercio digitale", "commerce digitale",
-        "comercio electronico", "online retail",
-    ]),
-    ("marketing_brand", "Marketing & Brand", [
-        "marketing", "brand", "communications", "public relations", " pr ",
-        "advertising", "branding", "content strategy", "comunicacion", "marcom",
+        "comercio electronico", "online retail", "digital transformation",
     ]),
     ("sales_commercial", "Sales & Commercial", [
-        "sales", "commercial", "revenue", "business development", "key account",
+        "sales", "revenue", "business development", "key account",
         " trade ", "channel sales", "retail sales", "ventas", "vendas",
         "distribution", "national accounts", "account director",
+        "commercial excellence", "sales excellence", "sales operations",
+        "customer development",
     ]),
     ("technology_data", "Technology & Data", [
         "technology", " data ", "analytics", "information systems",
-        " it director", " it manager", "systems director", "software",
+        " it director", " it manager", "systems director",
         "engineering director", "digital transformation", "tech director",
-    ]),
-    ("operations", "Operations & Supply Chain", [
-        "operations", "supply chain", "logistics", "procurement",
-        "manufacturing", "production", "warehousing", "inventory",
-    ]),
-    ("finance", "Finance", [
-        "finance", "financial", "treasury", "accounting", "audit",
-        " controlling", "finanzas", "finanças",
+        "bi director", "business intelligence",
     ]),
     ("strategy_innovation", "Strategy & Innovation", [
         "strategy", "innovation", "transformation", "strategic planning",
         "growth director", "corporate development", "estrategia",
     ]),
-    ("hr_people", "HR & People", [
-        "human resources", "people director", "talent", "recruitment",
-        "hr director", "hr manager", "learning", "recursos humanos",
-    ]),
-    ("product_category", "Product & Category", [
-        "product director", "category", "portfolio director", "product vp",
-        "head of product", "brand manager", "product manager",
-    ]),
     ("general_management", "General Management", [
         "general manager", "country manager", "regional director",
-        "area manager", "country director", "managing director",
-        "president", "vice president", "regional manager",
+        "country director", "managing director",
+        "president", "vice president",
+    ]),
+    ("rtm_gtm", "RTM / GTM / Distribution", [
+        "route to market", "go to market", "rtm", "gtm",
+        "channel development", "field sales",
+        "head of distribution", "head of retail",
     ]),
     ("other_senior", "Other Senior", []),  # catch-all for senior people
 ]
 
-# Which bucket IDs are pre-selected by default (DM-relevant functions)
+# All remaining buckets are DM-relevant — pre-select all by default
 _DEFAULT_SELECTED_BUCKETS = {
-    "c_suite", "digital_ecommerce", "marketing_brand",
-    "sales_commercial", "general_management", "technology_data",
-    "strategy_innovation",
+    "c_suite", "digital_ecommerce", "sales_commercial",
+    "general_management", "technology_data", "strategy_innovation",
+    "rtm_gtm",
 }
 
 
@@ -2803,12 +2968,16 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
     fcl_end_box:   list[int | None] = [None]
 
     bucket_label_map = {
-        "CEO/MD": "CEO/MD", "CTO/CIO": "CTO/CIO",
-        "CSO/Head of Sales": "CSO/Head of Sales",
-        "P1 Influencer": "P1 Influencer", "Gatekeeper": "Gatekeeper",
-        # Legacy compat
-        "DM": "Decision Maker", "Champion": "Champion",
-        "Influencer": "P1 Influencer", "GateKeeper": "Gatekeeper", "Unknown": "",
+        # New LLM buying-role tags
+        "FDM": "FDM", "KDM": "KDM",
+        "P1 Influencer": "P1 Influencer", "Influencer": "Influencer",
+        "Irrelevant": "Irrelevant",
+        # Legacy keyword-classifier tags (backwards compat)
+        "CEO/MD": "FDM", "CTO/CIO": "FDM",
+        "CSO/Head of Sales": "KDM",
+        "Gatekeeper": "Irrelevant",
+        "DM": "FDM", "Champion": "KDM",
+        "GateKeeper": "Irrelevant", "Unknown": "",
     }
 
     enrich_sem = asyncio.Semaphore(8)
@@ -2816,13 +2985,18 @@ async def enrich_contacts(state: SearcherState) -> SearcherState:
     async def _enrich_and_write(contact: Contact) -> None:
         """Enrich one contact — construct email from known format, no ZeroBounce."""
         async with enrich_sem:
-            bucket = _classify_role(contact.role_title or "")
-            contact = contact.model_copy(update={"role_bucket": bucket})
+            # Preserve LLM buying-role classification if already set by score_and_rank.
+            # Only fall back to keyword classifier for contacts that bypassed LLM.
+            _LLM_TAGS = {"FDM", "KDM", "P1 Influencer", "Influencer", "Irrelevant"}
+            bucket = contact.role_bucket
+            if bucket not in _LLM_TAGS:
+                bucket = _classify_role(contact.role_title or "")
+                contact = contact.model_copy(update={"role_bucket": bucket})
 
-            # Keep all senior roles — drop only Gatekeeper and Unknown
-            if bucket in ("Gatekeeper", "Unknown"):
+            # Drop contacts classified as irrelevant / gatekeeper / unknown
+            if bucket in ("Gatekeeper", "Unknown", "Irrelevant"):
                 logger.info("searcher_enrich_skip", contact=contact.full_name,
-                            bucket=bucket, reason="not a senior/decision-maker role")
+                            bucket=bucket, reason="not a decision-maker or influencer role")
                 return
 
             await _enrich_log(state.thread_id,

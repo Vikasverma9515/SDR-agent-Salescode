@@ -60,6 +60,7 @@ class Contact(BaseModel):
     role_bucket: Literal[
         "DM", "Champion", "Influencer", "GateKeeper", "Unknown",
         "CEO/MD", "CTO/CIO", "CSO/Head of Sales", "P1 Influencer", "Gatekeeper",
+        "FDM", "KDM", "Irrelevant",
     ] = "Unknown"
     linkedin_url: str | None = None
     linkedin_verified: bool = False
