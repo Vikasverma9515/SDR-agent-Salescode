@@ -307,18 +307,22 @@ REJECTED_PROFILES_HEADERS = [
     "Verified On",                                # W
 ]
 
-# Columns A-J — every n8n webhook hit logged here for Gopal's visibility
+# One row per contact — full payload data from n8n for complete visibility
 N8N_WEBHOOK_LOG_HEADERS = [
-    "Timestamp",            # A — when the webhook hit our endpoint
-    "Status",               # B — success / partial / error / empty
-    "Contacts Received",    # C — total contacts in the payload
-    "Written to Sheet",     # D — how many actually written to First Clean List
-    "Skipped",              # E — how many dropped (no name, bad data, etc.)
-    "Companies",            # F — comma-separated company names found
-    "Skip Reasons",         # G — why contacts were skipped
-    "Chain Triggered",      # H — which agent chain was started (Veri→Searcher→Veri)
-    "Thread ID",            # I — thread_id for tracking in the UI
-    "Raw Payload (sample)", # J — first contact's raw JSON for debugging
+    "Timestamp",            # A
+    "Company Name",         # B
+    "First Name",           # C
+    "Last Name",            # D
+    "Job Title",            # E
+    "Email",                # F
+    "LinkedIn URL",         # G
+    "Domain",               # H
+    "Phone",                # I
+    "Buying Role",          # J
+    "Country",              # K
+    "Status",               # L — written / skipped
+    "Skip Reason",          # M — why this contact was skipped (empty if written)
+    "Raw JSON",             # N — the exact JSON n8n sent for this contact
 ]
 
 async def delete_rows_batch(tab_name: str, row_nums: list[int]) -> None:

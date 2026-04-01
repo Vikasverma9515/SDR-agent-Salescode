@@ -60,26 +60,29 @@ def _extract_field(item: dict, *keys: str, default: str = "") -> str:
 
 _n8n_log_last_error: dict = {}  # surfaces sheet-write errors via /api/n8n/debug
 
-async def _log_n8n_webhook(
-    sheets_mod, timestamp: str, status: str,
-    received: int, written: int, skipped: int,
-    companies: str, skip_reasons: str, chain: str,
-    thread_id: str, sample_raw: str,
+async def _log_n8n_contact(
+    sheets_mod, timestamp: str, raw: dict, normalized: dict,
+    status: str, skip_reason: str,
 ) -> None:
-    """Log a single row to the N8N Webhook Log tab. Fire-and-forget — never raises."""
+    """Log one contact row to the N8N Webhook Log tab. Fire-and-forget."""
+    import json as _j
     try:
         await sheets_mod.ensure_headers(sheets_mod.N8N_WEBHOOK_LOG, sheets_mod.N8N_WEBHOOK_LOG_HEADERS)
         await sheets_mod.append_row(sheets_mod.N8N_WEBHOOK_LOG, [
-            timestamp,          # A
-            status,             # B
-            str(received),      # C
-            str(written),       # D
-            str(skipped),       # E
-            companies,          # F
-            skip_reasons,       # G
-            chain,              # H
-            thread_id,          # I
-            sample_raw,         # J
+            timestamp,                              # A
+            normalized.get("company_name", ""),      # B
+            normalized.get("first_name", ""),        # C
+            normalized.get("last_name", ""),         # D
+            normalized.get("job_title", ""),         # E
+            normalized.get("email", ""),             # F
+            normalized.get("linkedin_url", ""),      # G
+            normalized.get("domain", ""),            # H
+            normalized.get("phone_1", ""),           # I
+            normalized.get("buying_role", ""),       # J
+            normalized.get("country", ""),           # K
+            status,                                  # L
+            skip_reason,                             # M
+            _j.dumps(raw, default=str)[:500],        # N
         ])
         _n8n_log_last_error.clear()
     except Exception as e:
@@ -542,12 +545,11 @@ def create_app() -> FastAPI:
 
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        # Parse body — log errors too
+        # Parse body
         try:
             body = await request.json()
         except Exception:
-            # Log the bad request
-            await _log_n8n_webhook(sheets, timestamp, "error", 0, 0, 0, "", "Invalid JSON body", "", "", "")
+            await _log_n8n_contact(sheets, timestamp, {}, {}, "error", "Invalid JSON body")
             raise HTTPException(status_code=400, detail="Invalid JSON body")
 
         # Normalize to a list of contact dicts
@@ -558,23 +560,20 @@ def create_app() -> FastAPI:
             elif "contact" in body:
                 raw_contacts = [body["contact"]] if isinstance(body["contact"], dict) else body["contact"]
             else:
-                # Single contact object
                 raw_contacts = [body]
         elif isinstance(body, list):
             raw_contacts = body
         else:
-            await _log_n8n_webhook(sheets, timestamp, "error", 0, 0, 0, "",
-                                   "Could not parse contacts from body", "", "",
-                                   _json.dumps(body, default=str)[:500])
+            await _log_n8n_contact(sheets, timestamp, body if isinstance(body, dict) else {"_raw": str(body)[:200]},
+                                   {}, "error", "Could not parse contacts from body")
             raise HTTPException(status_code=400, detail="Could not parse contacts from request body")
 
         if not raw_contacts:
-            await _log_n8n_webhook(sheets, timestamp, "empty", 0, 0, 0, "",
-                                   "No contacts found in request", "", "",
-                                   _json.dumps(body, default=str)[:500])
+            await _log_n8n_contact(sheets, timestamp, {}, {}, "error", "No contacts found in request")
             raise HTTPException(status_code=400, detail="No contacts found in request")
 
         # Step 1: Normalize and write contacts to First Clean List
+        # Log EVERY contact to webhook log — written or skipped
         companies_seen: set[str] = set()
         rows_written = 0
         skipped = 0
@@ -585,6 +584,8 @@ def create_app() -> FastAPI:
                 if not isinstance(raw, dict):
                     skipped += 1
                     skip_reasons.append(f"Not a dict: {str(raw)[:80]}")
+                    await _log_n8n_contact(sheets, timestamp, {"_raw": str(raw)[:200]},
+                                           {}, "skipped", "Not a valid contact object")
                     continue
                 c = _normalize_contact(raw)
 
@@ -592,7 +593,9 @@ def create_app() -> FastAPI:
                 if not c["first_name"] and not c["last_name"]:
                     skipped += 1
                     company_hint = c["company_name"] or "(no company)"
-                    skip_reasons.append(f"No first/last name — {company_hint}: keys={list(raw.keys())[:6]}")
+                    reason = f"No first/last name — keys: {list(raw.keys())[:6]}"
+                    skip_reasons.append(f"{company_hint}: {reason}")
+                    await _log_n8n_contact(sheets, timestamp, raw, c, "skipped", reason)
                     continue
 
                 row = [
@@ -617,19 +620,16 @@ def create_app() -> FastAPI:
                 rows_written += 1
                 if c["company_name"]:
                     companies_seen.add(c["company_name"])
+                # Log the written contact too
+                await _log_n8n_contact(sheets, timestamp, raw, c, "written", "")
             logger.info("n8n_contacts_written", count=rows_written, skipped=skipped,
                         companies=list(companies_seen))
         except Exception as e:
             logger.error("n8n_contacts_write_error", error=str(e))
-            await _log_n8n_webhook(sheets, timestamp, "error", len(raw_contacts), rows_written, skipped,
-                                   ", ".join(companies_seen),
-                                   f"Write error: {str(e)[:200]}", "", "",
-                                   _json.dumps(raw_contacts[0] if raw_contacts else {}, default=str)[:500])
             raise HTTPException(status_code=500, detail=f"Failed to write contacts to sheet: {e}")
 
         # Step 2: Trigger Veri → Searcher → Veri chain
         thread_id = str(uuid.uuid4())
-        chain_info = ""
         if rows_written > 0:
             _log_queues[thread_id] = _PipelineQueue(thread_id)
             _active_runs[thread_id] = {
@@ -641,30 +641,12 @@ def create_app() -> FastAPI:
             }
             company_filter = ",".join(companies_seen) if companies_seen else None
             asyncio.create_task(_veri_task(thread_id, company_filter=company_filter))
-            chain_info = "Veri → Searcher → Veri"
             logger.info("n8n_contacts_chain_started",
                         contacts=rows_written, companies=list(companies_seen), thread_id=thread_id)
         else:
-            chain_info = "No chain — 0 contacts written"
             logger.info("n8n_contacts_no_chain", reason="0 rows written", skipped=skipped)
 
-        # Step 3: Log to N8N Webhook Log tab (Gopal's visibility)
-        status_label = "success" if skipped == 0 and rows_written > 0 else (
-            "partial" if rows_written > 0 else "empty"
-        )
-        skip_summary = "; ".join(skip_reasons[:5])  # first 5 reasons
-        if len(skip_reasons) > 5:
-            skip_summary += f" (+{len(skip_reasons) - 5} more)"
-        sample_raw = _json.dumps(raw_contacts[0] if raw_contacts else {}, default=str)[:500]
-
-        await _log_n8n_webhook(
-            sheets, timestamp, status_label,
-            len(raw_contacts), rows_written, skipped,
-            ", ".join(sorted(companies_seen)),
-            skip_summary, chain_info, thread_id, sample_raw
-        )
-
-        # Store last received data for debugging (existing /api/n8n/debug endpoint)
+        # Store last received data for debugging
         _n8n_last_received.clear()
         _n8n_last_received.update({
             "received_at": timestamp,
@@ -677,12 +659,14 @@ def create_app() -> FastAPI:
             "sample_normalized": _normalize_contact(raw_contacts[0]) if raw_contacts else {},
         })
 
+        chain_msg = "Veri → Searcher → Veri chain started" if rows_written > 0 else "No chain — 0 contacts written"
+        skip_msg = f" Skipped {skipped}: {'; '.join(skip_reasons[:3])}" if skipped else ""
+
         return RunResponse(
             thread_id=thread_id,
             status="started" if rows_written > 0 else "empty",
             message=f"Received {rows_written} contacts for {len(companies_seen)} companies. "
-                    f"{chain_info}."
-                    f"{f' Skipped {skipped}: {skip_summary}' if skipped else ''}",
+                    f"{chain_msg}.{skip_msg}",
         )
 
     @app.get("/api/n8n/debug")
