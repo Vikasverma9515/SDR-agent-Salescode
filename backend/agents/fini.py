@@ -1913,6 +1913,16 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
                 best = enriched_candidates[0]
                 pick_confidence = "LOW"
 
+            # If the selected candidate was lightweight (no domain/email), enrich it now
+            if best.get("domain") is None and best.get("org_id"):
+                await _log(f"[{company.raw_name}] selected candidate was lightweight — enriching now")
+                try:
+                    enriched_best = await _enrich_candidate(best)
+                    enriched_candidates[best_idx if 0 <= best_idx < len(enriched_candidates) else 0] = enriched_best
+                    best = enriched_best
+                except Exception as enrich_err:
+                    logger.warning("enrich_selected_lightweight_failed", company=company.raw_name, error=str(enrich_err))
+
             await _log(
                 f"[{company.raw_name}] best match: \"{best.get('name')}\" "
                 f"(confidence: {pick_confidence}) — {selection_reasoning}",
