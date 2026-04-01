@@ -919,121 +919,163 @@ async def _smart_company_lookup(raw_name: str, region: str = "") -> dict:
     }
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ONE comprehensive GPT web search — gets everything in a single call
+    # STEP 1: Deep web search — find domain + parent (search first, reason later)
+    # This is what ChatGPT does: search deeply for one thing, then reason.
+    # Asking for 9 fields in one shot makes GPT do shallow search + formatting.
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     try:
         region_hint = f" (operating region: {region})" if region else ""
-        prompt = (
-            f"You are a B2B sales researcher. Research this company and return a JSON object.\n\n"
-            f"COMPANY: \"{raw_name}\"{region_hint}\n\n"
-            f"SEARCH THE WEB and find:\n"
-            f"1. company_type — one of: brand, subsidiary, distributor, regional_branch, "
-            f"holding, joint_venture, independent.\n"
-            f"2. clean_name — the company's actual official name (strip legal suffixes like S.L., "
-            f"GmbH, Ltd; strip ownership parentheticals like '(Mahou owned)').\n"
-            f"3. domain — the company's official corporate website domain (e.g. 'dominos.de', "
-            f"'nestle.com'). For regional branches, use the regional domain if it exists. "
-            f"This is CRITICAL — verify it via web search, don't guess.\n"
-            f"4. parent_brand — the parent/owning company if this is a subsidiary, brand, "
-            f"distributor, or regional branch. Null if independent.\n"
-            f"5. parent_domain — the parent company's domain (e.g. 'mondelezinternational.com'). "
-            f"Null if no parent.\n"
-            f"6. linkedin_url — the LinkedIn company page URL. Search LinkedIn for this specific "
-            f"company. For brands (like Oreo), find the parent company's LinkedIn page instead "
-            f"(e.g. Mondelez International). Return the full URL like "
-            f"'https://www.linkedin.com/company/dominos-pizza-deutschland'\n"
-            f"7. parent_linkedin_url — the parent company's LinkedIn page URL if different. "
-            f"Null if same as linkedin_url or no parent.\n"
-            f"8. country — ISO 2-letter code (e.g. 'DE' for Germany, 'US' for USA).\n"
-            f"9. has_own_page — true/false/maybe — does this specific entity have its own "
-            f"LinkedIn company page (not the parent's page)?\n\n"
-            f"IMPORTANT:\n"
-            f"- For 'Dominos germany' → domain should be dominos.de (German domain), "
-            f"LinkedIn page should be Domino's Pizza Deutschland.\n"
-            f"- For 'Oreo usa' → domain should be oreo.com, but LinkedIn should be "
-            f"Mondelez International (Oreo is a brand, not a company on LinkedIn).\n"
-            f"- VERIFY the domain via web search — don't guess from the company name.\n\n"
-            f"Return ONLY valid JSON, no markdown, no explanation."
+
+        # Step 1: SEARCH — focused on finding the correct domain and parent
+        search_prompt = (
+            f"Search the web for this company: \"{raw_name}\"{region_hint}\n\n"
+            f"Find and verify:\n"
+            f"1. What is the official website domain for this company? "
+            f"(e.g. dominos.de, nestle.com — the ACTUAL corporate domain, not a social media page)\n"
+            f"2. Is this company a subsidiary, brand, distributor, or regional branch of a larger company? "
+            f"If yes, what is the parent company and its domain?\n"
+            f"3. What is this company's LinkedIn company page URL?\n\n"
+            f"IMPORTANT: Search the web to VERIFY the domain. Don't guess from the company name. "
+            f"For obscure/small companies, search harder — try '{raw_name} website', "
+            f"'{raw_name} official site', '{raw_name} contact'.\n\n"
+            f"Reply in this exact format (no JSON, no markdown):\n"
+            f"DOMAIN: example.com\n"
+            f"PARENT: Parent Company Name (or NONE if independent)\n"
+            f"PARENT_DOMAIN: parent.com (or NONE)\n"
+            f"LINKEDIN: https://www.linkedin.com/company/slug\n"
+            f"PARENT_LINKEDIN: https://www.linkedin.com/company/parent-slug (or NONE)\n"
+            f"TYPE: one of brand/subsidiary/distributor/regional_branch/holding/independent\n"
+            f"COUNTRY: XX (ISO 2-letter code)"
         )
 
-        raw_response = await llm_web_search(prompt, model="gpt-5-search-api")
-        logger.info("smart_lookup_gpt_response", company=raw_name,
-                    content=(raw_response or "")[:300])
+        search_response = await llm_web_search(search_prompt, model="gpt-5")
+        logger.info("smart_lookup_step1", company=raw_name,
+                    content=(search_response or "")[:400])
 
-        if not raw_response:
-            return result
+        if search_response:
+            # Parse line-by-line response (much more reliable than JSON parsing)
+            for line in search_response.strip().splitlines():
+                line = line.strip()
+                if line.upper().startswith("DOMAIN:"):
+                    val = line.split(":", 1)[1].strip().lower()
+                    val = re.sub(r'^https?://(?:www\.)?', '', val).split('/')[0].strip()
+                    if val and val != "none" and '.' in val:
+                        result["domain"] = val
+                elif line.upper().startswith("PARENT:") and "PARENT_" not in line.upper()[:12]:
+                    val = line.split(":", 1)[1].strip()
+                    if val.upper() != "NONE" and val:
+                        result["parent_brand"] = val
+                elif line.upper().startswith("PARENT_DOMAIN:"):
+                    pass  # stored for reference but not used in result
+                elif line.upper().startswith("LINKEDIN:") and "PARENT" not in line.upper()[:12]:
+                    val = line.split(":", 1)[1].strip()
+                    if "NONE" not in val.upper():
+                        # Reconstruct URL if it was split by ":"
+                        if "linkedin.com" not in val and len(line.split(":")) > 2:
+                            val = ":".join(line.split(":")[1:]).strip()
+                        m = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]{1,60})', val, re.IGNORECASE)
+                        if m:
+                            slug = m.group(1).rstrip('/')
+                            if slug not in result["slugs"]:
+                                result["slugs"].insert(0, slug)
+                        m = re.search(r'linkedin\.com/company/(\d{6,})', val, re.IGNORECASE)
+                        if m:
+                            result["org_id"] = m.group(1)
+                elif line.upper().startswith("PARENT_LINKEDIN:"):
+                    val = line.split(":", 1)[1].strip()
+                    if "NONE" not in val.upper():
+                        if "linkedin.com" not in val and len(line.split(":")) > 2:
+                            val = ":".join(line.split(":")[1:]).strip()
+                        m = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]{1,60})', val, re.IGNORECASE)
+                        if m:
+                            slug = m.group(1).rstrip('/')
+                            if slug not in result["parent_slugs"] and slug not in result["slugs"]:
+                                result["parent_slugs"].append(slug)
+                elif line.upper().startswith("TYPE:"):
+                    val = line.split(":", 1)[1].strip().lower()
+                    if val in ("brand", "subsidiary", "distributor", "regional_branch",
+                               "holding", "joint_venture", "independent"):
+                        result["company_type"] = val
+                elif line.upper().startswith("COUNTRY:"):
+                    pass  # used in notes only
 
-        # Parse JSON response
-        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_response.strip())
-        # Try to find JSON object in the response
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', cleaned, re.DOTALL)
-        if json_match:
-            analysis = _json.loads(json_match.group(0))
-        else:
-            analysis = _json.loads(cleaned)
-
-        # Extract all fields
-        result["company_type"] = analysis.get("company_type", "unknown")
-        result["clean_name"] = analysis.get("clean_name") or raw_name
-        result["parent_brand"] = analysis.get("parent_brand")
-        result["domain"] = analysis.get("domain")
-        result["has_own_page"] = analysis.get("has_own_page")
-
-        # Extract LinkedIn slugs from URLs
-        for url_key in ("linkedin_url", "parent_linkedin_url"):
-            url = analysis.get(url_key) or ""
-            if url:
-                m = re.search(r'linkedin\.com/company/([a-z0-9][a-z0-9\-]{1,60})', url, re.IGNORECASE)
-                if m:
-                    slug = m.group(1).rstrip('/')
-                    if url_key == "linkedin_url":
-                        if slug not in result["slugs"]:
-                            result["slugs"].insert(0, slug)
-                    else:
-                        if slug not in result["parent_slugs"] and slug not in result["slugs"]:
-                            result["parent_slugs"].append(slug)
-                # Also check for numeric org ID
-                m = re.search(r'linkedin\.com/company/(\d{6,})', url, re.IGNORECASE)
-                if m:
-                    result["org_id"] = m.group(1)
-
-        # Build notes
-        result["notes"] = (
-            f"type={result['company_type']}, "
-            f"domain={result['domain'] or '?'}, "
-            f"parent={result['parent_brand'] or 'none'}, "
-            f"country={analysis.get('country', '?')}, "
-            f"has_own_page={result['has_own_page']}"
-        )
-
-        logger.info("smart_lookup_done", company=raw_name,
-                    company_type=result["company_type"],
-                    clean_name=result["clean_name"],
-                    domain=result["domain"],
-                    parent=result["parent_brand"],
-                    slugs=result["slugs"][:3],
-                    parent_slugs=result["parent_slugs"][:2])
+        logger.info("smart_lookup_step1_parsed", company=raw_name,
+                    domain=result["domain"], parent=result["parent_brand"],
+                    slugs=result["slugs"][:3], type=result["company_type"])
 
     except Exception as e:
-        logger.warning("smart_lookup_error", company=raw_name, error=str(e))
-        # Fallback: try a simpler analysis without web search
-        try:
-            from backend.tools.llm import llm_complete
-            fallback_raw = await llm_complete(
-                f"Analyze this company name and return JSON with: company_type, clean_name, "
-                f"parent_brand, country, has_own_page.\n"
-                f"Company: \"{raw_name}\"{f' (region: {region})' if region else ''}\n"
-                f"Return ONLY JSON.",
-                model="gpt-4.1", max_tokens=200,
-            )
-            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', (fallback_raw or "").strip())
-            fb = _json.loads(cleaned)
-            result["company_type"] = fb.get("company_type", "unknown")
-            result["clean_name"] = fb.get("clean_name") or raw_name
-            result["parent_brand"] = fb.get("parent_brand")
-            result["has_own_page"] = fb.get("has_own_page")
-        except Exception:
-            pass
+        logger.warning("smart_lookup_step1_error", company=raw_name, error=str(e))
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 2: Fast LLM reasoning (NO web search) — classify and clean up
+    # Uses the facts from Step 1 + model knowledge to fill in gaps
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    try:
+        from backend.tools.llm import llm_complete
+
+        context_parts = []
+        if result["domain"]:
+            context_parts.append(f"domain: {result['domain']}")
+        if result["parent_brand"]:
+            context_parts.append(f"parent: {result['parent_brand']}")
+        if result["company_type"] != "unknown":
+            context_parts.append(f"type: {result['company_type']}")
+        context_str = ", ".join(context_parts) if context_parts else "no web data found"
+
+        reason_prompt = (
+            f"Analyze this company name and return a JSON object.\n\n"
+            f"COMPANY: \"{raw_name}\"{f' (region: {region})' if region else ''}\n"
+            f"WEB RESEARCH FOUND: {context_str}\n\n"
+            f"Return JSON with:\n"
+            f"- clean_name: the company's actual trading name (strip S.L., GmbH, parentheticals)\n"
+            f"- company_type: brand/subsidiary/distributor/regional_branch/holding/independent\n"
+            f"- has_own_page: true/false/maybe (does it have its own LinkedIn company page?)\n"
+            f"- primary_slug: most likely LinkedIn URL slug (lowercase, hyphens)\n"
+            f"- alt_slugs: list of 2-3 alternative slugs\n\n"
+            f"Return ONLY valid JSON, no markdown."
+        )
+
+        reason_raw = await llm_complete(reason_prompt, model="gpt-4.1", max_tokens=250)
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', (reason_raw or "").strip())
+        analysis = _json.loads(cleaned)
+
+        result["clean_name"] = analysis.get("clean_name") or raw_name
+        if result["company_type"] == "unknown":
+            result["company_type"] = analysis.get("company_type", "unknown")
+        result["has_own_page"] = analysis.get("has_own_page")
+
+        # Add slugs from reasoning (only if Step 1 didn't find any)
+        if not result["slugs"]:
+            primary = analysis.get("primary_slug", "")
+            if primary:
+                result["slugs"].append(primary)
+            for s in (analysis.get("alt_slugs") or []):
+                if s and s not in result["slugs"]:
+                    result["slugs"].append(s)
+
+        logger.info("smart_lookup_step2", company=raw_name,
+                    clean_name=result["clean_name"],
+                    company_type=result["company_type"],
+                    has_own_page=result["has_own_page"])
+
+    except Exception as e:
+        logger.warning("smart_lookup_step2_error", company=raw_name, error=str(e))
+
+    # Build notes
+    result["notes"] = (
+        f"type={result['company_type']}, "
+        f"domain={result['domain'] or '?'}, "
+        f"parent={result['parent_brand'] or 'none'}, "
+        f"has_own_page={result['has_own_page']}"
+    )
+
+    logger.info("smart_lookup_done", company=raw_name,
+                company_type=result["company_type"],
+                clean_name=result["clean_name"],
+                domain=result["domain"],
+                parent=result["parent_brand"],
+                slugs=result["slugs"][:3],
+                parent_slugs=result["parent_slugs"][:2])
 
     return result
 
