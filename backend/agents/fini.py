@@ -1677,27 +1677,123 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
                    + (f" + {len(lightweight_candidates)} lightweight" if lightweight_candidates else ""))
 
         async def _enrich_candidate(cand: dict) -> dict:
-            """Enrich a single LinkedIn candidate with domain, email, size."""
+            """Enrich a single LinkedIn candidate with domain, email, size.
+
+            ORDER MATTERS — domain-first strategy:
+            1. Discover domain (reliable — dominos.de)
+            2. Look up Sales Nav org_id WITH domain validation (filters out wrong companies)
+            3. Build Sales Nav URL (correct org_id guaranteed)
+            """
             cand_name = cand.get("name") or company.normalized_name or company.raw_name
             cand_org_id = cand.get("org_id")
             cand_enriched = {**cand}  # copy original fields
+            _ctype = smart.get("company_type", "")
+            _parent = smart.get("parent_brand", "")
 
-            # Build Sales Nav URL for this candidate.
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # STEP 1: Discover domain FIRST — this is our most reliable signal
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            found_domain = None
+            try:
+                _domain_ctx = {
+                    "company_type": smart.get("company_type"),
+                    "parent_brand": smart.get("parent_brand"),
+                    "region": effective_region,
+                    "linkedin_slug": cand.get("public_identifier") or cand.get("slug") or "",
+                    "org_id": cand.get("org_id") or "",
+                }
+
+                # Fast path: LinkedIn keyword search already returned the website
+                _linkedin_website = (cand.get("website") or "").strip()
+                if _linkedin_website:
+                    _linkedin_website = re.sub(r'^https?://(?:www\.)?', '', _linkedin_website)
+                    _linkedin_website = re.sub(r'^www\.', '', _linkedin_website)
+                    _linkedin_website = _linkedin_website.split('/')[0].strip().lower()
+
+                if _linkedin_website and re.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}$', _linkedin_website):
+                    found_domain = _linkedin_website
+                    await _log(f"[{company.raw_name}] {cand_name}: domain from LinkedIn = {found_domain}")
+                else:
+                    d_info = await discover_domain(cand_name, context=_domain_ctx)
+                    found_domain = d_info.get("domain")
+                    if d_info.get("email_format") and "@" in d_info["email_format"]:
+                        cand_enriched["_email_from_discovery"] = d_info["email_format"]
+
+                # Parent fallback if no domain found
+                if not found_domain and _parent:
+                    await _log(f"[{company.raw_name}] no domain for {cand_name}, trying parent: {_parent}")
+                    d_info = await discover_domain(_parent, context=_domain_ctx)
+                    found_domain = d_info.get("domain")
+                    if found_domain:
+                        await _log(f"[{company.raw_name}] using parent domain: {found_domain}")
+                        if d_info.get("email_format") and "@" in d_info["email_format"]:
+                            cand_enriched["_email_from_discovery"] = d_info["email_format"]
+
+                # Probe email format
+                email_fmt = cand_enriched.pop("_email_from_discovery", None)
+                if found_domain and not email_fmt:
+                    try:
+                        from backend.tools.domain_discovery import _probe_email_format
+                        email_fmt = await _probe_email_format(cand_name, found_domain)
+                    except Exception as e:
+                        logger.warning("email_probe_error", candidate=cand_name, error=str(e))
+
+                if not email_fmt and found_domain:
+                    email_fmt = f"{{first}}.{{last}}@{found_domain}"
+
+                d_confidence = "high" if (email_fmt and found_domain) else ("medium" if found_domain else "low")
+                cand_enriched["domain"] = found_domain
+                cand_enriched["email_format"] = email_fmt
+                cand_enriched["domain_confidence"] = d_confidence
+                ec = d_confidence if email_fmt and "@" in email_fmt else "low"
+                if ec == "low" and email_fmt:
+                    ec = "medium"
+                cand_enriched["email_confidence"] = ec
+                if found_domain:
+                    await _log(f"[{company.raw_name}] {cand_name}: domain={found_domain} · email={email_fmt or '?'}")
+                else:
+                    await _log(f"[{company.raw_name}] {cand_name}: no domain found")
+            except Exception as e:
+                logger.warning("enrich_candidate_domain_error", candidate=cand_name, error=str(e))
+                cand_enriched["domain"] = None
+                cand_enriched["email_format"] = None
+                cand_enriched["domain_confidence"] = "low"
+                cand_enriched["email_confidence"] = "low"
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # STEP 2: Find Sales Nav org_id WITH domain validation
+            # Domain is now known — use it to filter out wrong LinkedIn companies
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _use_org_id = cand_org_id
             _use_org_name = cand_name
             _use_region = effective_region or ""
 
-            # For regional branches / distributors / brands, use the PARENT company's org_id
-            # since the branch/brand page often has 0 employees in Sales Navigator.
-            _ctype = smart.get("company_type", "")
-            _parent = smart.get("parent_brand", "")
-            if _ctype in ("regional_branch", "distributor", "subsidiary", "brand") and _parent and cand_org_id:
+            # For regional branches / distributors / brands, search parent WITH domain validation
+            if _ctype in ("regional_branch", "distributor", "subsidiary", "brand") and _parent:
                 try:
-                    parent_org = await unipile.get_company_org_id(_parent)
+                    parent_org = await unipile.get_company_org_id(
+                        _parent, expected_domain=found_domain or ""
+                    )
                     if parent_org.get("org_id"):
                         _use_org_id = parent_org["org_id"]
                         _use_org_name = parent_org.get("name") or _parent
-                        await _log(f"[{company.raw_name}] using parent org ({_parent}) for Sales Nav")
+                        await _log(f"[{company.raw_name}] using parent org ({_use_org_name}) for Sales Nav"
+                                   + (f" [domain-validated: {found_domain}]" if found_domain else ""))
+                except Exception:
+                    pass
+            elif found_domain and _use_org_id:
+                # For non-parent cases: validate the candidate's own org_id against domain
+                try:
+                    _org_website = await unipile.get_company_domain(str(_use_org_id))
+                    if _org_website and not unipile._domain_matches(_org_website, found_domain):
+                        await _log(f"[{company.raw_name}] org website '{_org_website}' ≠ '{found_domain}' — re-searching with domain validation")
+                        _revalidated = await unipile.get_company_org_id(
+                            cand_name, expected_domain=found_domain
+                        )
+                        if _revalidated.get("org_id"):
+                            _use_org_id = _revalidated["org_id"]
+                            _use_org_name = _revalidated.get("name") or cand_name
+                            await _log(f"[{company.raw_name}] domain-validated org: {_use_org_name}")
                 except Exception:
                     pass
 
@@ -1719,118 +1815,15 @@ async def _enrich_single_company(company: TargetCompany, region: str, thread_id:
                         else:
                             await _log(f"[{company.raw_name}] {regional_count} people in {_use_region} — keeping filter")
                     except Exception:
-                        pass  # on error, keep the region filter
+                        pass
 
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # STEP 3: Build Sales Nav URL with the validated org_id
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _use_org_id:
                 cand_enriched["sales_nav_url"] = _build_sales_nav_url(
                     _use_org_id, _use_org_name, _use_region
                 )
-
-            # Domain + email format
-            try:
-                # Pass company context — includes LinkedIn slug so domain discovery
-                # can fetch the domain directly from LinkedIn (fastest path).
-                _domain_ctx = {
-                    "company_type": smart.get("company_type"),
-                    "parent_brand": smart.get("parent_brand"),
-                    "region": effective_region,
-                    "linkedin_slug": cand.get("public_identifier") or cand.get("slug") or "",
-                    "org_id": cand.get("org_id") or "",
-                }
-
-                # Fast path: if LinkedIn keyword search already returned the website, use it
-                _linkedin_website = (cand.get("website") or "").strip()
-                if _linkedin_website:
-                    _linkedin_website = re.sub(r'^https?://(?:www\.)?', '', _linkedin_website)
-                    _linkedin_website = re.sub(r'^www\.', '', _linkedin_website)
-                    _linkedin_website = _linkedin_website.split('/')[0].strip().lower()
-
-                # --- Find domain — no tight timeouts, let each step complete ---
-                found_domain = None
-
-                if _linkedin_website and re.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}$', _linkedin_website):
-                    found_domain = _linkedin_website
-                    await _log(f"[{company.raw_name}] {cand_name}: domain from LinkedIn = {found_domain}")
-                else:
-                    # Full discovery: LinkedIn page → GPT web search → Perplexity → email probing
-                    d_info = await discover_domain(cand_name, context=_domain_ctx)
-                    found_domain = d_info.get("domain")
-                    if d_info.get("email_format") and "@" in d_info["email_format"]:
-                        cand_enriched["_email_from_discovery"] = d_info["email_format"]
-
-                # Parent fallback if no domain found
-                if not found_domain and smart.get("parent_brand"):
-                    parent_name = smart["parent_brand"]
-                    await _log(f"[{company.raw_name}] no domain for {cand_name}, trying parent: {parent_name}")
-                    d_info = await discover_domain(parent_name, context=_domain_ctx)
-                    found_domain = d_info.get("domain")
-                    if found_domain:
-                        await _log(f"[{company.raw_name}] using parent domain: {found_domain}")
-                        if d_info.get("email_format") and "@" in d_info["email_format"]:
-                            cand_enriched["_email_from_discovery"] = d_info["email_format"]
-
-                # --- Probe email format if not already found ---
-                email_fmt = cand_enriched.pop("_email_from_discovery", None)
-                if found_domain and not email_fmt:
-                    try:
-                        from backend.tools.domain_discovery import _probe_email_format
-                        email_fmt = await _probe_email_format(cand_name, found_domain)
-                    except Exception as e:
-                        logger.warning("email_probe_error", candidate=cand_name, error=str(e))
-
-                if not email_fmt and found_domain:
-                    email_fmt = f"{{first}}.{{last}}@{found_domain}"
-
-                d_info = {
-                    "domain": found_domain,
-                    "email_format": email_fmt,
-                    "confidence": "high" if (email_fmt and found_domain) else ("medium" if found_domain else "low"),
-                }
-
-                cand_enriched["domain"] = d_info["domain"]
-                cand_enriched["email_format"] = d_info["email_format"]
-                dc = d_info.get("confidence", "low")
-                cand_enriched["domain_confidence"] = dc
-                ec = dc if d_info["email_format"] and "@" in d_info["email_format"] else "low"
-                if ec == "low" and d_info["email_format"]:
-                    ec = "medium"
-                cand_enriched["email_confidence"] = ec
-                if d_info["domain"]:
-                    await _log(f"[{company.raw_name}] {cand_name}: domain={d_info['domain']} · email={d_info.get('email_format') or '?'}")
-                else:
-                    await _log(f"[{company.raw_name}] {cand_name}: no domain found")
-            except Exception as e:
-                logger.warning("enrich_candidate_domain_error", candidate=cand_name, error=str(e))
-                cand_enriched["domain"] = None
-                cand_enriched["email_format"] = None
-                cand_enriched["domain_confidence"] = "low"
-                cand_enriched["email_confidence"] = "low"
-
-            # ── Domain cross-validation of Sales Nav org_id ──
-            # Now that we know the correct domain, re-validate the org_id.
-            # If the LinkedIn company's website doesn't match, re-search with domain validation.
-            _cand_domain = cand_enriched.get("domain") or ""
-            if _cand_domain and _use_org_id:
-                try:
-                    _org_website = await unipile.get_company_domain(str(_use_org_id))
-                    if _org_website and not unipile._domain_matches(_org_website, _cand_domain):
-                        await _log(f"[{company.raw_name}] Sales Nav org website '{_org_website}' ≠ domain '{_cand_domain}' — re-searching with domain validation")
-                        # Re-search parent or company with domain validation
-                        _search_name = _parent or cand_name
-                        _revalidated = await unipile.get_company_org_id(_search_name, expected_domain=_cand_domain)
-                        if _revalidated.get("org_id") and _revalidated["org_id"] != _use_org_id:
-                            _use_org_id = _revalidated["org_id"]
-                            _use_org_name = _revalidated.get("name") or _search_name
-                            await _log(f"[{company.raw_name}] re-validated Sales Nav org: {_use_org_name} (domain-matched)")
-                        elif _parent:
-                            # Try parent directly with domain validation
-                            _parent_retry = await unipile.get_company_org_id(_parent, expected_domain=_cand_domain)
-                            if _parent_retry.get("org_id"):
-                                _use_org_id = _parent_retry["org_id"]
-                                _use_org_name = _parent_retry.get("name") or _parent
-                                await _log(f"[{company.raw_name}] using parent org ({_parent}) after domain validation")
-                except Exception as _dv_err:
-                    logger.warning("domain_crossval_error", company=company.raw_name, error=str(_dv_err))
 
             # Account size
             try:
