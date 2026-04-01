@@ -47,14 +47,17 @@ class N8nCompleteRequest(BaseModel):
     row_start: Optional[int] = None  # 1-based data row range that n8n populated
     row_end: Optional[int] = None
 
+_EMPTY_MARKERS = {"empty", "null", "none", "n/a", "na", "undefined", "-", "—"}
+
 def _extract_field(item: dict, *keys: str, default: str = "") -> str:
-    """Extract a field from a dict by trying multiple possible key names (case-insensitive)."""
+    """Extract a field from a dict by trying multiple possible key names (case-insensitive).
+    Treats 'empty', 'null', 'none', 'n/a', 'undefined' as empty values."""
     item_lower = {k.lower().replace(" ", "_").replace("-", "_"): v for k, v in item.items()}
     for key in keys:
         k = key.lower().replace(" ", "_").replace("-", "_")
         if k in item_lower and item_lower[k] is not None:
             val = str(item_lower[k]).strip()
-            if val:
+            if val and val.lower() not in _EMPTY_MARKERS:
                 return val
     return default
 
