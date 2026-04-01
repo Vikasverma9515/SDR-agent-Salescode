@@ -252,79 +252,140 @@ _fini_results: dict[str, dict] = {}  # cache completed enrichment data for WS re
 _last_pause_event: dict[str, dict] = {}  # cache last role/contact pause event for WS reconnect replay
 
 # ---------------------------------------------------------------------------
-# n8n Intake Buffer — collects contacts, flushes after 60s silence
+# n8n Intake Buffer — collects contacts IN MEMORY, flushes after 5 min silence
 # ---------------------------------------------------------------------------
 # n8n sends contacts in drip-feed batches (not all at once).
-# Instead of triggering a chain per POST, we buffer everything and
-# flush once n8n goes quiet for 60 seconds.
+# We buffer contacts grouped by company, then on flush:
+#   For EACH company sequentially:
+#     1. Write that company's contacts to sheet
+#     2. Veri R1 (verify n8n contacts)
+#     3. Searcher (find gaps)
+#     4. Veri R2 (verify searcher contacts)
+#     → DONE, next company
 
 _N8N_BUFFER_TIMEOUT = 300  # 5 minutes of silence before flush
 
-_n8n_buffer_companies: set[str] = set()     # companies seen in current buffer window
-_n8n_buffer_contact_count: int = 0          # total contacts written in current buffer
-_n8n_buffer_timer: asyncio.Task | None = None  # the countdown timer task
-_n8n_buffer_lock = None                     # initialized in create_app (needs event loop)
-_n8n_chain_lock = None                      # prevents concurrent chains
-_n8n_chain_running: bool = False            # flag for status endpoint
+# Buffer: company_name → list of (sheet_row, raw_dict, normalized_dict)
+_n8n_buffer_contacts: dict[str, list[tuple[list, dict, dict]]] = {}
+_n8n_buffer_timer: asyncio.Task | None = None
+_n8n_buffer_lock = None        # initialized in create_app
+_n8n_chain_lock = None         # prevents concurrent chains
+_n8n_chain_running: bool = False
+_n8n_chain_current_company: str = ""  # which company is being processed now
 
 
 async def _n8n_buffer_flush():
-    """Called after 5min of silence — triggers ONE sequential chain for all buffered companies.
-    If a chain is already running, waits for it to finish first."""
-    global _n8n_buffer_companies, _n8n_buffer_contact_count, _n8n_buffer_timer, _n8n_chain_running
+    """Flush: for each company, write to sheet → Veri → Searcher → Veri R2."""
+    global _n8n_buffer_contacts, _n8n_buffer_timer, _n8n_chain_running, _n8n_chain_current_company
 
-    companies = set(_n8n_buffer_companies)  # snapshot
-    contact_count = _n8n_buffer_contact_count
-
-    # Reset buffer
-    _n8n_buffer_companies.clear()
-    _n8n_buffer_contact_count = 0
+    # Snapshot and reset buffer
+    buffered = dict(_n8n_buffer_contacts)
+    _n8n_buffer_contacts.clear()
     _n8n_buffer_timer = None
 
-    if not companies:
-        logger.info("n8n_buffer_flush_empty", msg="No companies to process")
+    if not buffered:
+        logger.info("n8n_buffer_flush_empty")
         return
 
-    # Wait for any running chain to finish — prevents concurrent chains
+    total_contacts = sum(len(rows) for rows in buffered.values())
+    company_list = sorted(buffered.keys())
+
+    # Wait for any running chain to finish
     async with _n8n_chain_lock:
-        logger.info("n8n_buffer_flush",
-                    companies=sorted(companies), contacts=contact_count,
-                    msg=f"Flushing {len(companies)} companies after {_N8N_BUFFER_TIMEOUT}s silence")
-
         _n8n_chain_running = True
-        thread_id = str(uuid.uuid4())
-        _log_queues[thread_id] = _PipelineQueue(thread_id)
-        _active_runs[thread_id] = {
-            "agent": "veri",
-            "status": "running",
-            "thread_id": thread_id,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "auto_triggered_by": "n8n_buffer",
-            "buffered_companies": sorted(companies),
-            "buffered_contacts": contact_count,
-        }
+        logger.info("n8n_buffer_flush_start",
+                    companies=company_list, total_contacts=total_contacts)
 
-        company_filter = ",".join(sorted(companies))
+        from backend.tools import sheets
 
-        try:
-            await _veri_task(thread_id, company_filter=company_filter)
-        except Exception as e:
-            logger.error("n8n_buffer_chain_error", error=str(e))
-        finally:
-            _n8n_chain_running = False
-            logger.info("n8n_buffer_chain_done",
-                        thread_id=thread_id, companies=sorted(companies))
+        for i, company in enumerate(company_list):
+            company_num = f"[{i+1}/{len(company_list)}]"
+            contact_rows = buffered[company]
+            _n8n_chain_current_company = company
+
+            logger.info("n8n_pipeline_company_start",
+                        company=company, num=company_num, contacts=len(contact_rows))
+
+            # ── Step 1: Write this company's contacts to sheet ──
+            try:
+                await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
+                for row_data, _raw, _norm in contact_rows:
+                    await sheets.append_row(sheets.FIRST_CLEAN_LIST, row_data)
+                logger.info("n8n_pipeline_sheet_written",
+                            company=company, rows=len(contact_rows))
+            except Exception as e:
+                logger.error("n8n_pipeline_sheet_error", company=company, error=str(e))
+                continue  # skip this company, try next
+
+            # ── Step 2: Veri R1 (verify n8n contacts) ──
+            veri1_thread = str(uuid.uuid4())
+            _log_queues[veri1_thread] = _PipelineQueue(veri1_thread)
+            _active_runs[veri1_thread] = {
+                "agent": "veri", "status": "running",
+                "thread_id": veri1_thread,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "auto_triggered_by": "n8n_buffer",
+            }
+            try:
+                logger.info("n8n_pipeline_veri1_start", company=company)
+                await _veri_task(veri1_thread, company_filter=company)
+                logger.info("n8n_pipeline_veri1_done", company=company)
+            except Exception as e:
+                logger.error("n8n_pipeline_veri1_error", company=company, error=str(e))
+
+            # ── Step 3: Searcher (find gaps) ──
+            searcher_thread = str(uuid.uuid4())
+            _log_queues[searcher_thread] = _PipelineQueue(searcher_thread)
+            _active_runs[searcher_thread] = {
+                "agent": "searcher", "status": "running",
+                "thread_id": searcher_thread,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "auto_triggered_by": "veri",
+            }
+            try:
+                logger.info("n8n_pipeline_searcher_start", company=company)
+                searcher_req = SearcherRunRequest(
+                    companies=company,
+                    auto_approve=True,
+                    auto_trigger_veri=False,
+                )
+                await _searcher_task(searcher_thread, searcher_req, auto_trigger_veri=False)
+                logger.info("n8n_pipeline_searcher_done", company=company)
+            except Exception as e:
+                logger.error("n8n_pipeline_searcher_error", company=company, error=str(e))
+
+            # ── Step 4: Veri R2 (verify searcher contacts) ──
+            veri2_thread = str(uuid.uuid4())
+            _log_queues[veri2_thread] = _PipelineQueue(veri2_thread)
+            _active_runs[veri2_thread] = {
+                "agent": "veri", "status": "running",
+                "thread_id": veri2_thread,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "auto_triggered_by": "searcher",
+            }
+            try:
+                logger.info("n8n_pipeline_veri2_start", company=company)
+                await _veri_task(veri2_thread, company_filter=company)
+                logger.info("n8n_pipeline_veri2_done", company=company)
+            except Exception as e:
+                logger.error("n8n_pipeline_veri2_error", company=company, error=str(e))
+
+            logger.info("n8n_pipeline_company_done",
+                        company=company, num=company_num)
+
+        _n8n_chain_running = False
+        _n8n_chain_current_company = ""
+        logger.info("n8n_buffer_flush_done",
+                    companies=company_list, total=total_contacts)
 
 
 async def _n8n_buffer_reset_timer():
-    """Reset the 60s countdown. Called on every new n8n POST."""
+    """Reset the 5-min countdown. Called on every new n8n POST."""
     global _n8n_buffer_timer
 
-    # Cancel existing timer
     if _n8n_buffer_timer and not _n8n_buffer_timer.done():
         _n8n_buffer_timer.cancel()
 
-    # Start new 60s countdown
     async def _countdown():
         await asyncio.sleep(_N8N_BUFFER_TIMEOUT)
         async with _n8n_buffer_lock:
@@ -691,95 +752,92 @@ def create_app() -> FastAPI:
             await _log_n8n_contact(sheets, timestamp, {}, {}, "error", "No contacts found in request")
             raise HTTPException(status_code=400, detail="No contacts found in request")
 
-        # Step 1: Normalize and write contacts to First Clean List
-        # Log EVERY contact to webhook log — written or skipped
+        # Step 1: Normalize contacts and buffer IN MEMORY (don't write to sheet yet)
+        # Sheet writes happen during flush — one company at a time
         companies_seen: set[str] = set()
-        rows_written = 0
+        buffered_count = 0
         skipped = 0
         skip_reasons: list[str] = []
-        try:
-            await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
-            for raw in raw_contacts:
-                if not isinstance(raw, dict):
-                    skipped += 1
-                    skip_reasons.append(f"Not a dict: {str(raw)[:80]}")
-                    asyncio.create_task(_log_n8n_contact(sheets, timestamp, {"_raw": str(raw)[:200]},
-                                           {}, "skipped", "Not a valid contact object"))
-                    continue
-                c = _normalize_contact(raw)
+        for raw in raw_contacts:
+            if not isinstance(raw, dict):
+                skipped += 1
+                skip_reasons.append(f"Not a dict: {str(raw)[:80]}")
+                asyncio.create_task(_log_n8n_contact(sheets, timestamp, {"_raw": str(raw)[:200]},
+                                       {}, "skipped", "Not a valid contact object"))
+                continue
+            c = _normalize_contact(raw)
 
-                # Skip contacts with no name
-                if not c["first_name"] and not c["last_name"]:
-                    skipped += 1
-                    company_hint = c["company_name"] or "(no company)"
-                    reason = f"No first/last name — keys: {list(raw.keys())[:6]}"
-                    skip_reasons.append(f"{company_hint}: {reason}")
-                    asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "skipped", reason))
-                    continue
+            # Skip contacts with no name
+            if not c["first_name"] and not c["last_name"]:
+                skipped += 1
+                company_hint = c["company_name"] or "(no company)"
+                reason = f"No first/last name — keys: {list(raw.keys())[:6]}"
+                skip_reasons.append(f"{company_hint}: {reason}")
+                asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "skipped", reason))
+                continue
 
-                row = [
-                    c["company_name"],                    # A
-                    c["normalized_name"],                 # B
-                    c["domain"],                          # C
-                    c["account_type"],                    # D
-                    c["account_size"],                    # E
-                    c["country"],                         # F
-                    c["first_name"],                      # G
-                    c["last_name"],                       # H
-                    c["job_title"],                       # I
-                    c["buying_role"],                     # J
-                    c["linkedin_url"],                    # K
-                    c["email"],                           # L
-                    c["phone_1"],                         # M
-                    c["phone_2"],                         # N
-                    "n8n",                                # O (Source)
-                    "",                                   # P (Pipeline Status)
-                ]
-                await sheets.append_row(sheets.FIRST_CLEAN_LIST, row)
-                rows_written += 1
-                if c["company_name"]:
-                    companies_seen.add(c["company_name"])
-                # Log the written contact (fire-and-forget — don't slow down response)
-                asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "written", ""))
-            logger.info("n8n_contacts_written", count=rows_written, skipped=skipped,
-                        companies=list(companies_seen))
-        except Exception as e:
-            logger.error("n8n_contacts_write_error", error=str(e))
-            raise HTTPException(status_code=500, detail=f"Failed to write contacts to sheet: {e}")
+            row = [
+                c["company_name"],                    # A
+                c["normalized_name"],                 # B
+                c["domain"],                          # C
+                c["account_type"],                    # D
+                c["account_size"],                    # E
+                c["country"],                         # F
+                c["first_name"],                      # G
+                c["last_name"],                       # H
+                c["job_title"],                       # I
+                c["buying_role"],                     # J
+                c["linkedin_url"],                    # K
+                c["email"],                           # L
+                c["phone_1"],                         # M
+                c["phone_2"],                         # N
+                "n8n",                                # O (Source)
+                "",                                   # P (Pipeline Status)
+            ]
 
-        # Step 2: Buffer companies — DON'T trigger chain yet.
-        # n8n sends contacts in drip-feed batches. We collect everything and
-        # flush after 60s of silence → ONE clean sequential pipeline run.
-        global _n8n_buffer_contact_count
-        if rows_written > 0:
+            # Buffer by company name — written to sheet during flush
+            company_key = c["company_name"] or "(unknown)"
             async with _n8n_buffer_lock:
-                _n8n_buffer_companies.update(companies_seen)
-                _n8n_buffer_contact_count += rows_written
-                await _n8n_buffer_reset_timer()
-                buffer_status = (
-                    f"Buffered. {len(_n8n_buffer_companies)} companies, "
-                    f"{_n8n_buffer_contact_count} contacts total. "
-                    f"Chain starts after {_N8N_BUFFER_TIMEOUT}s silence."
-                )
-            logger.info("n8n_contacts_buffered",
-                        new_contacts=rows_written, new_companies=list(companies_seen),
-                        buffer_companies=sorted(_n8n_buffer_companies),
-                        buffer_total=_n8n_buffer_contact_count)
-        else:
-            buffer_status = "No contacts written — nothing buffered"
-            logger.info("n8n_contacts_no_buffer", reason="0 rows written", skipped=skipped)
+                if company_key not in _n8n_buffer_contacts:
+                    _n8n_buffer_contacts[company_key] = []
+                _n8n_buffer_contacts[company_key].append((row, raw, c))
+            buffered_count += 1
+            if c["company_name"]:
+                companies_seen.add(c["company_name"])
+            # Log to webhook log (fire-and-forget)
+            asyncio.create_task(_log_n8n_contact(sheets, timestamp, raw, c, "buffered", ""))
 
-        # Store last received data for debugging
+        # Reset the 5-min timer
+        if buffered_count > 0:
+            async with _n8n_buffer_lock:
+                await _n8n_buffer_reset_timer()
+            total_buffered = sum(len(rows) for rows in _n8n_buffer_contacts.values())
+            buffer_companies = sorted(_n8n_buffer_contacts.keys())
+            buffer_status = (
+                f"Buffered. {len(buffer_companies)} companies, "
+                f"{total_buffered} contacts total. "
+                f"Chain starts after {_N8N_BUFFER_TIMEOUT}s silence."
+            )
+            logger.info("n8n_contacts_buffered",
+                        new=buffered_count, companies=list(companies_seen),
+                        buffer_companies=buffer_companies, buffer_total=total_buffered)
+        else:
+            buffer_status = "No contacts buffered"
+            logger.info("n8n_contacts_no_buffer", skipped=skipped)
+
+        # Store debug data
+        total_buffered = sum(len(rows) for rows in _n8n_buffer_contacts.values())
         _n8n_last_received.clear()
         _n8n_last_received.update({
             "received_at": timestamp,
             "raw_contacts_count": len(raw_contacts),
-            "rows_written": rows_written,
+            "buffered": buffered_count,
             "skipped": skipped,
             "skip_reasons": skip_reasons,
             "companies": list(companies_seen),
-            "buffer_companies": sorted(_n8n_buffer_companies),
-            "buffer_total_contacts": _n8n_buffer_contact_count,
+            "buffer_companies": sorted(_n8n_buffer_contacts.keys()),
+            "buffer_total_contacts": total_buffered,
+            "buffer_per_company": {k: len(v) for k, v in _n8n_buffer_contacts.items()},
             "buffer_timeout_secs": _N8N_BUFFER_TIMEOUT,
             "sample_raw": raw_contacts[0] if raw_contacts else {},
             "sample_normalized": _normalize_contact(raw_contacts[0]) if raw_contacts else {},
@@ -789,8 +847,8 @@ def create_app() -> FastAPI:
 
         return RunResponse(
             thread_id="buffered",
-            status="buffered" if rows_written > 0 else "empty",
-            message=f"Received {rows_written} contacts for {len(companies_seen)} companies. "
+            status="buffered" if buffered_count > 0 else "empty",
+            message=f"Received {buffered_count} contacts for {len(companies_seen)} companies. "
                     f"{buffer_status}{skip_msg}",
         )
 
@@ -798,11 +856,10 @@ def create_app() -> FastAPI:
     async def n8n_flush():
         """Manually flush the n8n buffer — triggers the chain immediately."""
         async with _n8n_buffer_lock:
-            companies = sorted(_n8n_buffer_companies)
-            contacts = _n8n_buffer_contact_count
+            companies = sorted(_n8n_buffer_contacts.keys())
+            contacts = sum(len(v) for v in _n8n_buffer_contacts.values())
             if not companies:
                 return {"status": "empty", "message": "Buffer is empty — nothing to flush"}
-            # Cancel the timer and flush now
             if _n8n_buffer_timer and not _n8n_buffer_timer.done():
                 _n8n_buffer_timer.cancel()
             await _n8n_buffer_flush()
@@ -815,11 +872,13 @@ def create_app() -> FastAPI:
     async def n8n_buffer_status():
         """Check the current buffer state — what's waiting to be processed."""
         return {
-            "companies": sorted(_n8n_buffer_companies),
-            "total_contacts": _n8n_buffer_contact_count,
+            "companies": sorted(_n8n_buffer_contacts.keys()),
+            "total_contacts": sum(len(v) for v in _n8n_buffer_contacts.values()),
+            "per_company": {k: len(v) for k, v in _n8n_buffer_contacts.items()},
             "timeout_secs": _N8N_BUFFER_TIMEOUT,
             "timer_active": _n8n_buffer_timer is not None and not _n8n_buffer_timer.done(),
             "chain_running": _n8n_chain_running,
+            "chain_current_company": _n8n_chain_current_company,
         }
 
     @app.get("/api/n8n/debug")
@@ -1672,10 +1731,15 @@ async def _veri_task(thread_id: str, row_start: int = None, row_end: int = None,
         print(f"[VERI CHAIN] triggered_by='{triggered_by}', verified={state.verified_count}, "
               f"contacts={len(state.contacts)}, companies={_companies_in_run}", flush=True)
 
-        # Trigger Searcher UNLESS this Veri was triggered by Searcher (prevents infinite loop)
+        # Trigger Searcher UNLESS:
+        # - triggered by Searcher (Veri R2 — prevents infinite loop)
+        # - triggered by n8n_buffer (flush handles Searcher explicitly)
         if triggered_by == "searcher":
             print("[VERI CHAIN] Veri round 2 done — chain complete, NOT triggering Searcher", flush=True)
             await _emit_log(thread_id, "info", "Veri round 2 complete — chain finished")
+        elif triggered_by == "n8n_buffer":
+            print("[VERI CHAIN] Veri triggered by n8n_buffer — flush handles Searcher, NOT auto-triggering", flush=True)
+            await _emit_log(thread_id, "info", "Veri R1 complete — flush will handle Searcher")
         elif _companies_in_run:
             # ── SEQUENTIAL COMPANY PROCESSING ──
             # Process ONE company at a time: Searcher(A) → Veri(A) → Searcher(B) → Veri(B) → ...
