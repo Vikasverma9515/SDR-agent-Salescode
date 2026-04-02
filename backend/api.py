@@ -279,7 +279,7 @@ _n8n_pipeline_companies: list[str] = []  # all companies in current pipeline run
 
 async def _n8n_buffer_flush():
     """Flush: for each company, write to sheet → Veri → Searcher → Veri R2."""
-    global _n8n_buffer_contacts, _n8n_buffer_timer, _n8n_chain_running, _n8n_chain_current_company
+    global _n8n_buffer_contacts, _n8n_buffer_timer, _n8n_chain_running, _n8n_chain_current_company, _n8n_chain_current_step, _n8n_pipeline_results, _n8n_pipeline_companies
 
     # Deep-copy snapshot and clear buffer atomically
     buffered: dict[str, list] = {}
@@ -355,10 +355,11 @@ async def _n8n_buffer_flush():
                                 company=company, num=company_num, contacts=len(contact_rows))
 
                     # ── Step 1: Write this company's contacts to sheet ──
+                    # NOTE: closures use default args to capture loop variables by VALUE
                     _n8n_chain_current_step = "sheet_write"
-                    async def _do_sheet_write():
+                    async def _do_sheet_write(_rows=contact_rows):
                         await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
-                        for row_data, _raw, _norm in contact_rows:
+                        for row_data, _raw, _norm in _rows:
                             await sheets.append_row(sheets.FIRST_CLEAN_LIST, row_data)
                     if not await _run_with_retry("sheet_write", _do_sheet_write, company_result):
                         company_result["status"] = "failed_sheet"
@@ -366,36 +367,36 @@ async def _n8n_buffer_flush():
 
                     # ── Step 2: Veri R1 (verify n8n contacts) ──
                     _n8n_chain_current_step = "veri_r1"
-                    async def _do_veri1():
+                    async def _do_veri1(_co=company):
                         t = str(uuid.uuid4())
                         _log_queues[t] = _PipelineQueue(t)
                         _active_runs[t] = {"agent": "veri", "status": "running", "thread_id": t,
                                            "started_at": datetime.now(timezone.utc).isoformat(),
                                            "auto_triggered_by": "n8n_buffer"}
-                        await _veri_task(t, company_filter=company)
+                        await _veri_task(t, company_filter=_co)
                     await _run_with_retry("veri_r1", _do_veri1, company_result)
 
                     # ── Step 3: Searcher (find gaps) ──
                     _n8n_chain_current_step = "searcher"
-                    async def _do_searcher():
+                    async def _do_searcher(_co=company):
                         t = str(uuid.uuid4())
                         _log_queues[t] = _PipelineQueue(t)
                         _active_runs[t] = {"agent": "searcher", "status": "running", "thread_id": t,
                                            "started_at": datetime.now(timezone.utc).isoformat(),
                                            "auto_triggered_by": "veri"}
-                        req = SearcherRunRequest(companies=company, auto_approve=True, auto_trigger_veri=False)
+                        req = SearcherRunRequest(companies=_co, auto_approve=True, auto_trigger_veri=False)
                         await _searcher_task(t, req, auto_trigger_veri=False)
                     await _run_with_retry("searcher", _do_searcher, company_result)
 
                     # ── Step 4: Veri R2 (verify searcher contacts) ──
                     _n8n_chain_current_step = "veri_r2"
-                    async def _do_veri2():
+                    async def _do_veri2(_co=company):
                         t = str(uuid.uuid4())
                         _log_queues[t] = _PipelineQueue(t)
                         _active_runs[t] = {"agent": "veri", "status": "running", "thread_id": t,
                                            "started_at": datetime.now(timezone.utc).isoformat(),
                                            "auto_triggered_by": "searcher"}
-                        await _veri_task(t, company_filter=company)
+                        await _veri_task(t, company_filter=_co)
                     await _run_with_retry("veri_r2", _do_veri2, company_result)
 
                     company_result["status"] = "done"
@@ -419,6 +420,7 @@ async def _n8n_buffer_flush():
         finally:
             _n8n_chain_running = False
             _n8n_chain_current_company = ""
+            _n8n_chain_current_step = ""
 
             # Log final summary
             done = [r["company"] for r in _n8n_pipeline_results if r["status"] == "done"]
