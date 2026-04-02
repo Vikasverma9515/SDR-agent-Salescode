@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import traceback as _tb
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -277,6 +278,31 @@ _n8n_pipeline_results: list[dict] = []  # per-company results (live, updated dur
 _n8n_pipeline_companies: list[str] = []  # all companies in current pipeline run
 
 
+_MAX_STEP_RETRIES = 2  # retry each pipeline step up to 2 times on failure
+
+async def _run_with_retry(step_name: str, func, company_result: dict) -> bool:
+    """Run a pipeline step with retry. Updates company_result live."""
+    for attempt in range(_MAX_STEP_RETRIES + 1):
+        try:
+            company_result["steps"][step_name] = "running" if attempt == 0 else f"retry {attempt}"
+            await func()
+            company_result["steps"][step_name] = "✅"
+            return True
+        except Exception as e:
+            if attempt < _MAX_STEP_RETRIES:
+                logger.warning(f"n8n_pipeline_{step_name}_retry",
+                               company=company_result["company"],
+                               attempt=attempt + 1, error=str(e))
+                await asyncio.sleep(5)
+            else:
+                company_result["steps"][step_name] = f"❌ {e}"
+                logger.error(f"n8n_pipeline_{step_name}_failed",
+                             company=company_result["company"],
+                             error=str(e), traceback=_tb.format_exc())
+                return False
+    return False
+
+
 async def _n8n_buffer_flush():
     """Flush: for each company, write to sheet → Veri → Searcher → Veri R2."""
     global _n8n_buffer_contacts, _n8n_buffer_timer, _n8n_chain_running, _n8n_chain_current_company, _n8n_chain_current_step, _n8n_pipeline_results, _n8n_pipeline_companies
@@ -302,30 +328,6 @@ async def _n8n_buffer_flush():
                     companies=company_list, total_contacts=total_contacts)
 
         from backend.tools import sheets
-        import traceback as _tb
-
-        MAX_RETRIES = 2  # retry each step up to 2 times on failure
-
-        async def _run_with_retry(step_name: str, func, company_result: dict):
-            """Run a pipeline step with retry. Updates company_result live."""
-            for attempt in range(MAX_RETRIES + 1):
-                try:
-                    company_result["steps"][step_name] = "running" if attempt == 0 else f"retry {attempt}"
-                    await func()
-                    company_result["steps"][step_name] = "✅"
-                    return True
-                except Exception as e:
-                    if attempt < MAX_RETRIES:
-                        logger.warning(f"n8n_pipeline_{step_name}_retry",
-                                       company=company_result["company"],
-                                       attempt=attempt + 1, error=str(e))
-                        await asyncio.sleep(5)  # brief pause before retry
-                    else:
-                        company_result["steps"][step_name] = f"❌ {e}"
-                        logger.error(f"n8n_pipeline_{step_name}_failed",
-                                     company=company_result["company"],
-                                     error=str(e), traceback=_tb.format_exc())
-                        return False
 
         # Track results for every company — updated LIVE so frontend can poll
         _n8n_pipeline_results.clear()
@@ -354,13 +356,12 @@ async def _n8n_buffer_flush():
                     logger.info("n8n_pipeline_company_start",
                                 company=company, num=company_num, contacts=len(contact_rows))
 
-                    # ── Step 1: Write this company's contacts to sheet ──
-                    # NOTE: closures use default args to capture loop variables by VALUE
+                    # ── Step 1: Write this company's contacts to sheet (BATCH — 1 API call) ──
                     _n8n_chain_current_step = "sheet_write"
                     async def _do_sheet_write(_rows=contact_rows):
                         await sheets.ensure_headers(sheets.FIRST_CLEAN_LIST, sheets.FIRST_CLEAN_LIST_HEADERS)
-                        for row_data, _raw, _norm in _rows:
-                            await sheets.append_row(sheets.FIRST_CLEAN_LIST, row_data)
+                        batch = [row_data for row_data, _raw, _norm in _rows]
+                        await sheets.append_rows_batch(sheets.FIRST_CLEAN_LIST, batch)
                     if not await _run_with_retry("sheet_write", _do_sheet_write, company_result):
                         company_result["status"] = "failed_sheet"
                         continue  # can't proceed without sheet write
@@ -410,6 +411,10 @@ async def _n8n_buffer_flush():
                     logger.error("n8n_pipeline_company_crashed", company=company,
                                  error=str(e), traceback=_tb.format_exc())
                     # DO NOT break — continue to next company
+
+                # Brief pause between companies to let Google Sheets API recover
+                if i < len(company_list) - 1:
+                    await asyncio.sleep(5)
 
         except Exception as e:
             # Catch-all for the entire loop — should never happen but just in case
@@ -947,6 +952,102 @@ def create_app() -> FastAPI:
             "timer_active": _n8n_buffer_timer is not None and not _n8n_buffer_timer.done(),
             "chain_running": _n8n_chain_running,
             "chain_current_company": _n8n_chain_current_company,
+        }
+
+    @app.post("/api/n8n/retry")
+    async def n8n_retry_failed():
+        """Retry all failed companies from the last pipeline run."""
+        if _n8n_chain_running:
+            return {"status": "error", "message": "Pipeline is already running. Wait for it to finish."}
+
+        # Find failed companies that have contacts still in the sheet
+        failed = [r for r in _n8n_pipeline_results
+                  if r["status"] not in ("done", "pending")]
+        if not failed:
+            return {"status": "empty", "message": "No failed companies to retry."}
+
+        failed_companies = [r["company"] for r in failed]
+
+        # For companies that failed at sheet_write, we need their contact data.
+        # But the buffer is already cleared. So we run Veri directly on existing sheet data.
+        # For companies that wrote to sheet but failed Veri/Searcher, re-run from where they failed.
+
+        async def _retry_chain():
+            global _n8n_chain_running, _n8n_chain_current_company, _n8n_chain_current_step
+
+            async with _n8n_chain_lock:
+                _n8n_chain_running = True
+
+                for i, company_result in enumerate([r for r in _n8n_pipeline_results
+                                                     if r["status"] not in ("done", "pending")]):
+                    company = company_result["company"]
+                    _n8n_chain_current_company = company
+                    company_result["status"] = "retrying"
+                    logger.info("n8n_pipeline_retry", company=company)
+
+                    try:
+                        # If sheet_write failed, the contacts aren't in the sheet.
+                        # Skip to companies that at least got written.
+                        if company_result["steps"].get("sheet_write", "").startswith("❌"):
+                            company_result["status"] = "failed_sheet"
+                            logger.warning("n8n_retry_skip_no_sheet_data", company=company)
+                            continue
+
+                        # Re-run from first failed step
+                        steps = company_result["steps"]
+
+                        if steps.get("veri_r1", "").startswith("❌") or steps.get("veri_r1") == "pending":
+                            _n8n_chain_current_step = "veri_r1"
+                            async def _r_veri1(_co=company):
+                                t = str(uuid.uuid4())
+                                _log_queues[t] = _PipelineQueue(t)
+                                _active_runs[t] = {"agent": "veri", "status": "running", "thread_id": t,
+                                                   "started_at": datetime.now(timezone.utc).isoformat(),
+                                                   "auto_triggered_by": "n8n_buffer"}
+                                await _veri_task(t, company_filter=_co)
+                            await _run_with_retry("veri_r1", _r_veri1, company_result)
+
+                        if steps.get("searcher", "").startswith("❌") or steps.get("searcher") == "pending":
+                            _n8n_chain_current_step = "searcher"
+                            async def _r_searcher(_co=company):
+                                t = str(uuid.uuid4())
+                                _log_queues[t] = _PipelineQueue(t)
+                                _active_runs[t] = {"agent": "searcher", "status": "running", "thread_id": t,
+                                                   "started_at": datetime.now(timezone.utc).isoformat(),
+                                                   "auto_triggered_by": "veri"}
+                                req = SearcherRunRequest(companies=_co, auto_approve=True, auto_trigger_veri=False)
+                                await _searcher_task(t, req, auto_trigger_veri=False)
+                            await _run_with_retry("searcher", _r_searcher, company_result)
+
+                        if steps.get("veri_r2", "").startswith("❌") or steps.get("veri_r2") == "pending":
+                            _n8n_chain_current_step = "veri_r2"
+                            async def _r_veri2(_co=company):
+                                t = str(uuid.uuid4())
+                                _log_queues[t] = _PipelineQueue(t)
+                                _active_runs[t] = {"agent": "veri", "status": "running", "thread_id": t,
+                                                   "started_at": datetime.now(timezone.utc).isoformat(),
+                                                   "auto_triggered_by": "searcher"}
+                                await _veri_task(t, company_filter=_co)
+                            await _run_with_retry("veri_r2", _r_veri2, company_result)
+
+                        company_result["status"] = "done"
+
+                    except Exception as e:
+                        company_result["status"] = f"retry_failed: {e}"
+                        logger.error("n8n_retry_company_error", company=company,
+                                     error=str(e), traceback=_tb.format_exc())
+
+                    if i < len(failed) - 1:
+                        await asyncio.sleep(5)
+
+                _n8n_chain_running = False
+                _n8n_chain_current_company = ""
+                _n8n_chain_current_step = ""
+
+        asyncio.create_task(_retry_chain())
+        return {
+            "status": "retrying",
+            "message": f"Retrying {len(failed_companies)} failed companies: {', '.join(failed_companies)}",
         }
 
     @app.get("/api/n8n/pipeline")

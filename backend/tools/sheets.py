@@ -114,6 +114,45 @@ async def append_row(tab_name: str, values: list[Any], retry_count: int = 3) -> 
     raise RuntimeError(f"Failed to append row to {tab_name} after {retry_count} attempts")
 
 
+async def append_rows_batch(tab_name: str, rows: list[list[Any]], retry_count: int = 3) -> int:
+    """
+    Append multiple rows in ONE API call. Much faster and avoids rate limits.
+    Returns the 1-based row number of the first written row.
+    """
+    if not rows:
+        return 0
+    for attempt in range(retry_count):
+        try:
+            sheet = _get_sheet(tab_name)
+            all_vals = await _run_sync(sheet.get_all_values)
+            next_row = len(all_vals) + 1
+
+            range_notation = f"A{next_row}"
+            await _run_sync(
+                sheet.update,
+                range_notation,
+                rows,
+                value_input_option="USER_ENTERED",
+            )
+            logger.info(
+                "sheet_rows_batch_appended",
+                tab=tab_name,
+                start_row=next_row,
+                count=len(rows),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+            return next_row
+        except gspread.exceptions.APIError as e:
+            if attempt == retry_count - 1:
+                raise
+            wait = 2 ** (attempt + 1) + 5  # longer wait for batch (rate limit recovery)
+            logger.warning("sheet_batch_retry", tab=tab_name, attempt=attempt,
+                           wait=wait, rows=len(rows), error=str(e))
+            await asyncio.sleep(wait)
+
+    raise RuntimeError(f"Failed to batch append {len(rows)} rows to {tab_name}")
+
+
 async def read_all_rows(tab_name: str) -> list[list[Any]]:
     """Read all rows from a sheet tab. Returns list of lists (excludes header)."""
     for attempt in range(3):

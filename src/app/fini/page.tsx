@@ -633,7 +633,21 @@ function PipelineTracker() {
       <div className="flex items-center gap-2 mb-3">
         <span className="text-[9px] font-bold text-white/50 uppercase tracking-[0.35em]">Pipeline Tracker</span>
         {data.running && <span className="text-[8px] text-blue-400 animate-pulse font-mono">RUNNING</span>}
-        {!data.running && data.results.length > 0 && <span className="text-[8px] text-emerald-400 font-mono">DONE</span>}
+        {!data.running && data.results.length > 0 && !data.results.some(r => r.status !== 'done' && r.status !== 'pending') && (
+          <span className="text-[8px] text-emerald-400 font-mono">DONE</span>
+        )}
+        {!data.running && data.results.some(r => r.status !== 'done' && r.status !== 'pending') && (
+          <button
+            onClick={async () => {
+              try {
+                await fetch(apiUrl('/api/n8n/retry'), { method: 'POST' });
+              } catch {}
+            }}
+            className="px-3 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 text-[9px] font-bold text-red-400 uppercase tracking-wider transition-all"
+          >
+            Retry Failed
+          </button>
+        )}
         <div className="flex-1 h-[1px] bg-white/[0.06]" />
         {data.buffer.companies.length > 0 && (
           <span className="text-[8px] text-amber-400 font-mono">
