@@ -159,11 +159,30 @@ def _extract_alternates(name: str) -> list[str]:
     return [v for v in variants if v]
 
 
+# Words that indicate a DIFFERENT business entity when added to a company name.
+# "Marico" ≠ "Marico Investments", "Godrej" ≠ "Godrej Properties"
+# But "Dabur" = "Dabur India" (geographic), "Nestle" = "Nestle Limited" (legal)
+_DIFFERENT_ENTITY_WORDS = {
+    'investments', 'properties', 'infotech', 'infosys', 'waters', 'products',
+    'pharma', 'pharmaceuticals', 'chemicals', 'cement', 'steel', 'power',
+    'energy', 'realty', 'real estate', 'telecom', 'media', 'entertainment',
+    'insurance', 'finance', 'financial', 'bank', 'banking', 'capital',
+    'ventures', 'partners', 'consulting', 'advisory', 'logistics',
+    'aviation', 'airlines', 'motors', 'auto', 'automobiles',
+    'chicken', 'meat', 'dairy', 'beverages', 'brewery',
+    'construction', 'infrastructure', 'housing', 'developers',
+    'technology', 'technologies', 'software', 'digital', 'tech',
+}
+
+
 def _company_matches(found: str, target: str) -> bool:
     """
     Fuzzy check: does the found company name match the target?
     Handles parenthetical alternate names, e.g. "Surya Food & Agro Ltd. (Priyagold)".
     Matches if found matches ANY of the extracted name variants.
+
+    IMPORTANT: Rejects matches where the extra words indicate a different business.
+    "Marico" matches "Marico India Limited" but NOT "Marico Investments (Pty) Ltd".
     """
     def _matches_single(f_raw: str, t_raw: str) -> bool:
         f = _ascii_lower(f_raw)
@@ -186,6 +205,12 @@ def _company_matches(found: str, target: str) -> bool:
         if not (f_is_single and t_is_single):
             shorter_c, longer_c = (f_core, t_core) if len(f_core) <= len(t_core) else (t_core, f_core)
             if shorter_c in longer_c:
+                # Check if the EXTRA words are business descriptors → different entity
+                extra = longer_c.replace(shorter_c, '', 1).strip()
+                extra_words = set(extra.split())
+                if extra_words & _DIFFERENT_ENTITY_WORDS:
+                    # "Marico Investments" has "investments" → DIFFERENT company
+                    return False
                 return True
         f_words = set(re.sub(r'[^a-z0-9]', ' ', f_core).split())
         t_words = set(re.sub(r'[^a-z0-9]', ' ', t_core).split())
