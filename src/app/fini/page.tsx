@@ -228,6 +228,8 @@ function ReviewCardItem({
   index,
   submitN8n,
   onSend,
+  onSendN8n,
+  onSendBoth,
   onSkip,
   onFieldChange,
   onReenrich,
@@ -236,6 +238,8 @@ function ReviewCardItem({
   index: number;
   submitN8n: boolean;
   onSend: (index: number) => void;
+  onSendN8n: (index: number) => void;
+  onSendBoth: (index: number) => void;
   onSkip: (index: number) => void;
   onFieldChange: (index: number, field: keyof ReviewCard, value: string) => void;
   onReenrich: (index: number, newName: string) => void;
@@ -435,29 +439,68 @@ function ReviewCardItem({
 
         {/* Actions */}
         {!isDone && (
-          <div className="flex gap-2 pt-1">
-            <button
-              id={`fini-send-${index}`}
-              onClick={() => onSend(index)}
-              disabled={isSending || isReenriching}
-              className="flex-1 py-2.5 rounded-xl bg-white hover:bg-white/90 disabled:bg-white/10 text-black disabled:text-white/55 text-[11px] font-bold uppercase tracking-wider transition-all duration-200 flex items-center justify-center gap-1.5"
-            >
-              {isSending ? (
-                <><div className="w-3 h-3 border-2 border-black/20 border-t-black rounded-full animate-spin" /><span>Sending…</span></>
-              ) : isReenriching ? (
-                <><div className="w-3 h-3 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" /><span>Re-searching…</span></>
-              ) : (
-                <><span>↑</span><span>Send to Sheet</span></>
-              )}
-            </button>
-            <button
-              id={`fini-skip-${index}`}
-              onClick={() => onSkip(index)}
-              disabled={isSending || isReenriching}
-              className="px-4 py-2.5 rounded-xl border border-white/[0.07] text-white/65 hover:text-white/60 hover:border-white/15 text-[11px] font-bold uppercase tracking-wider transition-all duration-200"
-            >
-              Skip
-            </button>
+          <div className="flex flex-col gap-2 pt-1">
+            {/* When n8n relay is ON: single "Send to Sheet" button (sends to both) */}
+            {submitN8n ? (
+              <div className="flex gap-2">
+                <button
+                  id={`fini-send-${index}`}
+                  onClick={() => onSend(index)}
+                  disabled={isSending || isReenriching}
+                  className="flex-1 py-2.5 rounded-xl bg-white hover:bg-white/90 disabled:bg-white/10 text-black disabled:text-white/55 text-[11px] font-bold uppercase tracking-wider transition-all duration-200 flex items-center justify-center gap-1.5"
+                >
+                  {isSending ? (
+                    <><div className="w-3 h-3 border-2 border-black/20 border-t-black rounded-full animate-spin" /><span>Sending…</span></>
+                  ) : isReenriching ? (
+                    <><div className="w-3 h-3 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" /><span>Re-searching…</span></>
+                  ) : (
+                    <><span>↑</span><span>Send to Sheet + n8n</span></>
+                  )}
+                </button>
+                <button
+                  id={`fini-skip-${index}`}
+                  onClick={() => onSkip(index)}
+                  disabled={isSending || isReenriching}
+                  className="px-4 py-2.5 rounded-xl border border-white/[0.07] text-white/65 hover:text-white/60 hover:border-white/15 text-[11px] font-bold uppercase tracking-wider transition-all duration-200"
+                >
+                  Skip
+                </button>
+              </div>
+            ) : (
+              /* When n8n relay is OFF: show 3 options */
+              <div className="flex gap-2">
+                <button
+                  id={`fini-send-${index}`}
+                  onClick={() => onSend(index)}
+                  disabled={isSending || isReenriching}
+                  className="flex-1 py-2.5 rounded-xl bg-white hover:bg-white/90 disabled:bg-white/10 text-black disabled:text-white/55 text-[10px] font-bold uppercase tracking-wider transition-all duration-200 flex items-center justify-center gap-1"
+                >
+                  {isSending ? (
+                    <><div className="w-3 h-3 border-2 border-black/20 border-t-black rounded-full animate-spin" /><span>Sending…</span></>
+                  ) : isReenriching ? (
+                    <><div className="w-3 h-3 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" /><span>Re-searching…</span></>
+                  ) : (
+                    <><span>↑</span><span>Sheet</span></>
+                  )}
+                </button>
+                <button
+                  id={`fini-send-n8n-${index}`}
+                  onClick={() => onSendBoth(index)}
+                  disabled={isSending || isReenriching}
+                  className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-white/10 text-white disabled:text-white/55 text-[10px] font-bold uppercase tracking-wider transition-all duration-200 flex items-center justify-center gap-1"
+                >
+                  <span>↑</span><span>Sheet + n8n</span>
+                </button>
+                <button
+                  id={`fini-skip-${index}`}
+                  onClick={() => onSkip(index)}
+                  disabled={isSending || isReenriching}
+                  className="px-3 py-2.5 rounded-xl border border-white/[0.07] text-white/65 hover:text-white/60 hover:border-white/15 text-[10px] font-bold uppercase tracking-wider transition-all duration-200"
+                >
+                  Skip
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -915,7 +958,8 @@ export default function FiniPage() {
     }
   };
 
-  const handleSend = async (index: number) => {
+  // Send to sheet only (no n8n)
+  const handleSend = async (index: number, forceN8n?: boolean) => {
     const card = reviewCards[index];
     setReviewCards(prev => prev.map((c, i) => i === index ? { ...c, status: 'sending' } : c));
 
@@ -932,7 +976,7 @@ export default function FiniPage() {
           email_format: card.editEmailFormat,
           account_type: card.editAccountType,
           account_size: card.editAccountSize,
-          submit_n8n: submitN8n,
+          submit_n8n: forceN8n ?? submitN8n,
         }),
       });
       if (!resp.ok) {
@@ -944,6 +988,12 @@ export default function FiniPage() {
       setReviewCards(prev => prev.map((c, i) => i === index ? { ...c, status: 'error', errorMsg: e.message } : c));
     }
   };
+
+  // Send to n8n only (also writes to sheet — sheet is always compulsory)
+  const handleSendN8n = async (index: number) => handleSend(index, true);
+
+  // Send to both sheet + n8n
+  const handleSendBoth = async (index: number) => handleSend(index, true);
 
   const handleSkip = (index: number) => {
     setReviewCards(prev => prev.map((c, i) => i === index ? { ...c, status: 'skipped' } : c));
@@ -1381,6 +1431,8 @@ export default function FiniPage() {
                   index={index}
                   submitN8n={submitN8n}
                   onSend={handleSend}
+                  onSendN8n={handleSendN8n}
+                  onSendBoth={handleSendBoth}
                   onSkip={handleSkip}
                   onFieldChange={handleFieldChange}
                   onReenrich={handleReenrich}
