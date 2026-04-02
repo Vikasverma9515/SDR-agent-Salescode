@@ -202,8 +202,6 @@ def _classify_role(role_title: str) -> str:
 
     return "Unknown"
 
-    return "Unknown"
-
 
 # ---------------------------------------------------------------------------
 # Node: load_gap_analysis
@@ -393,11 +391,16 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
         await _emit_log(state.thread_id,
             f"[{state.target_company}] LLM gap analysis failed ({e}), using keyword fallback",
             level="warning")
-        # Fallback to keyword matching
+        # Fallback to keyword matching — map _classify_role names to new tier names
+        _role_to_tier = {
+            "CEO/MD": "FDM", "CTO/CIO": "CTO/CIO", "CSO/Head of Sales": "KDM",
+            "P1 Influencer": "Key Influencer", "Gatekeeper": "Gatekeeper",
+        }
         for title in existing_role_titles:
             tier = _classify_role(title)
-            if tier in existing_tiers:
-                existing_tiers[tier].append(title)
+            mapped = _role_to_tier.get(tier, "")
+            if mapped in existing_tiers:
+                existing_tiers[mapped].append(title)
         for tier_def in MUST_HAVE_TIERS:
             if not existing_tiers.get(tier_def["tier"]):
                 missing_tiers.append(tier_def)

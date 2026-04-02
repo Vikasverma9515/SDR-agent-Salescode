@@ -8,7 +8,7 @@ Phase 1  Web intelligence    — DDG ×3 + Perplexity (structured role query) + 
                                Tavily fallback when DDG is inconclusive
 Phase 2  LinkedIn audit      — Unipile verify_profile (confirms identity, employment,
                                current title)
-Phase 3  LLM cross-reasoning — gpt-4.1-mini reads all evidence and produces
+Phase 3  LLM cross-reasoning — gpt-4.1 reads all evidence and produces
                                identity / employment / title_match verdicts +
                                a short explanation
 Phase 4  Verdict + routing   — deterministic rules on the three signals:
