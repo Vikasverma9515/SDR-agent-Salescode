@@ -129,7 +129,9 @@ async def _ask_gpt_for_domain(company_name: str) -> str | None:
         raw = await llm_web_search(
             f"What is the official corporate website domain for {company_name}? "
             f"Return ONLY the bare domain (e.g. dabur.com) — the primary HQ domain, "
-            f"not a subsidiary, product, shop, or regional domain. No explanation."
+            f"not a subsidiary, product, shop, or regional domain. "
+            f"Note: many tech/SaaS companies use .ai, .io, .co domains — check all variants. "
+            f"No explanation, just the domain."
         )
         content = raw.strip().lower() if raw else ""
         logger.info("gpt_domain_response", company=company_name, content=content)
