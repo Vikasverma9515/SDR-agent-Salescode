@@ -93,7 +93,7 @@ async def _openai_responses(prompt: str, model: str = "gpt-5",
         return content
 
 
-async def _openai_chat(prompt: str, model: str = "gpt-4.1-mini",
+async def _openai_chat(prompt: str, model: str = "gpt-4.1",
                        max_retries: int = 1, wait_secs: int = 10,
                        max_tokens: int = 200, temperature: float = 0) -> str:
     """Call OpenAI Chat Completions API. Retries on 429."""
@@ -240,7 +240,7 @@ async def llm_web_search(prompt: str, model: str = "gpt-5") -> str:
     return ""
 
 
-async def llm_complete(prompt: str, model: str = "gpt-4.1-mini",
+async def llm_complete(prompt: str, model: str = "gpt-4.1",
                        max_tokens: int = 200, temperature: float = 0) -> str:
     """
     Simple LLM text completion (no web search).

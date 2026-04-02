@@ -310,10 +310,44 @@ async def _verify_one(
                 "web", "linkedin_discovery", f"search error: {e}", "error")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Phase 1: Web intelligence — DDG ×3 + Perplexity (role extraction) + TheOrg
+    # Phase 1: Web intelligence — GPT-5 PRIMARY + DDG/Perplexity/TheOrg secondary
+    # GPT-5 does the real verification (like a human researcher), others supplement.
     # ─────────────────────────────────────────────────────────────────────────
     await emit_veri_contact(state.thread_id, contact.full_name, contact.company, "web")
 
+    # ── PRIMARY: GPT-5 deep web verification ──
+    async def _gpt5_web_verify():
+        """GPT-5 is the PRIMARY verifier — searches the web like a real analyst."""
+        try:
+            from backend.tools.llm import llm_web_search
+            result = await llm_web_search(
+                f"You are verifying a B2B sales contact. Search the web thoroughly.\n\n"
+                f"Person: {contact.full_name}\n"
+                f"Claimed company: {contact.company}\n"
+                f"Claimed domain: {contact.domain or 'unknown'}\n"
+                f"Claimed role: {contact.role_title or 'unknown'}\n"
+                f"LinkedIn: {contact.linkedin_url or 'none'}\n\n"
+                f"SEARCH THE WEB and answer:\n"
+                f"1. Does this person CURRENTLY work at {contact.company}? "
+                f"Check their LinkedIn profile, company website, news articles, press releases.\n"
+                f"2. What is their ACTUAL current job title and employer?\n"
+                f"3. Is the company domain '{contact.domain or '?'}' correct for {contact.company}?\n"
+                f"4. IMPORTANT: If there are MULTIPLE companies with similar names "
+                f"(e.g. 'Rajdhani Besan' vs 'Rajdhani chicken & food'), identify which one "
+                f"this person actually works at. Check the domain to distinguish.\n\n"
+                f"Reply in this format:\n"
+                f"EMPLOYED: YES or NO or UNCERTAIN\n"
+                f"ACTUAL_COMPANY: the company they actually work at\n"
+                f"ACTUAL_ROLE: their actual current title\n"
+                f"DOMAIN_MATCH: YES or NO (does the company domain match?)\n"
+                f"REASONING: 1-2 sentences explaining your findings",
+                model="gpt-5"
+            )
+            return result or ""
+        except Exception:
+            return ""
+
+    # ── SECONDARY: DDG + Perplexity + TheOrg (run in parallel with GPT-5) ──
     queries = [
         f'"{contact.full_name}" {contact.company}',
         f'"{contact.full_name}" {contact.role_title or ""} {contact.company}'.strip(),
@@ -333,7 +367,6 @@ async def _verify_one(
             return None
 
     async def _perplexity_search():
-        # Structured query to extract current role — much more targeted than generic search
         role_query = (
             f'What is {contact.full_name}\'s current job title and employer as of 2026? '
             f'Are they currently working at {contact.company}? '
@@ -344,7 +377,9 @@ async def _verify_one(
         except Exception:
             return []
 
-    ddg_result_sets, theorg_entry, perplexity_results = await asyncio.gather(
+    # All run in parallel — GPT-5 is primary, others are secondary signals
+    gpt5_verification, ddg_result_sets, theorg_entry, perplexity_results = await asyncio.gather(
+        _gpt5_web_verify(),
         asyncio.gather(*[_ddg_query(q) for q in queries]),
         _theorg_lookup(),
         _perplexity_search(),
@@ -407,6 +442,65 @@ async def _verify_one(
     else:
         await emit_veri_step(state.thread_id, contact.full_name, contact.company,
             "web", "perplexity", "no strong signals (inconclusive)", "info")
+
+    # ── Process GPT-5 PRIMARY verification ──
+    gpt5_employed = "UNCERTAIN"
+    gpt5_actual_company = ""
+    gpt5_actual_role = ""
+    gpt5_domain_match = True
+    gpt5_reasoning = ""
+
+    if gpt5_verification:
+        evidence["gpt5_web"] = gpt5_verification[:800]
+        for _line in gpt5_verification.strip().splitlines():
+            _line = _line.strip()
+            if _line.upper().startswith("EMPLOYED:"):
+                _val = _line.split(":", 1)[1].strip().upper()
+                if "YES" in _val:
+                    gpt5_employed = "YES"
+                elif "NO" in _val:
+                    gpt5_employed = "NO"
+                else:
+                    gpt5_employed = "UNCERTAIN"
+            elif _line.upper().startswith("ACTUAL_COMPANY:"):
+                gpt5_actual_company = _line.split(":", 1)[1].strip()
+            elif _line.upper().startswith("ACTUAL_ROLE:"):
+                gpt5_actual_role = _line.split(":", 1)[1].strip()
+            elif _line.upper().startswith("DOMAIN_MATCH:"):
+                gpt5_domain_match = "NO" not in _line.upper().split(":", 1)[1]
+            elif _line.upper().startswith("REASONING:"):
+                gpt5_reasoning = _line.split(":", 1)[1].strip()
+
+        evidence["gpt5_employed"] = gpt5_employed
+        evidence["gpt5_actual_company"] = gpt5_actual_company
+        evidence["gpt5_actual_role"] = gpt5_actual_role
+        evidence["gpt5_domain_match"] = gpt5_domain_match
+        evidence["gpt5_reasoning"] = gpt5_reasoning
+
+        if gpt5_employed == "YES" and gpt5_domain_match:
+            evidence["gpt5_positive"] = True
+            evidence["gpt5_stale"] = False
+            await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+                "web", "gpt5",
+                f"CONFIRMED at {contact.company}" + (f" as {gpt5_actual_role}" if gpt5_actual_role else ""),
+                "success")
+        elif gpt5_employed == "NO" or not gpt5_domain_match:
+            evidence["gpt5_positive"] = False
+            evidence["gpt5_stale"] = True
+            _detail = gpt5_reasoning or f"actually at {gpt5_actual_company}" if gpt5_actual_company else "not at target"
+            await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+                "web", "gpt5", f"NOT at {contact.company}: {_detail}", "error")
+        else:
+            evidence["gpt5_positive"] = False
+            evidence["gpt5_stale"] = False
+            await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+                "web", "gpt5", f"uncertain — {gpt5_reasoning or 'no clear signal'}", "info")
+    else:
+        evidence["gpt5_web"] = ""
+        evidence["gpt5_positive"] = False
+        evidence["gpt5_stale"] = False
+        evidence["gpt5_employed"] = "UNCERTAIN"
+        evidence["gpt5_reasoning"] = ""
 
     # Tavily fallback if DDG was inconclusive
     if not ddg_positive and not ddg_stale:
@@ -870,6 +964,10 @@ async def _llm_cross_reason(
         web_summary.append("Perplexity mentions 2025/2026")
     if evidence.get("theorg_found"):
         web_summary.append(f"TheOrg: {evidence.get('theorg_title','?')} at {contact.company}")
+    if evidence.get("gpt5_positive"):
+        web_summary.append("GPT-5 web search confirms presence")
+    if evidence.get("gpt5_stale"):
+        web_summary.append("GPT-5 web search: may NOT be at target company")
 
     li = audit
     li_summary = (
@@ -887,7 +985,8 @@ async def _llm_cross_reason(
         f"Domain: {contact.domain or 'unknown'}\n\n"
         f"LinkedIn audit: {li_summary}\n"
         f"Web signals: {'; '.join(web_summary) or 'none'}\n"
-        f"Perplexity snippet: {evidence.get('perplexity','')[:300]}\n\n"
+        f"Perplexity snippet: {evidence.get('perplexity','')[:300]}\n"
+        f"GPT-5 web verification: {evidence.get('gpt5_web','')[:300]}\n\n"
         f"IMPORTANT REASONING RULES:\n"
         f"1. COMPANY NAME MATCHING: Companies often have different names on LinkedIn vs their\n"
         f"   official name. Examples: 'FamPay' may appear as 'Fam' on LinkedIn; 'Red Bull España'\n"
@@ -1000,8 +1099,8 @@ async def _check_role_relevance(role_title: str, company: str) -> dict:
 
 def _check_all_fast(contact: Contact, audit: dict, evidence: dict) -> tuple[str, str, str]:
     """
-    Deterministic identity / employment / role_match from Unipile + web signals.
-    Used as fast path; LLM cross-reasoning upgrades uncertain cases.
+    Identity / employment / role_match from GPT-5 (primary) + Unipile + web signals.
+    GPT-5 verdict is the strongest signal — overrides LinkedIn when it disagrees.
     """
     li_valid = audit.get("valid", False)
     li_at_company = audit.get("at_target_company", False)
@@ -1009,9 +1108,15 @@ def _check_all_fast(contact: Contact, audit: dict, evidence: dict) -> tuple[str,
     li_current_company = audit.get("current_company") or ""
     li_current_role = audit.get("current_role") or ""
 
+    # GPT-5 is the PRIMARY signal
+    gpt5_employed = evidence.get("gpt5_employed", "UNCERTAIN")
+    gpt5_domain_match = evidence.get("gpt5_domain_match", True)
+
     # ── Identity ──
     if li_valid:
         identity = "CONFIRMED"
+    elif gpt5_employed in ("YES", "NO"):
+        identity = "CONFIRMED"  # GPT-5 found them — they exist
     elif evidence.get("theorg_found"):
         identity = "CONFIRMED"
     else:
@@ -1019,10 +1124,31 @@ def _check_all_fast(contact: Contact, audit: dict, evidence: dict) -> tuple[str,
             bool(evidence.get("ddg_positive")),
             bool(evidence.get("tavily_positive")),
             bool(evidence.get("perplexity_positive")),
+            bool(evidence.get("gpt5_positive")),
         ])
-        identity = "CONFIRMED" if positive_count >= 2 else "UNCONFIRMED"
+        identity = "CONFIRMED" if positive_count >= 1 else "UNCONFIRMED"
 
     # ── Employment ──
+    # GPT-5 is PRIMARY: if it says NO or domain doesn't match → REJECTED
+    # This catches cases like "Rajdhani chicken & food" ≠ "Rajdhani Besan"
+    if gpt5_employed == "NO" or (gpt5_employed != "UNCERTAIN" and not gpt5_domain_match):
+        return identity, "REJECTED", "UNKNOWN"
+
+    # GPT-5 says YES → trust it even if LinkedIn disagrees
+    if gpt5_employed == "YES" and gpt5_domain_match:
+        # Still check role match below, but employment is confirmed
+        role_match = "UNKNOWN"
+        sheet_title = contact.role_title or ""
+        gpt5_role = evidence.get("gpt5_actual_role", "")
+        if not sheet_title:
+            role_match = "UNKNOWN"
+        elif gpt5_role:
+            role_match = _compare_titles_fast(sheet_title, gpt5_role)
+        elif li_current_role:
+            role_match = _compare_titles_fast(sheet_title, li_current_role)
+        return identity, "CONFIRMED", role_match
+
+    # GPT-5 is uncertain — fall back to LinkedIn + other signals
     # Smart company matching: if Unipile's strict matcher said at_target=False,
     # do a soft check — the LinkedIn company might be a shortened name (Fam vs FamPay),
     # parent brand (Red Bull vs Red Bull España), or a rebranded name (Quintiles vs IQVIA).
@@ -1057,6 +1183,7 @@ def _check_all_fast(contact: Contact, audit: dict, evidence: dict) -> tuple[str,
                 bool(evidence.get("ddg_stale")),
                 bool(evidence.get("tavily_stale")),
                 bool(evidence.get("perplexity_stale")),
+                bool(evidence.get("gpt5_stale")),
             ])
             employment = "REJECTED" if stale_count >= 2 else "UNCERTAIN"
     else:
@@ -1064,6 +1191,7 @@ def _check_all_fast(contact: Contact, audit: dict, evidence: dict) -> tuple[str,
             bool(evidence.get("ddg_stale")),
             bool(evidence.get("tavily_stale")),
             bool(evidence.get("perplexity_stale")),
+            bool(evidence.get("gpt5_stale")),
         ])
         if stale_count >= 2:
             employment = "REJECTED"

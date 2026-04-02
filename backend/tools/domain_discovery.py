@@ -90,7 +90,7 @@ async def _llm_validate_domain(company_name: str, domain: str, context: dict | N
     )
 
     try:
-        raw = await llm_complete(prompt, model="gpt-4.1-mini", max_tokens=150, temperature=0)
+        raw = await llm_complete(prompt, model="gpt-4.1", max_tokens=150, temperature=0)
         cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', (raw or "").strip())
         import json as _json
         result = _json.loads(cleaned)

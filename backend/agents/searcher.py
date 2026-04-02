@@ -324,7 +324,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
     existing_tiers: dict[str, list[str]] = {"CEO/MD": [], "CTO/CIO": [], "CSO/Head of Sales": []}
 
     try:
-        raw = await llm_complete(gap_prompt, model="gpt-4.1-mini", max_tokens=300, temperature=0)
+        raw = await llm_complete(gap_prompt, model="gpt-4.1", max_tokens=300, temperature=0)
         import re as _re
         cleaned = _re.sub(r'^```(?:json)?\s*|\s*```$', '', (raw or "").strip())
         gap_result = _json.loads(cleaned)
