@@ -130,18 +130,43 @@ _GATEKEEPER_KEYWORDS = {
 }
 
 # Must-have roles — Searcher will specifically web-search for these if missing
+# All roles Salescode targets — Searcher must find these if n8n missed them.
+# 4 tiers: FDM (Final Decision Makers), KDM (Key Decision Makers),
+#          Key Influencers, Gatekeepers
 MUST_HAVE_TIERS = [
-    {"tier": "CEO/MD", "keywords": _CEO_MD_KEYWORDS, "search_queries": [
-        "CEO", "Co-Founder", "Founder", "Managing Director", "General Manager", "Country Manager",
+    {"tier": "FDM", "keywords": _CEO_MD_KEYWORDS, "search_queries": [
+        "CEO", "Co-Founder", "Founder", "Managing Director", "President",
+        "Vice President", "Executive Director", "COO", "EVP",
+        "Country Manager", "General Manager",
+    ]},
+    {"tier": "KDM", "keywords": _CSO_SALES_KEYWORDS, "search_queries": [
+        "Sales Director", "VP Sales", "CIO", "COO", "SVP Sales",
+        "IT Head", "Head of IT", "Head of Sales", "CRO",
     ]},
     {"tier": "CTO/CIO", "keywords": _CTO_CIO_KEYWORDS, "search_queries": [
-        "CTO", "CIO", "Head of Technology", "VP Engineering",
+        "CTO", "CIO", "Head of Technology", "IT Director",
+        "VP Engineering", "Chief Digital Officer",
     ]},
-    # NOTE: CMO, Head of Marketing, Commercial Director are EXCLUDED from search —
-    # they are classified as "Irrelevant" per the buying-role prompt.
-    # Only Sales leadership roles are searched here.
-    {"tier": "CSO/Head of Sales", "keywords": _CSO_SALES_KEYWORDS, "search_queries": [
-        "Head of Sales", "Sales Director", "CRO", "VP Sales",
+    {"tier": "Key Influencer", "keywords": _P1_INFLUENCER_KEYWORDS, "search_queries": [
+        "Sales Excellence Director", "Commercial Excellence Director",
+        "Field Sales Director", "Chief Digital Officer",
+        "Digital Transformation Head", "RTM Head", "GTM Head",
+        "Sales Operations Head", "Customer Development Head",
+        "Head of General Trade", "GM IT", "IT Director",
+        "Business Intelligence Head", "Analytics Director",
+        "Head of Digital Commerce", "eB2B Head",
+        "Head of Independents", "GTM Director", "RTM Director",
+        "VP Commerce", "VP Digital Commerce",
+        "Head of GenAI", "Head of AI", "AI Director",
+        "Head of Telesales",
+    ]},
+    {"tier": "Gatekeeper", "keywords": _GATEKEEPER_KEYWORDS, "search_queries": [
+        "Sales Automation Head", "Sales Effectiveness Manager",
+        "Sales Capability Manager", "SFA Manager",
+        "Trade Marketing Head", "RTM Manager", "GTM Manager",
+        "Customer Development Manager", "Analytics Manager",
+        "Business Intelligence Manager", "eB2B Manager",
+        "GenAI Manager", "AI ML Manager",
     ]},
 ]
 
@@ -300,28 +325,38 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
     contacts_summary = "\n".join(f"- {t}" for t in existing_role_titles) if existing_role_titles else "(no contacts found)"
 
     gap_prompt = (
-        f"You are a B2B sales intelligence analyst. Analyze the existing contacts for {state.target_company} "
-        f"and determine which of the 3 MUST-HAVE leadership tiers are covered vs missing.\n\n"
+        f"You are a B2B sales intelligence analyst for FMCG/CPG. Analyze the existing contacts "
+        f"for {state.target_company} and determine which role categories are covered vs missing.\n\n"
         f"EXISTING CONTACTS (job titles):\n{contacts_summary}\n\n"
-        f"MUST-HAVE TIERS:\n"
-        f"1. CEO/MD — CEO, Managing Director, President, Founder, General Manager, Country Manager, COO\n"
-        f"2. CTO/CIO — CTO, CIO, Chief Digital Officer, VP Technology, VP Engineering, Head of IT/Digital/Technology\n"
-        f"3. CSO/Head of Sales — CSO, CRO, VP Sales, Head of Sales, Sales Director, CMO, Head of Marketing, Commercial Director\n\n"
+        f"ROLE CATEGORIES TO CHECK:\n"
+        f"1. FDM (Final Decision Makers) — CEO, MD, President, VP, Executive Director, COO, EVP, "
+        f"Country Manager, General Manager, Founder, Co-Founder\n"
+        f"2. KDM (Key Decision Makers) — Sales Director, VP Sales, CIO, SVP Sales, IT Head, "
+        f"Head of IT, Head of Sales, CRO\n"
+        f"3. CTO/CIO — CTO, CIO, Chief Digital Officer, VP Technology, Head of IT/Digital/Technology\n"
+        f"4. Key Influencer — Sales Excellence Director, Commercial Excellence Director, "
+        f"Field Sales Director, CDO, Digital Transformation Head, RTM/GTM Head, "
+        f"Sales Operations Head, Customer Development Head, Head of General Trade, "
+        f"GM IT, IT Director, Analytics Director, BI Director, Head of Digital Commerce, "
+        f"eB2B Head, VP Commerce, VP Digital Commerce, Head of AI/GenAI, Head of Telesales\n"
+        f"5. Gatekeeper — Sales Automation Head, Sales Effectiveness Manager, "
+        f"SFA Manager, Trade Marketing Head, RTM/GTM Manager, Customer Development Manager, "
+        f"Analytics Manager, BI Manager, eB2B Manager, GenAI/AI Manager\n\n"
         f"RULES:\n"
-        f"- A title covers a tier ONLY if the person genuinely holds that level of responsibility\n"
-        f"- 'Director of Business Development' is NOT a CSO — it's mid-level\n"
-        f"- 'Associate Director of IT' is NOT a CTO — it's mid-level\n"
-        f"- 'VP, Managing Director' IS CEO/MD tier\n"
-        f"- 'CFO' is NOT any of these 3 tiers — it's finance\n"
-        f"- Be strict: only C-suite, VP-level, or Head-of-department count for the tier\n\n"
+        f"- A title covers a tier ONLY if the person genuinely holds that level\n"
+        f"- Be strict: 'Associate Director' is NOT the same as 'Director'\n"
+        f"- Different companies use different titles — focus on FUNCTION not exact wording\n"
+        f"- If a tier has 0 coverage, it MUST be in the missing list\n\n"
         f"Return ONLY valid JSON (no markdown):\n"
-        f'{{"covered": [{{"tier": "CEO/MD", "covered_by": "title that covers it"}}], '
-        f'"missing": ["CTO/CIO", "CSO/Head of Sales"], '
+        f'{{"covered": [{{"tier": "FDM", "covered_by": "title"}}], '
+        f'"missing": ["CTO/CIO", "Key Influencer", "Gatekeeper"], '
         f'"reasoning": "one sentence explaining your analysis"}}'
     )
 
     missing_tiers: list[dict] = []
-    existing_tiers: dict[str, list[str]] = {"CEO/MD": [], "CTO/CIO": [], "CSO/Head of Sales": []}
+    existing_tiers: dict[str, list[str]] = {
+        "FDM": [], "KDM": [], "CTO/CIO": [], "Key Influencer": [], "Gatekeeper": [],
+    }
 
     try:
         raw = await llm_complete(gap_prompt, model="gpt-4.1", max_tokens=300, temperature=0)
@@ -526,46 +561,62 @@ async def expand_search_terms(state: SearcherState) -> SearcherState:
 # We pick ONE representative query per bucket from expanded_dm_roles.
 # Each bucket targets a DIFFERENT business function → searches return different people.
 #
-# ALIGNED WITH BUYING-ROLE PROMPT: Only search for roles that can be FDM/KDM/P1/Influencer.
-# REMOVED: marketing (CMO/marketing-only → Irrelevant), operations (→ Irrelevant),
-#          finance (except CFO which is in c_suite).
+# ALIGNED WITH GOPAL'S FULL ROLE LIST: FDM + KDM + Key Influencer + Gatekeeper
+# Each bucket = one parallel LinkedIn search query → different people per function
 _FUNCTION_BUCKETS: list[tuple[str, list[str]]] = [
     ("c_suite",    ["ceo", "cfo", "coo", "director general", "gerente general", "managing director",
                     "consejero delegado", "président", "président directeur",
-                    "geschäftsführer", "direttore generale", "directeur général", "president"]),
-    ("digital",    ["cdo", "chief digital", "digital director", "director digital",
-                    "head of digital", "vp digital", "directeur digital",
-                    "responsable digital", "jefe digital",
-                    "digital transformation", "chief data"]),
-    ("ecommerce",  ["ecommerce", "e-commerce", "commerce director", "head of ecommerce",
-                    "director ecommerce", "jefe ecommerce", "responsable ecommerce"]),
-    ("sales",      ["chief revenue", "cro", "sales director", "director ventas",
-                    "vp sales", "head of sales", "national sales manager",
+                    "geschäftsführer", "direttore generale", "directeur général", "president",
+                    "executive director", "evp"]),
+    ("sales_leadership", ["chief revenue", "cro", "sales director", "director ventas",
+                    "vp sales", "svp sales", "head of sales", "national sales manager",
                     "directeur des ventes", "direttore commerciale",
-                    "leiter vertrieb", "sales excellence", "commercial excellence"]),
+                    "leiter vertrieb", "field sales director"]),
+    ("sales_excellence", ["sales excellence", "commercial excellence",
+                    "sales operations", "sales effectiveness",
+                    "sales capability", "sales automation",
+                    "customer development"]),
     ("technology", ["cto", "cio", "chief technology", "chief information",
                     "technology director", "director tecnologia", "director de sistemas",
-                    "it director", "head of it", "directeur technique"]),
-    ("strategy",   ["chief strategy", "vp strategy", "strategy director",
-                    "head of strategy", "director de estrategia"]),
+                    "it director", "head of it", "gm it", "directeur technique",
+                    "director of transformation"]),
+    ("digital_ai", ["cdo", "chief digital", "digital director", "director digital",
+                    "head of digital", "vp digital", "digital transformation",
+                    "head of genai", "head of ai", "ai director",
+                    "head of digital commerce", "vp digital commerce", "vp commerce"]),
+    ("rtm_gtm",   ["route to market", "go to market", "rtm", "gtm",
+                    "channel development", "distribution director",
+                    "head of distribution", "head of retail",
+                    "head of general trade", "head of independents",
+                    "head of fragmented trade"]),
+    ("ecommerce",  ["ecommerce", "e-commerce", "eb2b", "head of ecommerce",
+                    "director ecommerce", "eb2b director", "eb2b head",
+                    "eb2b manager"]),
+    ("analytics_bi", ["business intelligence", "analytics director",
+                    "bi director", "bi head", "analytics head",
+                    "analytics manager", "bi manager"]),
+    ("telesales",  ["telesales", "tele-sales", "head of telesales",
+                    "inside sales director"]),
+    ("trade_marketing", ["trade marketing", "sfa manager", "sfa head",
+                    "trade marketing head", "trade marketing manager"]),
     ("general_mgmt", ["general manager", "country manager", "regional director",
                       "gerente general", "director regional", "country director",
                       "business director"]),
-    ("rtm_gtm",   ["route to market", "go to market", "rtm", "gtm",
-                    "channel development", "distribution director",
-                    "head of distribution", "head of retail"]),
 ]
 
 # Fallback English queries per bucket (used when no match found in expanded_roles)
 _BUCKET_FALLBACKS = {
-    "c_suite":     "CEO Managing Director CFO COO",
-    "digital":     "CDO Digital Director Digital Transformation",
-    "ecommerce":   "Ecommerce Director Head of Ecommerce",
-    "sales":       "Sales Director VP Sales Head of Sales CRO",
-    "technology":  "CTO CIO Technology Director IT Director",
-    "strategy":    "VP Strategy Chief Strategy Officer",
-    "general_mgmt": "General Manager Country Manager",
-    "rtm_gtm":    "Head of Distribution RTM GTM Director",
+    "c_suite":         "CEO Managing Director CFO COO President EVP",
+    "sales_leadership": "Sales Director VP Sales Head of Sales CRO SVP Sales",
+    "sales_excellence": "Sales Excellence Director Commercial Excellence Sales Operations",
+    "technology":      "CTO CIO IT Director Head of IT GM IT",
+    "digital_ai":      "CDO Digital Director Head of AI GenAI Digital Transformation",
+    "rtm_gtm":         "Head of Distribution RTM GTM Director Head of General Trade",
+    "ecommerce":       "eB2B Head Ecommerce Director Head of Ecommerce",
+    "analytics_bi":    "Analytics Director BI Director Business Intelligence Head",
+    "telesales":       "Head of Telesales Inside Sales Director",
+    "trade_marketing": "Trade Marketing Head SFA Manager",
+    "general_mgmt":    "General Manager Country Manager",
 }
 
 
@@ -1501,6 +1552,9 @@ async def unipile_search(state: SearcherState) -> SearcherState:
         "Chief",
         "Managing Director",
         "Country Manager",
+        "Head of",
+        "Director",
+        "General Manager",
         "Gerente",       # Spanish/Portuguese
         "Directeur",     # French
         "Geschäftsführer",  # German
@@ -2318,6 +2372,7 @@ async def perplexity_executive_search(state: SearcherState) -> SearcherState:
 # ALIGNED WITH BUYING-ROLE PROMPT: Only buckets that can produce FDM/KDM/P1/Influencer.
 # REMOVED: marketing_brand, operations, finance, hr_people, product_category
 # (all map to "Irrelevant" per buying-role classification rules).
+# ALIGNED WITH GOPAL'S FULL ROLE LIST
 _ROLE_BUCKETS_DEF: list[tuple[str, str, list[str]]] = [
     ("c_suite", "C-Suite & Executive", [
         "ceo", " coo", " cfo", " cdo", " cto", " cio", " cro",
@@ -2326,47 +2381,61 @@ _ROLE_BUCKETS_DEF: list[tuple[str, str, list[str]]] = [
         "consejero delegado", "directeur général",
         "geschäftsführer", "direttore generale", "director general",
         "président directeur", "vice chairman", "chairman",
+        "executive director", " evp",
     ]),
-    ("digital_ecommerce", "Digital & Ecommerce", [
-        "digital", "ecommerce", "e-commerce", "omnichannel", "marketplace",
-        "direct to consumer", " d2c", "commercio digitale", "commerce digitale",
-        "comercio electronico", "online retail", "digital transformation",
+    ("sales_leadership", "Sales Leadership", [
+        "sales director", "vp sales", "svp sales", "head of sales",
+        "field sales director", "national sales manager",
+        "ventas", "vendas", "leiter vertrieb",
     ]),
-    ("sales_commercial", "Sales & Commercial", [
-        "sales", "revenue", "business development", "key account",
-        " trade ", "channel sales", "retail sales", "ventas", "vendas",
-        "distribution", "national accounts", "account director",
-        "commercial excellence", "sales excellence", "sales operations",
+    ("sales_excellence", "Sales & Commercial Excellence", [
+        "sales excellence", "commercial excellence",
+        "sales operations", "sales effectiveness",
+        "sales capability", "sales automation", "sfa",
         "customer development",
     ]),
-    ("technology_data", "Technology & Data", [
-        "technology", " data ", "analytics", "information systems",
-        " it director", " it manager", "systems director",
-        "engineering director", "digital transformation", "tech director",
-        "bi director", "business intelligence",
+    ("digital_ecommerce", "Digital, eB2B & Ecommerce", [
+        "digital", "ecommerce", "e-commerce", "eb2b", "omnichannel",
+        "digital commerce", "vp commerce", "vp digital commerce",
+        "digital transformation",
     ]),
-    ("strategy_innovation", "Strategy & Innovation", [
-        "strategy", "innovation", "transformation", "strategic planning",
-        "growth director", "corporate development", "estrategia",
+    ("technology_data", "Technology, IT & Data", [
+        "technology", " data ", "analytics", "information systems",
+        " it director", " it manager", "systems director", "gm it",
+        "business intelligence", "bi director", "bi manager",
+        "analytics director", "analytics manager",
+    ]),
+    ("ai_genai", "AI & GenAI", [
+        "genai", "gen ai", "ai director", "ai manager",
+        "head of ai", "ai/ml", "machine learning",
+    ]),
+    ("rtm_gtm", "RTM / GTM / Distribution", [
+        "route to market", "go to market", "rtm", "gtm",
+        "channel development", "field sales",
+        "head of distribution", "head of retail",
+        "head of general trade", "head of independents",
+        "head of fragmented trade", "independent retail",
+    ]),
+    ("telesales", "Telesales & Inside Sales", [
+        "telesales", "tele-sales", "inside sales",
+        "head of telesales",
+    ]),
+    ("trade_marketing", "Trade Marketing & SFA", [
+        "trade marketing", "sfa manager", "sfa head",
     ]),
     ("general_management", "General Management", [
         "general manager", "country manager", "regional director",
         "country director", "managing director",
         "president", "vice president",
     ]),
-    ("rtm_gtm", "RTM / GTM / Distribution", [
-        "route to market", "go to market", "rtm", "gtm",
-        "channel development", "field sales",
-        "head of distribution", "head of retail",
-    ]),
-    ("other_senior", "Other Senior", []),  # catch-all for senior people
+    ("other_senior", "Other Senior", []),
 ]
 
-# All remaining buckets are DM-relevant — pre-select all by default
+# All buckets are DM-relevant — pre-select all by default
 _DEFAULT_SELECTED_BUCKETS = {
-    "c_suite", "digital_ecommerce", "sales_commercial",
-    "general_management", "technology_data", "strategy_innovation",
-    "rtm_gtm",
+    "c_suite", "sales_leadership", "sales_excellence",
+    "digital_ecommerce", "technology_data", "ai_genai",
+    "rtm_gtm", "telesales", "trade_marketing", "general_management",
 }
 
 
