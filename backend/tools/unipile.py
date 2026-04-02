@@ -35,12 +35,25 @@ _pool_cycle: itertools.cycle | None = None
 
 
 async def _init_pool() -> None:
-    """Fetch all LinkedIn accounts from Unipile and build the round-robin pool."""
+    """Initialize the round-robin account pool.
+    Priority: UNIPILE_ACCOUNT_IDS env var (hardcoded) → Unipile API fetch → single fallback.
+    """
     global _account_pool, _pool_cycle
     if _account_pool:
         return  # already initialised
 
     settings = get_settings()
+
+    # Priority 1: Use hardcoded account IDs from env (most reliable)
+    if settings.unipile_account_ids:
+        ids = [aid.strip() for aid in settings.unipile_account_ids.split(",") if aid.strip()]
+        if ids:
+            _account_pool = ids
+            _pool_cycle = itertools.cycle(ids)
+            logger.info("unipile_pool_from_env", accounts=len(ids))
+            return
+
+    # Priority 2: Fetch from Unipile API
     if not settings.unipile_api_key:
         return
 
@@ -53,7 +66,6 @@ async def _init_pool() -> None:
             resp.raise_for_status()
             data = resp.json()
 
-        # Only use LinkedIn accounts with status OK
         ids = [
             item["id"]
             for item in data.get("items", [])
@@ -64,7 +76,7 @@ async def _init_pool() -> None:
         if ids:
             _account_pool = ids
             _pool_cycle = itertools.cycle(ids)
-            logger.info("unipile_pool_ready", accounts=len(ids), ids=ids)
+            logger.info("unipile_pool_from_api", accounts=len(ids), ids=ids)
         else:
             logger.warning("unipile_no_accounts", detail="No OK LinkedIn accounts found")
 

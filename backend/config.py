@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     unipile_api_key: str = ""
     unipile_dsn: str = "api21.unipile.com:15157"
     unipile_account_id: str = ""
+    unipile_account_ids: str = ""  # comma-separated list of all account IDs for round-robin
 
     # Search / LLM
     openai_api_key: str = ""
