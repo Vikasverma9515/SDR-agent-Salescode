@@ -567,15 +567,18 @@ async def _verify_one(
     evidence["linkedin_audit"] = audit
 
     # Emit LinkedIn result
+    li_connections = audit.get("connections_count")
+    li_followers = audit.get("follower_count")
     if audit.get("valid"):
         li_c = audit.get("current_company", "")
         li_r = audit.get("current_role", "")
         li_at = audit.get("at_target_company", False)
         li_emp = audit.get("still_employed", False)
         li_level = "success" if (li_at and li_emp) else "warning"
+        conn_str = f" · connections={li_connections}" if li_connections is not None else ""
         await emit_veri_step(state.thread_id, contact.full_name, contact.company,
             "linkedin_audit", "linkedin",
-            f"profile loaded · company='{li_c}' · role='{li_r}' · at_target={li_at} · employed={li_emp}",
+            f"profile loaded · company='{li_c}' · role='{li_r}' · at_target={li_at} · employed={li_emp}{conn_str}",
             li_level)
     elif audit.get("error"):
         await emit_veri_step(state.thread_id, contact.full_name, contact.company,
@@ -583,6 +586,64 @@ async def _verify_one(
     else:
         await emit_veri_step(state.thread_id, contact.full_name, contact.company,
             "linkedin_audit", "linkedin", "profile not accessible or no URL provided", "warning")
+
+    evidence["connections_count"] = li_connections
+    evidence["follower_count"] = li_followers
+
+    # ── Early REJECT: low connection count = fake/irrelevant profile ──
+    # Real B2B decision-makers at target companies have 500+ connections.
+    # Profiles with fewer are almost always fake, aspirational, or junior.
+    _MIN_CONNECTIONS = 500
+    if li_connections is not None and li_connections < _MIN_CONNECTIONS:
+        reject_reason = f"Low LinkedIn connections ({li_connections} < {_MIN_CONNECTIONS}) — likely fake or irrelevant profile"
+        logger.info("veri_low_connections_reject",
+                    contact=contact.full_name, company=contact.company,
+                    connections=li_connections)
+        await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+            "linkedin_audit", "connections",
+            f"REJECT — only {li_connections} connections (min {_MIN_CONNECTIONS})", "error")
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        contact = contact.model_copy(update={
+            "verification_status": "REJECT",
+            "verification_notes": f"REJECT: {reject_reason}",
+            "verification_timestamp": timestamp,
+        })
+
+        # Write REJECT to sheet immediately and return — skip Phases 3-4
+        async with sheet_lock:
+            try:
+                sheet_row = state.sheet_row_nums.get(idx)
+                if sheet_row:
+                    await sheets.update_row_cells(sheets.FIRST_CLEAN_LIST, sheet_row, {
+                        17: "Low connections",    # Q - LinkedIn Status
+                        18: "NO",                 # R - Employment Verified
+                        19: "N/A",                # S - Title Match
+                        20: audit.get("current_role") or "",  # T - Actual Title Found
+                        21: "REJECT",             # U - Overall Status
+                        22: reject_reason,        # V - Verification Notes
+                        23: timestamp,            # W - Verified On
+                    })
+                # Copy to Rejected Profiles
+                raw_cols = state.raw_rows.get(idx, [""] * 16)
+                await sheets.ensure_headers(sheets.REJECTED_PROFILES, sheets.REJECTED_PROFILES_HEADERS)
+                await sheets.append_row(sheets.REJECTED_PROFILES,
+                    raw_cols[:16] + [
+                        "Low connections",        # Q
+                        "NO",                     # R
+                        "N/A",                    # S
+                        audit.get("current_role") or "",  # T
+                        reject_reason,            # U - Reject Reason
+                        reject_reason,            # V - Verification Notes
+                        timestamp,                # W
+                    ])
+                if sheet_row:
+                    rejected_sheet_rows.append(sheet_row)
+            except Exception as e:
+                logger.error("veri_low_conn_sheet_error", contact=contact.full_name, error=str(e))
+
+        await emit_veri_contact(state.thread_id, contact.full_name, contact.company, "done")
+        return contact
 
     linkedin_verified = bool(
         audit.get("valid") and audit.get("at_target_company") and audit.get("still_employed")

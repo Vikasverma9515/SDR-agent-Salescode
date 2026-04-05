@@ -111,6 +111,8 @@ class ProfileVerification(TypedDict):
     current_role: str | None
     at_target_company: bool
     still_employed: bool
+    connections_count: int | None  # number of LinkedIn connections (None if unavailable)
+    follower_count: int | None     # number of LinkedIn followers (None if unavailable)
     error: str | None
 
 
@@ -634,6 +636,8 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
         "current_role": None,
         "at_target_company": False,
         "still_employed": False,
+        "connections_count": None,
+        "follower_count": None,
         "error": None,
     }
 
@@ -678,6 +682,25 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
         first = (data.get("first_name") or "").strip()
         last = (data.get("last_name") or "").strip()
         result["full_name"] = f"{first} {last}".strip() or data.get("name") or None
+
+        # Extract connection / follower counts — Unipile returns these as
+        # top-level fields.  Try multiple key variants to be safe.
+        for key in ("connections_count", "num_connections", "connections"):
+            val = data.get(key)
+            if val is not None:
+                try:
+                    result["connections_count"] = int(val)
+                except (ValueError, TypeError):
+                    pass
+                break
+        for key in ("follower_count", "followers_count", "followers"):
+            val = data.get(key)
+            if val is not None:
+                try:
+                    result["follower_count"] = int(val)
+                except (ValueError, TypeError):
+                    pass
+                break
 
         # --- Primary: use work_experience entries ---
         # Collect ALL current positions (end is null/missing = still active).
@@ -735,6 +758,8 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
             match=result["at_target_company"],
             current_positions=len(current_positions) if current_positions else 0,
             source="experience" if current_positions else "headline",
+            connections=result["connections_count"],
+            followers=result["follower_count"],
         )
 
     except Exception as e:
