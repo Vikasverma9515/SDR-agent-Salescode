@@ -683,17 +683,34 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
         last = (data.get("last_name") or "").strip()
         result["full_name"] = f"{first} {last}".strip() or data.get("name") or None
 
-        # Extract connection / follower counts — Unipile returns these as
-        # top-level fields.  Try multiple key variants to be safe.
-        for key in ("connections_count", "num_connections", "connections"):
+        # Log ALL top-level keys so we can find the right field for connections
+        _all_keys = [k for k in data.keys() if k not in ("work_experience",)]
+        logger.info("unipile_profile_raw_keys",
+                     identifier=identifier,
+                     keys=_all_keys,
+                     sample={k: data.get(k) for k in _all_keys if "connect" in k.lower() or "follow" in k.lower() or "network" in k.lower() or "relation" in k.lower()})
+
+        # Extract connection / follower counts — try every plausible key name.
+        _CONN_KEYS = (
+            "connections_count", "num_connections", "connections",
+            "network_size", "connection_count", "connectionsCount",
+            "number_of_connections", "relation_degree",
+        )
+        for key in _CONN_KEYS:
             val = data.get(key)
             if val is not None:
                 try:
                     result["connections_count"] = int(val)
+                    logger.info("unipile_connections_found", key=key, value=result["connections_count"])
                 except (ValueError, TypeError):
                     pass
                 break
-        for key in ("follower_count", "followers_count", "followers"):
+
+        _FOLLOWER_KEYS = (
+            "follower_count", "followers_count", "followers",
+            "followersCount", "number_of_followers",
+        )
+        for key in _FOLLOWER_KEYS:
             val = data.get(key)
             if val is not None:
                 try:
@@ -701,6 +718,12 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
                 except (ValueError, TypeError):
                     pass
                 break
+
+        if result["connections_count"] is None:
+            logger.warning("unipile_no_connections_field",
+                           identifier=identifier,
+                           available_keys=_all_keys,
+                           msg="Could not find connections count in Unipile response — fake profile check will be skipped")
 
         # --- Primary: use work_experience entries ---
         # Collect ALL current positions (end is null/missing = still active).

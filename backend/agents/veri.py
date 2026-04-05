@@ -590,18 +590,35 @@ async def _verify_one(
     evidence["connections_count"] = li_connections
     evidence["follower_count"] = li_followers
 
-    # ── Early REJECT: low connection count = fake/irrelevant profile ──
+    # ── Early REJECT: low connection/follower count = fake/irrelevant profile ──
     # Real B2B decision-makers at target companies have 500+ connections.
     # Profiles with fewer are almost always fake, aspirational, or junior.
+    # Fallback: if connections_count unavailable, use follower_count < 50 as proxy.
     _MIN_CONNECTIONS = 500
+    _MIN_FOLLOWERS = 50  # fallback when connections unavailable
+
+    _should_reject_low_network = False
+    _reject_signal = ""
+
     if li_connections is not None and li_connections < _MIN_CONNECTIONS:
-        reject_reason = f"Low LinkedIn connections ({li_connections} < {_MIN_CONNECTIONS}) — likely fake or irrelevant profile"
-        logger.info("veri_low_connections_reject",
+        _should_reject_low_network = True
+        _reject_signal = f"Low LinkedIn connections ({li_connections} < {_MIN_CONNECTIONS})"
+    elif li_connections is None and li_followers is not None and li_followers < _MIN_FOLLOWERS:
+        _should_reject_low_network = True
+        _reject_signal = f"Low LinkedIn followers ({li_followers} < {_MIN_FOLLOWERS}) — connections unavailable"
+    elif li_connections is None and li_followers is None:
+        logger.warning("veri_no_network_data",
+                       contact=contact.full_name, company=contact.company,
+                       msg="Unipile returned neither connections nor followers — fake check skipped")
+
+    if _should_reject_low_network:
+        reject_reason = f"{_reject_signal} — likely fake or irrelevant profile"
+        logger.info("veri_low_network_reject",
                     contact=contact.full_name, company=contact.company,
-                    connections=li_connections)
+                    connections=li_connections, followers=li_followers)
         await emit_veri_step(state.thread_id, contact.full_name, contact.company,
             "linkedin_audit", "connections",
-            f"REJECT — only {li_connections} connections (min {_MIN_CONNECTIONS})", "error")
+            f"REJECT — {_reject_signal}", "error")
 
         timestamp = datetime.now(timezone.utc).isoformat()
         contact = contact.model_copy(update={
