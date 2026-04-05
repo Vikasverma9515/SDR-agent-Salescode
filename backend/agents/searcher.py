@@ -467,8 +467,9 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
         "target_normalized_name": normalized_company_name,
         "target_sales_nav_url": sales_nav_url_full,
         "missing_dm_roles": missing_roles,
+        "missing_tiers": missing_tiers,
         "existing_names": existing_names,
-        "phase": "unipile_search",
+        "phase": "discover_role_holders",
     })
 
 
@@ -3348,6 +3349,445 @@ async def _get_email_format(company_name: str, _domain: str) -> str | None:
     return None
 
 
+# ===========================================================================
+# NEW: Role-First Discovery Pipeline (replaces title-keyword search)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Node: discover_role_holders  (GPT-5 web search + Perplexity cross-ref)
+# ---------------------------------------------------------------------------
+
+async def discover_role_holders(state: SearcherState) -> SearcherState:
+    """
+    For each missing role tier, use GPT-5 web search to find who ACTUALLY
+    holds that role at the company.  Cross-reference with Perplexity.
+
+    This replaces the old title-keyword LinkedIn search.  Instead of searching
+    LinkedIn for "CEO" (which returns fakes), we Google "Who is the CEO of X?"
+    and get the real person's name.
+    """
+    from backend.tools.llm import llm_web_search
+    from backend.utils.progress import emit_log as _emit_log
+
+    company = state.target_normalized_name or state.target_company
+    tiers = state.missing_tiers or []
+
+    if not tiers:
+        logger.info("discover_skip", company=company, reason="no missing tiers")
+        return state
+
+    await _emit_log(state.thread_id,
+        f"[{company}] Discovering role holders for {len(tiers)} missing tier(s) via web search…",
+        level="info")
+
+    # ── Step 1: GPT-5 web search — one call per search query, all in parallel ──
+    all_queries: list[tuple[str, str, str]] = []  # (tier, search_title, prompt)
+    for tier_def in tiers:
+        tier_name = tier_def["tier"]
+        for search_title in tier_def.get("search_queries", [])[:5]:  # cap per tier
+            prompt = (
+                f"Who is the current {search_title} of {company}? "
+                f"Search the web and find the ACTUAL person currently holding this role. "
+                f"If the exact title doesn't exist, find the closest equivalent "
+                f"(e.g. Managing Director instead of CEO, VP Engineering instead of CTO). "
+                f"Return ONLY in this exact format: Full Name — Exact Current Title\n"
+                f"If you truly cannot find this with confidence, return exactly: UNKNOWN\n"
+                f"Do NOT guess or fabricate names."
+            )
+            all_queries.append((tier_name, search_title, prompt))
+
+    found_people: list[dict] = []
+    seen_names: set[str] = set()
+
+    async def _gpt5_search(tier_name: str, search_title: str, prompt: str):
+        try:
+            raw = await llm_web_search(prompt)
+            content = (raw or "").strip()
+            if not content or "unknown" in content.lower():
+                return
+
+            # Parse "Name — Title"
+            parts = re.split(r'\s*[—–\-]\s*', content, maxsplit=1)
+            name = parts[0].strip() if parts else ""
+            title = parts[1].strip() if len(parts) >= 2 else search_title
+
+            # Strip markdown bold, quotes, etc.
+            name = re.sub(r'[*_"`]', '', name).strip()
+            title = re.sub(r'[*_"`]', '', title).strip()
+
+            if len(name) < 3 or len(name) > 60:
+                return
+            if any(w in name.lower() for w in ["the", "is", "was", "company", "unknown", "currently", "there"]):
+                return
+            if not _looks_like_name(name):
+                return
+
+            name_lower = name.lower().strip()
+            if name_lower not in seen_names:
+                seen_names.add(name_lower)
+                found_people.append({
+                    "name": name,
+                    "title": title,
+                    "tier": tier_name,
+                    "sources": ["gpt5_web_search"],
+                    "confidence": "high",
+                })
+                await _emit_log(state.thread_id,
+                    f"[{company}] {tier_name}: found {name} — {title}", "success")
+
+        except Exception as e:
+            logger.warning("discover_gpt5_error", company=company,
+                           tier=tier_name, role=search_title, error=str(e))
+
+    # Run all GPT-5 queries in parallel (throttled by existing llm semaphore)
+    await asyncio.gather(*[
+        _gpt5_search(tier, title, prompt)
+        for tier, title, prompt in all_queries
+    ])
+
+    # ── Step 2: Perplexity cross-reference (2 calls) ──
+    settings = get_settings()
+    if settings.perplexity_api_key:
+        await _emit_log(state.thread_id,
+            f"[{company}] Cross-referencing with Perplexity AI…", "info")
+
+        pplx_queries = [
+            (
+                f"Who are the current C-suite executives, directors, and vice presidents at {company}? "
+                f"Include their exact full names and current job titles. "
+                f"Format each person strictly as: Full Name — Job Title"
+            ),
+            (
+                f"List the current heads of department and senior managers at {company}. "
+                f"Include marketing, digital, ecommerce, sales, operations, finance, and technology leads. "
+                f"Format each person strictly as: Full Name — Job Title"
+            ),
+        ]
+
+        import httpx as _httpx
+        for pplx_query in pplx_queries:
+            try:
+                async with _httpx.AsyncClient(timeout=35) as client:
+                    resp = await client.post(
+                        "https://api.perplexity.ai/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.perplexity_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "sonar",
+                            "messages": [
+                                {"role": "system", "content": (
+                                    "You are a business research assistant. "
+                                    "List ONLY current employees with their exact names and current titles. "
+                                    "Format each on its own line: Full Name — Job Title. "
+                                    "No introductions, no explanations, no markdown."
+                                )},
+                                {"role": "user", "content": pplx_query},
+                            ],
+                            "max_tokens": 1500,
+                            "temperature": 0,
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+
+                for line in content.splitlines():
+                    line = re.sub(r'\[\d+\]', '', line).strip()
+                    line = re.sub(r'^[\d]+[.)]\s*', '', line).strip()
+                    line = line.lstrip('-•*').strip()
+                    if not line or len(line) < 5:
+                        continue
+                    for sep in ('—', '–', ' - '):
+                        if sep in line:
+                            parts = line.split(sep, 1)
+                            if len(parts) == 2:
+                                name = _clean_name(parts[0].strip())
+                                title = parts[1].strip()
+                                if (name and title and _looks_like_name(name)
+                                        and len(title) > 3
+                                        and name.lower() not in seen_names):
+                                    seen_names.add(name.lower())
+                                    bucket = _classify_role(title)
+                                    # Only keep senior roles
+                                    if bucket not in ("Unknown", "Gatekeeper"):
+                                        found_people.append({
+                                            "name": name,
+                                            "title": title,
+                                            "tier": bucket,
+                                            "sources": ["perplexity"],
+                                            "confidence": "medium",
+                                        })
+                            break
+            except Exception as e:
+                logger.warning("discover_perplexity_error", company=company, error=str(e))
+
+    # ── Step 3: Company website scraping (supplementary) ──
+    domain = state.target_domain
+    if domain and len(found_people) < 5:
+        await _emit_log(state.thread_id,
+            f"[{company}] Checking company website ({domain}) for leadership…", "info")
+        try:
+            website_contacts, _ = await _scrape_httpx(domain, company)
+            if not website_contacts:
+                website_contacts = await _scrape_llm(domain, company)
+            for wc in (website_contacts or []):
+                if wc.full_name and wc.full_name.lower() not in seen_names:
+                    seen_names.add(wc.full_name.lower())
+                    found_people.append({
+                        "name": wc.full_name,
+                        "title": wc.role_title or "",
+                        "tier": _classify_role(wc.role_title or ""),
+                        "sources": ["company_website"],
+                        "confidence": "medium",
+                    })
+        except Exception as e:
+            logger.warning("discover_website_error", company=company, error=str(e))
+
+    # ── Step 4: Dedup by name similarity ──
+    try:
+        from rapidfuzz import fuzz as _fuzz
+        deduped: list[dict] = []
+        for person in found_people:
+            is_dup = False
+            for existing in deduped:
+                if _fuzz.token_sort_ratio(person["name"].lower(), existing["name"].lower()) >= 85:
+                    # Merge sources
+                    for src in person["sources"]:
+                        if src not in existing["sources"]:
+                            existing["sources"].append(src)
+                    if len(existing["sources"]) > 1:
+                        existing["confidence"] = "high"
+                    is_dup = True
+                    break
+            if not is_dup:
+                deduped.append(person)
+        found_people = deduped
+    except ImportError:
+        pass  # no rapidfuzz → skip dedup
+
+    logger.info("discover_role_holders_done", company=company, found=len(found_people),
+                tiers_searched=len(tiers))
+    await _emit_log(state.thread_id,
+        f"[{company}] Web discovery complete — found {len(found_people)} people across {len(tiers)} tier(s)",
+        level="success" if found_people else "warning")
+
+    return state.model_copy(update={
+        "web_discovered_people": found_people,
+        "phase": "linkedin_lookup",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Node: linkedin_lookup_by_name  (find LinkedIn profiles for named people)
+# ---------------------------------------------------------------------------
+
+async def linkedin_lookup_by_name(state: SearcherState) -> SearcherState:
+    """
+    For each person found by web search, find their LinkedIn profile.
+    Primary: Unipile search_person_by_name (with org_id filter).
+    Fallback: Google search for LinkedIn URL.
+    """
+    from backend.tools.unipile import search_person_by_name
+    from backend.utils.progress import emit_log as _emit_log
+
+    people = state.web_discovered_people or []
+    if not people:
+        logger.info("linkedin_lookup_skip", company=state.target_company, reason="no people to look up")
+        return state.model_copy(update={"phase": "verify"})
+
+    company = state.target_normalized_name or state.target_company
+    org_id = state.target_org_id or ""
+
+    await _emit_log(state.thread_id,
+        f"[{company}] Looking up LinkedIn profiles for {len(people)} discovered people…",
+        level="info")
+
+    sem = asyncio.Semaphore(5)
+    contacts: list[Contact] = []
+    _LI_URL_RE = re.compile(r'linkedin\.com/in/([^/?&\s"\'<>]+)')
+
+    async def _lookup_one(person: dict) -> Contact | None:
+        async with sem:
+            name = person["name"]
+            title = person["title"]
+            linkedin_url = None
+
+            # ── Primary: Unipile name search ──
+            try:
+                candidates = await search_person_by_name(name, org_id=org_id, limit=3)
+                if candidates:
+                    # Pick best match: prefer exact name match with org_id filter
+                    for cand in candidates:
+                        cand_name = cand.get("full_name", "")
+                        try:
+                            from rapidfuzz import fuzz as _fuzz
+                            if _fuzz.token_sort_ratio(name.lower(), cand_name.lower()) >= 80:
+                                linkedin_url = cand.get("linkedin_url")
+                                break
+                        except ImportError:
+                            if name.lower() in cand_name.lower() or cand_name.lower() in name.lower():
+                                linkedin_url = cand.get("linkedin_url")
+                                break
+                    if not linkedin_url and candidates:
+                        # Fall back to first result if org_id was used (already company-filtered)
+                        if org_id:
+                            linkedin_url = candidates[0].get("linkedin_url")
+            except Exception as e:
+                logger.warning("linkedin_lookup_unipile_error",
+                               name=name, company=company, error=str(e))
+
+            # ── Fallback: Google search for LinkedIn URL ──
+            if not linkedin_url:
+                try:
+                    results = await search_with_fallback(
+                        f'"{name}" LinkedIn "{company}" site:linkedin.com/in',
+                        max_results=5,
+                    )
+                    for r in results:
+                        # Check URL
+                        m = _LI_URL_RE.search(r.url or "")
+                        if m:
+                            linkedin_url = f"https://www.linkedin.com/in/{m.group(1).rstrip('/')}"
+                            break
+                        # Check snippet
+                        m = _LI_URL_RE.search(r.snippet or "")
+                        if m:
+                            linkedin_url = f"https://www.linkedin.com/in/{m.group(1).rstrip('/')}"
+                            break
+                except Exception as e:
+                    logger.warning("linkedin_lookup_google_error",
+                                   name=name, company=company, error=str(e))
+
+            await _emit_log(state.thread_id,
+                f"[{company}] {name} — LinkedIn: {linkedin_url or 'not found'}",
+                level="success" if linkedin_url else "warning")
+
+            return Contact(
+                full_name=name,
+                company=company,
+                domain=state.target_domain or "",
+                role_title=title or None,
+                role_bucket=_classify_role(title or ""),
+                linkedin_url=linkedin_url,
+                linkedin_verified=False,
+                provenance=["web_search_role_first"],
+            )
+
+    results = await asyncio.gather(*[_lookup_one(p) for p in people])
+    contacts = [c for c in results if c is not None]
+
+    logger.info("linkedin_lookup_done", company=company,
+                total=len(people), with_url=sum(1 for c in contacts if c.linkedin_url),
+                without_url=sum(1 for c in contacts if not c.linkedin_url))
+    await _emit_log(state.thread_id,
+        f"[{company}] LinkedIn lookup: {sum(1 for c in contacts if c.linkedin_url)}/{len(contacts)} profiles found",
+        level="info")
+
+    return state.model_copy(update={
+        "discovered_contacts": contacts,
+        "phase": "verify",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Node: verify_candidates  (verify_profile + connections >= 500)
+# ---------------------------------------------------------------------------
+
+async def verify_candidates(state: SearcherState) -> SearcherState:
+    """
+    Verify each candidate's LinkedIn profile.
+    Reject if: wrong company, left company, or < 500 connections (fake).
+    Keep contacts without LinkedIn URL (email still constructable, Veri tries later).
+    """
+    from backend.tools.unipile import verify_profile
+    from backend.utils.progress import emit_log as _emit_log
+
+    contacts = state.discovered_contacts or []
+    if not contacts:
+        return state
+
+    company = state.target_normalized_name or state.target_company
+    _MIN_CONNECTIONS = 500
+    sem = asyncio.Semaphore(5)
+
+    with_url = [c for c in contacts if c.linkedin_url]
+    without_url = [c for c in contacts if not c.linkedin_url]
+
+    await _emit_log(state.thread_id,
+        f"[{company}] Verifying {len(with_url)} LinkedIn profiles ({len(without_url)} without URL kept as-is)…",
+        level="info")
+
+    verified: list[Contact] = []
+
+    async def _verify_one(contact: Contact) -> Contact | None:
+        async with sem:
+            try:
+                result = await verify_profile(contact.linkedin_url, company)
+
+                if not result.get("valid"):
+                    await _emit_log(state.thread_id,
+                        f"[{company}] {contact.full_name}: profile not found — dropped", "warning")
+                    return None
+
+                conn_count = result.get("connections_count")
+                if conn_count is not None and conn_count < _MIN_CONNECTIONS:
+                    await _emit_log(state.thread_id,
+                        f"[{company}] {contact.full_name}: only {conn_count} connections (< {_MIN_CONNECTIONS}) — REJECT (likely fake)",
+                        "error")
+                    return None
+
+                if not result.get("at_target_company"):
+                    actual = result.get("current_company", "?")
+                    await _emit_log(state.thread_id,
+                        f"[{company}] {contact.full_name}: not at {company} (actually at {actual}) — dropped",
+                        "warning")
+                    return None
+
+                if not result.get("still_employed"):
+                    await _emit_log(state.thread_id,
+                        f"[{company}] {contact.full_name}: no longer employed — dropped", "warning")
+                    return None
+
+                # Passed all checks
+                updated_role = result.get("current_role") or contact.role_title
+                await _emit_log(state.thread_id,
+                    f"[{company}] {contact.full_name}: VERIFIED at {company} as {updated_role}"
+                    + (f" ({conn_count} connections)" if conn_count else ""),
+                    "success")
+
+                return contact.model_copy(update={
+                    "linkedin_verified": True,
+                    "role_title": updated_role,
+                })
+
+            except Exception as e:
+                logger.warning("verify_candidates_error",
+                               contact=contact.full_name, error=str(e))
+                await _emit_log(state.thread_id,
+                    f"[{company}] {contact.full_name}: verification error — kept unverified", "warning")
+                return contact
+
+    results = await asyncio.gather(*[_verify_one(c) for c in with_url])
+    verified = [c for c in results if c is not None]
+
+    # Add contacts without LinkedIn URL (they still get emails, Veri handles them later)
+    all_contacts = verified + without_url
+
+    v_count = sum(1 for c in all_contacts if c.linkedin_verified)
+    logger.info("verify_candidates_done", company=company,
+                verified=v_count, kept_no_url=len(without_url),
+                rejected=len(with_url) - len(verified))
+    await _emit_log(state.thread_id,
+        f"[{company}] Verification done — {v_count} verified, {len(without_url)} without URL, "
+        f"{len(with_url) - len(verified)} rejected",
+        level="success" if v_count > 0 else "warning")
+
+    return state.model_copy(update={"discovered_contacts": all_contacts})
+
+
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
@@ -3355,7 +3795,7 @@ async def _get_email_format(company_name: str, _domain: str) -> str | None:
 def route_after_gap_analysis(state: SearcherState) -> str:
     if state.phase == "done":
         return "advance_or_finish"
-    return "expand_search_terms"
+    return "discover_role_holders"
 
 
 def route_after_write(_state: SearcherState) -> str:
@@ -3385,21 +3825,16 @@ class AioSqliteConnectionWrapper:
 
 async def build_searcher_graph():
     # No checkpointer — Searcher is a straight pipeline with no human-in-the-loop.
-    # Checkpointing was silently killing execution between nodes due to serialization issues.
     graph = StateGraph(SearcherState)
 
+    # Role-First Discovery Pipeline (v2)
     graph.add_node("load_gap_analysis", load_gap_analysis)
-    graph.add_node("expand_search_terms", expand_search_terms)
-    graph.add_node("unipile_search", unipile_search)
-    graph.add_node("scrape_sales_nav", scrape_sales_nav)
-    graph.add_node("search_company_website", search_company_website)
-    graph.add_node("perplexity_executive_search", perplexity_executive_search)
+    graph.add_node("discover_role_holders", discover_role_holders)
+    graph.add_node("linkedin_lookup_by_name", linkedin_lookup_by_name)
+    graph.add_node("verify_candidates", verify_candidates)
     graph.add_node("deduplicate", deduplicate)
-    graph.add_node("group_into_role_buckets", group_into_role_buckets)
-    graph.add_node("await_role_selection", await_role_selection)
     graph.add_node("score_and_rank", score_and_rank)
     graph.add_node("await_full_selection", await_full_selection)
-    graph.add_node("validate_linkedin", validate_linkedin)
     graph.add_node("enrich_contacts", enrich_contacts)
     graph.add_node("write_to_sheet", write_contacts_to_sheet)
     graph.add_node("advance_or_finish", advance_or_finish)
@@ -3407,17 +3842,12 @@ async def build_searcher_graph():
     graph.set_entry_point("load_gap_analysis")
 
     graph.add_conditional_edges("load_gap_analysis", route_after_gap_analysis)
-    graph.add_edge("expand_search_terms", "unipile_search")
-    graph.add_edge("unipile_search", "scrape_sales_nav")
-    graph.add_edge("scrape_sales_nav", "search_company_website")
-    graph.add_edge("search_company_website", "perplexity_executive_search")
-    graph.add_edge("perplexity_executive_search", "deduplicate")
-    graph.add_edge("deduplicate", "group_into_role_buckets")
-    graph.add_edge("group_into_role_buckets", "await_role_selection")
-    graph.add_edge("await_role_selection", "score_and_rank")
+    graph.add_edge("discover_role_holders", "linkedin_lookup_by_name")
+    graph.add_edge("linkedin_lookup_by_name", "verify_candidates")
+    graph.add_edge("verify_candidates", "deduplicate")
+    graph.add_edge("deduplicate", "score_and_rank")
     graph.add_edge("score_and_rank", "await_full_selection")
-    graph.add_edge("await_full_selection", "validate_linkedin")
-    graph.add_edge("validate_linkedin", "enrich_contacts")
+    graph.add_edge("await_full_selection", "enrich_contacts")
     graph.add_edge("enrich_contacts", "write_to_sheet")
     graph.add_conditional_edges("write_to_sheet", route_after_write)
     graph.add_conditional_edges("advance_or_finish", route_advance)

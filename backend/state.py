@@ -111,14 +111,23 @@ class SearcherState(BaseModel):
     missing_dm_roles: list[str] = Field(default_factory=list)
     # Multilingual/expanded role variants (populated by expand_search_terms)
     expanded_dm_roles: list[str] = Field(default_factory=list)
+    # Structured gap info: which tiers are missing and what roles to search for
+    # [{"tier": "FDM", "search_queries": ["CEO", "MD", ...], "priority": 1}, ...]
+    missing_tiers: list[dict] = Field(default_factory=list)
+    # People discovered via web search (name + title + tier), before LinkedIn lookup
+    # [{"name": "...", "title": "...", "tier": "...", "sources": [...], "confidence": "..."}, ...]
+    web_discovered_people: list[dict] = Field(default_factory=list)
     # How many contacts to find per company (0 = unlimited)
     target_contact_count: int = 10
     discovered_contacts: list[Contact] = Field(default_factory=list)
     # Senior contacts found with roles NOT in target list — held for SDR selection
     pending_dm_candidates: list[Contact] = Field(default_factory=list)
     phase: Literal[
-        "unipile_search", "filing_search", "web_search", "linkedin_validation", "enrichment", "write_output", "done"
-    ] = "unipile_search"
+        "discover_role_holders", "linkedin_lookup", "verify",
+        "enrichment", "write_output", "done",
+        # Legacy phases kept for backwards compatibility
+        "unipile_search", "filing_search", "web_search", "linkedin_validation",
+    ] = "discover_role_holders"
     role_buckets: list[dict] = Field(default_factory=list)
     # Names already existing in Google Sheets (populated by gap analysis)
     existing_names: list[str] = Field(default_factory=list)
