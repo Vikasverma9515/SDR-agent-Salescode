@@ -3736,11 +3736,19 @@ async def verify_candidates(state: SearcherState) -> SearcherState:
                     return None
 
                 conn_count = result.get("connections_count")
+                foll_count = result.get("follower_count")
+                _HIGH_FOLLOWERS_OVERRIDE = 500
                 if conn_count is not None and conn_count < _MIN_CONNECTIONS:
-                    await _emit_log(state.thread_id,
-                        f"[{company}] {contact.full_name}: only {conn_count} connections (< {_MIN_CONNECTIONS}) — REJECT (likely fake)",
-                        "error")
-                    return None
+                    # High followers override low connections (real execs can have few connections but many followers)
+                    if foll_count is not None and foll_count >= _HIGH_FOLLOWERS_OVERRIDE:
+                        await _emit_log(state.thread_id,
+                            f"[{company}] {contact.full_name}: low connections ({conn_count}) but high followers ({foll_count}) — keeping",
+                            "info")
+                    else:
+                        await _emit_log(state.thread_id,
+                            f"[{company}] {contact.full_name}: only {conn_count} connections (< {_MIN_CONNECTIONS}) — REJECT (likely fake)",
+                            "error")
+                        return None
 
                 if not result.get("at_target_company"):
                     actual = result.get("current_company", "?")

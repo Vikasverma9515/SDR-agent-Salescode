@@ -589,27 +589,51 @@ async def _verify_one(
 
     evidence["connections_count"] = li_connections
     evidence["follower_count"] = li_followers
+    li_work_exp = audit.get("work_experience_count")
+    li_has_pic = audit.get("has_profile_picture", True)  # default True to avoid false rejects
+    evidence["work_experience_count"] = li_work_exp
+    evidence["has_profile_picture"] = li_has_pic
 
-    # ── Early REJECT: low connection/follower count = fake/irrelevant profile ──
-    # Real B2B decision-makers at target companies have 500+ connections.
-    # Profiles with fewer are almost always fake, aspirational, or junior.
-    # Fallback: if connections_count unavailable, use follower_count < 50 as proxy.
+    # ── Early REJECT: fake/irrelevant profile detection ──
+    # Uses multiple signals from Unipile (in priority order):
+    #   1. connections_count < 500 (strongest signal, not always available)
+    #   2. follower_count < 50 (fallback when connections unavailable)
+    #   3. work_experience_count == 1 + no profile picture (strong combo signal)
     _MIN_CONNECTIONS = 500
-    _MIN_FOLLOWERS = 50  # fallback when connections unavailable
+    _MIN_FOLLOWERS = 50
 
     _should_reject_low_network = False
     _reject_signal = ""
 
+    # High follower count overrides low connection count (e.g. Nadia Chauhan: 383 conn, 13K followers)
+    _HIGH_FOLLOWERS_OVERRIDE = 500
+
     if li_connections is not None and li_connections < _MIN_CONNECTIONS:
-        _should_reject_low_network = True
-        _reject_signal = f"Low LinkedIn connections ({li_connections} < {_MIN_CONNECTIONS})"
+        # Check if high followers should override the rejection
+        if li_followers is not None and li_followers >= _HIGH_FOLLOWERS_OVERRIDE:
+            logger.info("veri_low_conn_high_followers_pass",
+                        contact=contact.full_name, company=contact.company,
+                        connections=li_connections, followers=li_followers,
+                        msg="Low connections but high followers — keeping")
+            await emit_veri_step(state.thread_id, contact.full_name, contact.company,
+                "linkedin_audit", "connections",
+                f"Low connections ({li_connections}) but high followers ({li_followers}) — keeping", "info")
+        else:
+            _should_reject_low_network = True
+            _reject_signal = f"Low LinkedIn connections ({li_connections} < {_MIN_CONNECTIONS})"
     elif li_connections is None and li_followers is not None and li_followers < _MIN_FOLLOWERS:
         _should_reject_low_network = True
-        _reject_signal = f"Low LinkedIn followers ({li_followers} < {_MIN_FOLLOWERS}) — connections unavailable"
+        _reject_signal = f"Low LinkedIn followers ({li_followers} < {_MIN_FOLLOWERS})"
     elif li_connections is None and li_followers is None:
-        logger.warning("veri_no_network_data",
-                       contact=contact.full_name, company=contact.company,
-                       msg="Unipile returned neither connections nor followers — fake check skipped")
+        # Neither connections nor followers — use combo of work_exp + no photo
+        if li_work_exp is not None and li_work_exp <= 1 and not li_has_pic:
+            _should_reject_low_network = True
+            _reject_signal = f"Bare profile (only {li_work_exp} job, no photo, no network data)"
+        else:
+            logger.warning("veri_no_network_data",
+                           contact=contact.full_name, company=contact.company,
+                           work_exp=li_work_exp, has_pic=li_has_pic,
+                           msg="No connections/followers — using LLM verification only")
 
     if _should_reject_low_network:
         reject_reason = f"{_reject_signal} — likely fake or irrelevant profile"

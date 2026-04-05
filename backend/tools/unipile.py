@@ -113,6 +113,8 @@ class ProfileVerification(TypedDict):
     still_employed: bool
     connections_count: int | None  # number of LinkedIn connections (None if unavailable)
     follower_count: int | None     # number of LinkedIn followers (None if unavailable)
+    work_experience_count: int | None  # total work experience entries (1 = red flag for senior roles)
+    has_profile_picture: bool      # False = strong fake signal
     error: str | None
 
 
@@ -638,6 +640,8 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
         "still_employed": False,
         "connections_count": None,
         "follower_count": None,
+        "work_experience_count": None,
+        "has_profile_picture": False,
         "error": None,
     }
 
@@ -719,11 +723,25 @@ async def verify_profile(linkedin_url: str, target_company: str) -> ProfileVerif
                     pass
                 break
 
+        # Extract work experience count and profile picture
+        _exp_count = data.get("work_experience_total_count")
+        if _exp_count is not None:
+            try:
+                result["work_experience_count"] = int(_exp_count)
+            except (ValueError, TypeError):
+                pass
+        result["has_profile_picture"] = bool(
+            data.get("profile_picture_url") or data.get("profile_picture_url_large")
+        )
+
         if result["connections_count"] is None:
             logger.warning("unipile_no_connections_field",
                            identifier=identifier,
                            available_keys=_all_keys,
-                           msg="Could not find connections count in Unipile response — fake profile check will be skipped")
+                           follower_count=result["follower_count"],
+                           work_exp=result["work_experience_count"],
+                           has_pic=result["has_profile_picture"],
+                           msg="connections_count not in response — using fallback signals")
 
         # --- Primary: use work_experience entries ---
         # Collect ALL current positions (end is null/missing = still active).
