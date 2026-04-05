@@ -3384,70 +3384,122 @@ async def discover_role_holders(state: SearcherState) -> SearcherState:
         f"[{company}] Discovering role holders for {len(tiers)} missing tier(s) via web search…",
         level="info")
 
-    # ── Step 1: GPT-5 web search — one call per search query, all in parallel ──
-    all_queries: list[tuple[str, str, str]] = []  # (tier, search_title, prompt)
-    for tier_def in tiers:
-        tier_name = tier_def["tier"]
-        for search_title in tier_def.get("search_queries", [])[:5]:  # cap per tier
-            prompt = (
-                f"Who is the current {search_title} of {company}? "
-                f"Search the web and find the ACTUAL person currently holding this role. "
-                f"If the exact title doesn't exist, find the closest equivalent "
-                f"(e.g. Managing Director instead of CEO, VP Engineering instead of CTO). "
-                f"Return ONLY in this exact format: Full Name — Exact Current Title\n"
-                f"If you truly cannot find this with confidence, return exactly: UNKNOWN\n"
-                f"Do NOT guess or fabricate names."
-            )
-            all_queries.append((tier_name, search_title, prompt))
-
     found_people: list[dict] = []
     seen_names: set[str] = set()
 
-    async def _gpt5_search(tier_name: str, search_title: str, prompt: str):
-        try:
-            raw = await llm_web_search(prompt)
-            content = (raw or "").strip()
-            if not content or "unknown" in content.lower():
-                return
+    def _parse_name_title_lines(text: str, default_tier: str = "") -> list[dict]:
+        """Parse multi-line 'Name — Title' responses into people dicts."""
+        people = []
+        for line in text.splitlines():
+            line = re.sub(r'\[\d+\]', '', line).strip()
+            line = re.sub(r'^[\d]+[.)]\s*', '', line).strip()
+            line = line.lstrip('-•*').strip()
+            if not line or len(line) < 5 or "unknown" in line.lower():
+                continue
+            for sep in ('—', '–', ' - '):
+                if sep in line:
+                    parts = line.split(sep, 1)
+                    if len(parts) == 2:
+                        name = re.sub(r'[*_"`]', '', parts[0]).strip()
+                        title = re.sub(r'[*_"`]', '', parts[1]).strip()
+                        name = _clean_name(name) if '_clean_name' in dir() else name
+                        if name and title and len(name) >= 3 and len(title) > 3:
+                            if _looks_like_name(name) and name.lower() not in seen_names:
+                                seen_names.add(name.lower())
+                                tier = _classify_role(title)
+                                if tier in ("Unknown", "Gatekeeper"):
+                                    tier = default_tier or "Key Influencer"
+                                people.append({
+                                    "name": name, "title": title, "tier": tier,
+                                    "sources": [], "confidence": "medium",
+                                })
+                    break
+        return people
 
-            # Parse "Name — Title"
-            parts = re.split(r'\s*[—–\-]\s*', content, maxsplit=1)
-            name = parts[0].strip() if parts else ""
-            title = parts[1].strip() if len(parts) >= 2 else search_title
+    # ── Step 1: ONE comprehensive GPT-5 web search call ──
+    # Instead of 25 individual calls, ask for ALL executives at once.
+    # This is resilient: if it works, we get 10-20 people in one call.
+    tier_descriptions = []
+    for t in tiers:
+        examples = ", ".join(t.get("search_queries", [])[:4])
+        tier_descriptions.append(f"- {t['tier']}: {examples}")
+    tier_list = "\n".join(tier_descriptions)
 
-            # Strip markdown bold, quotes, etc.
-            name = re.sub(r'[*_"`]', '', name).strip()
-            title = re.sub(r'[*_"`]', '', title).strip()
+    bulk_prompt = (
+        f"Search the web and list ALL current senior executives and leadership team at {company}.\n\n"
+        f"I need people for these role categories:\n{tier_list}\n\n"
+        f"RULES:\n"
+        f"- Search the web thoroughly — check the company website, LinkedIn, press releases\n"
+        f"- Only include people CURRENTLY at {company} (not former employees)\n"
+        f"- Include their EXACT full name and current job title\n"
+        f"- Format EACH person on its own line as: Full Name — Job Title\n"
+        f"- Find as many senior people as possible (aim for 10-20)\n"
+        f"- Do NOT guess or fabricate — only include if found from a reliable source\n"
+        f"- If you cannot find anyone for a category, skip it\n"
+    )
 
-            if len(name) < 3 or len(name) > 60:
-                return
-            if any(w in name.lower() for w in ["the", "is", "was", "company", "unknown", "currently", "there"]):
-                return
-            if not _looks_like_name(name):
-                return
+    try:
+        await _emit_log(state.thread_id,
+            f"[{company}] GPT-5 bulk search: finding all executives…", "info")
+        bulk_result = await llm_web_search(bulk_prompt)
+        if bulk_result:
+            bulk_people = _parse_name_title_lines(bulk_result)
+            for p in bulk_people:
+                p["sources"] = ["gpt5_bulk_search"]
+                p["confidence"] = "high"
+                found_people.append(p)
+            await _emit_log(state.thread_id,
+                f"[{company}] GPT-5 bulk search: found {len(bulk_people)} people", "success")
+    except Exception as e:
+        logger.warning("discover_bulk_gpt5_error", company=company, error=str(e))
 
-            name_lower = name.lower().strip()
-            if name_lower not in seen_names:
-                seen_names.add(name_lower)
-                found_people.append({
-                    "name": name,
-                    "title": title,
-                    "tier": tier_name,
-                    "sources": ["gpt5_web_search"],
-                    "confidence": "high",
-                })
-                await _emit_log(state.thread_id,
-                    f"[{company}] {tier_name}: found {name} — {title}", "success")
+    # ── Step 2: Individual GPT-5 calls for tiers still missing ──
+    # Only search for tiers where the bulk call didn't find anyone.
+    covered_tiers = {p["tier"] for p in found_people}
+    missing_after_bulk = [t for t in tiers if t["tier"] not in covered_tiers]
 
-        except Exception as e:
-            logger.warning("discover_gpt5_error", company=company,
-                           tier=tier_name, role=search_title, error=str(e))
+    if missing_after_bulk:
+        await _emit_log(state.thread_id,
+            f"[{company}] {len(missing_after_bulk)} tier(s) still missing after bulk — running targeted searches…",
+            "info")
 
-    # Run all GPT-5 queries in parallel (throttled by existing llm semaphore)
-    await asyncio.gather(*[
-        _gpt5_search(tier, title, prompt)
-        for tier, title, prompt in all_queries
-    ])
+        async def _targeted_search(tier_name: str, search_title: str):
+            try:
+                prompt = (
+                    f"Who is the current {search_title} of {company}? "
+                    f"Search the web and find the ACTUAL person currently holding this role. "
+                    f"If the exact title doesn't exist, find the closest equivalent. "
+                    f"Return ONLY: Full Name — Exact Current Title\n"
+                    f"If unknown, return: UNKNOWN"
+                )
+                raw = await llm_web_search(prompt)
+                content = (raw or "").strip()
+                if not content or "unknown" in content.lower():
+                    return
+
+                parts = re.split(r'\s*[—–\-]\s*', content, maxsplit=1)
+                name = re.sub(r'[*_"`]', '', parts[0]).strip() if parts else ""
+                title = re.sub(r'[*_"`]', '', parts[1]).strip() if len(parts) >= 2 else search_title
+
+                if (len(name) >= 3 and len(name) <= 60 and _looks_like_name(name)
+                        and name.lower() not in seen_names):
+                    seen_names.add(name.lower())
+                    found_people.append({
+                        "name": name, "title": title, "tier": tier_name,
+                        "sources": ["gpt5_targeted"], "confidence": "high",
+                    })
+                    await _emit_log(state.thread_id,
+                        f"[{company}] {tier_name}: found {name} — {title}", "success")
+            except Exception as e:
+                logger.warning("discover_targeted_error", company=company,
+                               tier=tier_name, role=search_title, error=str(e))
+
+        # Only search top 2 roles per missing tier (not all 5)
+        targeted_tasks = []
+        for tier_def in missing_after_bulk:
+            for search_title in tier_def.get("search_queries", [])[:2]:
+                targeted_tasks.append(_targeted_search(tier_def["tier"], search_title))
+        await asyncio.gather(*targeted_tasks)
 
     # ── Step 2: Perplexity cross-reference (2 calls) ──
     settings = get_settings()
