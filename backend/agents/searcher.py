@@ -432,6 +432,7 @@ async def load_gap_analysis(state: SearcherState) -> SearcherState:
             "target_normalized_name": normalized_company_name,
             "target_sales_nav_url": sales_nav_url_full,
             "missing_dm_roles": [],
+            "missing_tiers": [],
             "existing_names": existing_names,
             "phase": "done",
         })
@@ -3268,10 +3269,12 @@ async def advance_or_finish(state: SearcherState) -> SearcherState:
             "target_sales_nav_url": "",
             "missing_dm_roles": [],
             "expanded_dm_roles": [],
+            "missing_tiers": [],
+            "web_discovered_people": [],
             "role_buckets": [],
             "discovered_contacts": [],
             "pending_dm_candidates": [],
-            "phase": "unipile_search",
+            "phase": "discover_role_holders",
         })
 
 
@@ -3375,7 +3378,7 @@ async def discover_role_holders(state: SearcherState) -> SearcherState:
 
     if not tiers:
         logger.info("discover_skip", company=company, reason="no missing tiers")
-        return state
+        return state.model_copy(update={"phase": "linkedin_lookup"})
 
     await _emit_log(state.thread_id,
         f"[{company}] Discovering role holders for {len(tiers)} missing tier(s) via web search…",
@@ -3707,7 +3710,7 @@ async def verify_candidates(state: SearcherState) -> SearcherState:
 
     contacts = state.discovered_contacts or []
     if not contacts:
-        return state
+        return state.model_copy(update={"phase": "enrichment"})
 
     company = state.target_normalized_name or state.target_company
     _MIN_CONNECTIONS = 500
